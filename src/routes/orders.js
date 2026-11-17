@@ -25,7 +25,7 @@ const KITCHEN = ['cocina', 'bartender', 'barista']
 const AREA_OF_POSITION = { cocina: 'cocina', bartender: 'bar', barista: 'barista' }
 const SELLERS = ['mesero', 'cajero', 'host', 'bartender', 'barista']
 
-const ORDER_COLUMNS = `*, site:sites(name), table:dining_tables(id, name),
+const ORDER_COLUMNS = `*, site:sites(name), table:dining_tables!orders_table_id_fkey(id, name),
   waiter:users!orders_waiter_id_fkey(id, name, last_name), cashier:users!orders_cashier_id_fkey(id, name, last_name)`
 
 const itemDTO = (i) => ({
@@ -314,7 +314,7 @@ router.get('/comandas', auth(STAFF), guard(...KITCHEN, 'mesero'), h(async (req, 
   const areas = area ? [area] : (ADMIN.includes(req.user.role) || !mine.length ? ['cocina', 'bar', 'barista'] : mine)
   const since = new Date(Date.now() - 16 * 3600e3).toISOString()
   const { data, error } = await supabase.from('order_items')
-    .select('id, name, quantity, note, area, status, courtesy, created_at, started_at, ready_at, order:orders!inner(id, number, site_id, status, type, alias, customer_name, table:dining_tables(name), waiter:users!orders_waiter_id_fkey(name, last_name))')
+    .select('id, name, quantity, note, area, status, courtesy, created_at, started_at, ready_at, order:orders!inner(id, number, site_id, status, type, alias, customer_name, table:dining_tables!orders_table_id_fkey(name), waiter:users!orders_waiter_id_fkey(name, last_name))')
     .in('area', areas).in('status', req.query.listos === '1' ? ['listo'] : ['pendiente', 'preparando', 'listo'])
     .eq('order.site_id', site).eq('order.status', 'abierto').gte('created_at', since).order('created_at')
   if (error) throw error

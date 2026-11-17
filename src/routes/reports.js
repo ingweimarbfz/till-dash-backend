@@ -87,9 +87,9 @@ const buildReport = async (req) => {
   const bySite = (q) => (site ? q.eq('site_id', site) : q)
 
   const [orders, voidedOrders, payouts, incidents, sites] = await Promise.all([
-    all(() => bySite(supabase.from('orders').select('id, number, site_id, type, guests, waiter_id, gross, courtesy_total, subtotal, discount_name, discount_total, tip, total, closed_at, opened_at, table_id, table:dining_tables(name, seats, area:dining_areas(name))')
+    all(() => bySite(supabase.from('orders').select('id, number, site_id, type, guests, waiter_id, gross, courtesy_total, subtotal, discount_name, discount_total, tip, total, closed_at, opened_at, table_id, table:dining_tables!orders_table_id_fkey(name, seats, area:dining_areas(name))')
       .eq('status', 'cobrado').gte('closed_at', start).lt('closed_at', end)).order('closed_at')),
-    all(() => bySite(supabase.from('orders').select('id, number, site_id, total, gross, void_reason, closed_at, updated_at, voider:users!orders_voided_by_fkey(name, last_name), table:dining_tables(name)')
+    all(() => bySite(supabase.from('orders').select('id, number, site_id, total, gross, void_reason, closed_at, updated_at, voider:users!orders_voided_by_fkey(name, last_name), table:dining_tables!orders_table_id_fkey(name)')
       .eq('status', 'anulado').gte('updated_at', start).lt('updated_at', end)).order('updated_at')),
     all(() => supabase.from('tip_payouts').select('id, amount, user_id, created_at, user:users!tip_payouts_user_id_fkey(name, last_name), session:cash_sessions!inner(number, site_id)')
       .gte('created_at', start).lt('created_at', end).order('created_at')).then((r) => (site ? r.filter((t) => t.session?.site_id === site) : r)),

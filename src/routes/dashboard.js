@@ -55,7 +55,7 @@ router.get('/dashboard', auth(), h(async (req, res) => {
       site(supabase.from('table_calls').select('id, kind, created_at, table:dining_tables(name)').eq('status', 'pendiente').order('created_at')),
       site(supabase.from('cash_sessions').select('id, number, opening_amount, opened_at, register:cash_registers(name), site:sites(name)').eq('status', 'abierta')),
       site(supabase.from('receivables').select('amount, paid').eq('status', 'pendiente')),
-      site(supabase.from('orders').select('id, table_id, guests, total, tip, opened_at, closed_at, table:dining_tables(name, seats, area:dining_areas(name))')
+      site(supabase.from('orders').select('id, table_id, guests, total, tip, opened_at, closed_at, table:dining_tables!orders_table_id_fkey(name, seats, area:dining_areas(name))')
         .eq('status', 'cobrado').not('table_id', 'is', null).gte('closed_at', month)).order('closed_at', { ascending: false }).limit(3000)
     ])
     const usage = tableStats(used.data || [])

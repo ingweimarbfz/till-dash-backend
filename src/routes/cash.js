@@ -25,7 +25,7 @@ const registerDTO = (r) => ({ id: r.id, siteId: r.site_id, site: r.site?.name ??
 const sessionSummary = async (s) => {
   const [{ data: moves }, { data: orders }, { data: payouts }] = await Promise.all([
     supabase.from('cash_movements').select('*, user:users(name, last_name)').eq('session_id', s.id).order('created_at'),
-    supabase.from('orders').select('id, number, total, tip, discount_total, courtesy_total, table:dining_tables(name), closed_at').eq('session_id', s.id).eq('status', 'cobrado').order('closed_at'),
+    supabase.from('orders').select('id, number, total, tip, discount_total, courtesy_total, table:dining_tables!orders_table_id_fkey(name), closed_at').eq('session_id', s.id).eq('status', 'cobrado').order('closed_at'),
     supabase.from('tip_payouts').select('id, amount, user_id, user:users!tip_payouts_user_id_fkey(name, last_name)').eq('session_id', s.id).order('id')
   ])
   const m = moves || []

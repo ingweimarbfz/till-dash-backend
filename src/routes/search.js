@@ -30,7 +30,7 @@ router.get('/buscar', auth(STAFF), h(async (req, res) => {
       subtitle: [p.category?.name, `$ ${Math.round(Number(p.price)).toLocaleString('es-CO')}`, p.track_stock ? `${Number(p.stock).toLocaleString('es-CO')} ${p.unit}` : null, !p.active && 'inactivo'].filter(Boolean).join(' · '),
       to: `/productos/${p.id}`
     }))))
-  jobs.push(mySite(supabase.from('orders').select('id, number, status, total, customer_name, table:dining_tables(name)'))
+  jobs.push(mySite(supabase.from('orders').select('id, number, status, total, customer_name, table:dining_tables!orders_table_id_fkey(name)'))
     .or(`number.ilike.%${q}%,customer_name.ilike.%${q}%`).order('opened_at', { ascending: false }).limit(6)
     .then(({ data }) => (data || []).forEach((o) => groups.pedidos.push({ id: o.id, title: `Pedido ${o.number}`, subtitle: [o.table?.name, o.customer_name, cop(o.total), STATUS[o.status]].filter(Boolean).join(' · '), to: `/pedidos/${o.id}` }))))
   jobs.push(mySite(supabase.from('dining_tables').select('id, name, site:sites(name)')).ilike('name', `%${q}%`).eq('active', true).limit(5)

@@ -11,7 +11,7 @@ const { h, fail, clean } = require('../http')
 const { auth, ADMIN, STAFF } = require('../auth')
 const { audit } = require('../audit')
 const { runAsOrg } = require('../tenant')
-const { workSite, sameSite, fullName } = require('../ops')
+const { workSite, sameSite, fullName, cashOpenAt } = require('../ops')
 const { bestFor, promoBrief, loadActive } = require('../promo')
 const { notify, callMessage } = require('../notify')
 
@@ -49,7 +49,7 @@ router.get('/mesas', auth(STAFF), h(async (req, res) => {
     }
   })
   const counter = (orders || []).filter((o) => !o.table_id).map((o) => ({ id: o.id, number: o.number, customer: o.customer_name, total: Number(o.total), openedAt: o.opened_at }))
-  res.send({ site: siteRow, areas: (areas || []).map(areaDTO), tables: rows, counter })
+  res.send({ site: siteRow, cashOpen: await cashOpenAt(site), areas: (areas || []).map(areaDTO), tables: rows, counter })
 }))
 
 // ---------------------------------------------------------------- Zonas

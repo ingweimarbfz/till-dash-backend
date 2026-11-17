@@ -14,7 +14,7 @@ const { audit } = require('../audit')
 const { bestFor, loadActive } = require('../promo')
 const { checkLowStock } = require('../stock')
 const { notify, courtesyMessage, voidMessage } = require('../notify')
-const { can, guard, workSite, sameSite, dbError, money, isMoney, PAY_METHODS, fullName } = require('../ops')
+const { cashOpenAt, NO_CASH, can, guard, workSite, sameSite, dbError, money, isMoney, PAY_METHODS, fullName } = require('../ops')
 const { qty } = require('./inventory')
 
 const router = express.Router()
@@ -139,6 +139,7 @@ router.post('/pedidos', auth(STAFF), guard(...SELLERS), h(async (req, res) => {
     table = data
   }
   if (type === 'domicilio' && !clean(b.customerAddress)) return fail(res, 'Escribe la dirección del domicilio', 400)
+  if (!(await cashOpenAt(site))) return fail(res, NO_CASH, 409)
   let built = null
   if (Array.isArray(b.items) && b.items.length) {
     built = await buildItems(req, b.items)
@@ -168,6 +169,7 @@ router.post('/pedidos', auth(STAFF), guard(...SELLERS), h(async (req, res) => {
 router.post('/pedidos/:id/items', auth(STAFF), guard(...SELLERS), h(async (req, res) => {
   const o = await orderFor(req, res)
   if (!o) return
+  if (!(await cashOpenAt(o.site_id))) return fail(res, NO_CASH, 409)
   const built = await buildItems(req, req.body?.items)
   if (built.error) return fail(res, built.error, 400)
   const r = await insertItems(req, o, built.rows)

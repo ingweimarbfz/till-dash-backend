@@ -37,4 +37,11 @@ const isMoney = (v) => v !== '' && v !== null && v !== undefined && Number.isFin
 const PAY_METHODS = { efectivo: 'Efectivo', tarjeta: 'Tarjeta', transferencia: 'Transferencia', nequi: 'Nequi', daviplata: 'Daviplata', cuenta_por_cobrar: 'Cuenta por cobrar', otro: 'Otro' }
 const fullName = (u) => (u ? `${u.name} ${u.last_name || ''}`.trim() : null)
 
-module.exports = { can, guard, workSite, sameSite, dbError, money, isMoney, PAY_METHODS, fullName }
+// Sin un turno de caja abierto en la sucursal no se abren mesas ni se despachan productos.
+const cashOpenAt = async (siteId) => {
+  const { count } = await supabase.from('cash_sessions').select('id', { count: 'exact', head: true }).eq('site_id', siteId).eq('status', 'abierta')
+  return Boolean(count)
+}
+const NO_CASH = 'La caja del día no está abierta. Pide al cajero que abra el turno antes de tomar pedidos.'
+
+module.exports = { cashOpenAt, NO_CASH, can, guard, workSite, sameSite, dbError, money, isMoney, PAY_METHODS, fullName }

@@ -1,0 +1,137 @@
+// =====================================================================
+// Usuarios del establecimiento
+// · Un usuario puede tener varios perfiles: role (principal) + extra_roles (como en QuontUp360).
+// · El empleado tiene uno o varios cargos (mesero, cajero, cocina…), que definen su dashboard y,
+//   más adelante, el reparto de propinas.
+// · Solo el superadmin crea o edita superadmins; siempre debe quedar uno activo.
+// · La contraseña inicial es el número de identificación.
+// =====================================================================
+const express = require('express')
+const bcrypt = require('bcryptjs')
+const supabase = require('../db')
+const { h, fail, clean, EMAIL_RE, PHONE_RE, DOC_RE, NAME_RE, imageError, HttpError } = require('../http')
+const { auth, ADMIN, ROLES, POSITIONS, PROFILE_ORDER, USER_COLUMNS, toUserDTO } = require('../auth')
+const { audit } = require('../audit')
+
+const router = express.Router()
+
+const validate = (b) => {
+  const errors = []
+  for (const [k, label] of [['identification', 'Identificación'], ['name', 'Nombre'], ['username', 'Usuario']]) {
+    if (!clean(b[k])) errors.push(`${label} es requerido`)
+  }
+  if (clean(b.identification) && !DOC_RE.test(clean(b.identification))) errors.push('Identificación no válida')
+  if (clean(b.name) && !NAME_RE.test(clean(b.name))) errors.push('Los nombres solo admiten letras')
+  if (clean(b.lastName) && !NAME_RE.test(clean(b.lastName))) errors.push('Los apellidos solo admiten letras')
+  if (clean(b.username) && !/^[a-z0-9._-]{3,30}$/i.test(clean(b.username))) errors.push('El usuario solo admite letras, números, punto, guion y guion bajo (3 a 30)')
+  if (clean(b.email) && !EMAIL_RE.test(clean(b.email))) errors.push('Correo no válido')
+  if (clean(b.phone) && !PHONE_RE.test(clean(b.phone))) errors.push('Teléfono no válido (7 a 10 dígitos)')
+  if (b.password && String(b.password).length < 8) errors.push('La contraseña debe tener al menos 8 caracteres')
+  const e = imageError(b.avatarUrl, 300)
+  if (e) errors.push(e)
+  return errors
+}
+
+// Perfiles pedidos → perfil principal y adicionales. Precedencia: superadmin > admin > empleado.
+const profilesFrom = (b) => {
+  const list = Array.isArray(b.profiles) && b.profiles.length ? b.profiles : [b.role]
+  if (list.includes('cliente')) return { role: 'cliente', extra: [] }
+  const set = PROFILE_ORDER.filter((r) => list.includes(r))
+  if (!set.length) throw new HttpError('Elige al menos un perfil: superadmin, admin o empleado')
+  return { role: set[0], extra: set.slice(1).filter((r) => r !== 'superadmin') }
+}
+const positionsFrom = (b, role, extra) => {
+  const isEmployee = role === 'empleado' || extra.includes('empleado')
+  const list = (Array.isArray(b.positions) ? b.positions : []).filter((p) => POSITIONS.includes(p))
+  if (isEmployee && !list.length) throw new HttpError('Elige al menos un cargo para el perfil de empleado (mesero, cajero, cocina…)')
+  return isEmployee ? [...new Set(list)] : []
+}
+
+const dupMessage = (e) => (e?.code === '23505'
+  ? (String(e.message).includes('username') ? 'Ese nombre de usuario ya existe' : 'Ya existe un usuario con esa identificación')
+  : null)
+
+const activeOwners = async (excludeId) => {
+  const { count, error } = await supabase.from('users').select('id', { count: 'exact', head: true })
+    .eq('role', 'superadmin').eq('active', true).neq('id', excludeId)
+  if (error) throw error
+  return count
+}
+
+router.get('/usuarios', auth(ADMIN), h(async (req, res) => {
+  let q = supabase.from('users').select(USER_COLUMNS).order('name')
+  if (req.siteId) q = q.or(`site_id.eq.${req.siteId},role.in.(superadmin,admin)`)
+  const { data, error } = await q
+  if (error) throw error
+  const rol = ROLES.includes(req.query.rol) ? req.query.rol : null
+  const cargo = POSITIONS.includes(req.query.cargo) ? req.query.cargo : null
+  res.send(data
+    .filter((u) => !rol || u.role === rol || (u.extra_roles || []).includes(rol))
+    .filter((u) => !cargo || (u.positions || []).includes(cargo))
+    .map(toUserDTO))
+}))
+
+router.post('/usuarios', auth(ADMIN), h(async (req, res) => {
+  const b = req.body || {}
+  const { role, extra } = profilesFrom(b)
+  if (role === 'superadmin' && req.user.role !== 'superadmin') return fail(res, 'Solo un super administrador puede crear otro', 403)
+  const positions = positionsFrom(b, role, extra)
+  const errors = validate(b)
+  if (errors.length) return fail(res, errors.join('. '), 400)
+  const { data, error } = await supabase.from('users').insert({
+    identification: clean(b.identification),
+    name: clean(b.name),
+    last_name: clean(b.lastName) || '',
+    username: clean(b.username).toLowerCase(),
+    email: clean(b.email),
+    phone: clean(b.phone),
+    role,
+    extra_roles: extra,
+    positions,
+    site_id: Number(b.siteId) || null,
+    avatar_url: clean(b.avatarUrl),
+    password_hash: await bcrypt.hash(String(b.password || clean(b.identification)), 10),
+    active: b.active !== false
+  }).select(USER_COLUMNS).single()
+  if (error) return dupMessage(error) ? fail(res, dupMessage(error), 409) : fail(res, error)
+  await audit(req, 'crear', 'usuario', data.id, { role, extra, positions, username: data.username })
+  res.status(201).send(toUserDTO(data))
+}))
+
+router.put('/usuarios/:id', auth(ADMIN), h(async (req, res) => {
+  const id = Number(req.params.id)
+  const b = req.body || {}
+  const { role, extra } = profilesFrom(b)
+  const positions = positionsFrom(b, role, extra)
+  const errors = validate(b)
+  if (errors.length) return fail(res, errors.join('. '), 400)
+  const { data: current } = await supabase.from('users').select('id, role, active').eq('id', id).maybeSingle()
+  if (!current) return fail(res, 'Usuario no encontrado', 404)
+  if ((current.role === 'superadmin' || role === 'superadmin') && req.user.role !== 'superadmin') return fail(res, 'Solo un super administrador puede editar a otro', 403)
+  const losesOwner = current.role === 'superadmin' && current.active && (role !== 'superadmin' || b.active === false)
+  if (losesOwner && (await activeOwners(id)) === 0) return fail(res, 'Debe quedar al menos un super administrador activo', 400)
+  const patch = {
+    identification: clean(b.identification),
+    name: clean(b.name),
+    last_name: clean(b.lastName) || '',
+    username: clean(b.username).toLowerCase(),
+    email: clean(b.email),
+    phone: clean(b.phone),
+    role,
+    extra_roles: extra,
+    positions,
+    site_id: Number(b.siteId) || null,
+    active: b.active !== false
+  }
+  if (b.avatarUrl !== undefined) patch.avatar_url = clean(b.avatarUrl)
+  if (b.resetPassword) patch.password_hash = await bcrypt.hash(String(patch.identification), 10)
+  else if (b.password) patch.password_hash = await bcrypt.hash(b.password, 10)
+  const { data, error } = await supabase.from('users').update(patch).eq('id', id).select(USER_COLUMNS).single()
+  if (error) return dupMessage(error) ? fail(res, dupMessage(error), 409) : fail(res, error)
+  await audit(req, 'editar', 'usuario', id, { role, extra, positions, active: data.active, password: Boolean(b.resetPassword || b.password) })
+  res.send(toUserDTO(data))
+}))
+
+module.exports = router
+module.exports.profilesFrom = profilesFrom
+module.exports.positionsFrom = positionsFrom

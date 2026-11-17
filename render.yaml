@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: till-dash-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: SUPABASE_URL
+        value: https://ftawtyuyiwodmdqueuqa.supabase.co
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: CORS_ORIGIN
+        sync: false
+      - key: SESSION_HOURS
+        value: "12"

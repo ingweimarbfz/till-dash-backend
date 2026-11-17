@@ -11,17 +11,36 @@ const { h, fail, clean } = require('../http')
 const { auth, ADMIN, STAFF } = require('../auth')
 const { audit } = require('../audit')
 const { runAsOrg } = require('../tenant')
-const { workSite, sameSite, fullName, cashOpenAt } = require('../ops')
+const { workSite, sameSite, fullName, cashOpenAt, NO_CASH } = require('../ops')
 const { bestFor, promoBrief, loadActive } = require('../promo')
 const { notify, callMessage } = require('../notify')
+const jwt = require('jsonwebtoken')
+const { JWT_SECRET } = require('../config')
+
+// Sesión de la carta: al escanear el QR se abre una sesión corta que se renueva mientras el cliente usa
+// la carta. Si la deja quieta, vence y para volver a llamar o pedir debe escanear de nuevo.
+// Así una pestaña olvidada no sigue consultando ni puede enviar llamados.
+const QR_SESSION_MIN = 15
+const qrSign = (token) => jwt.sign({ qr: token }, JWT_SECRET, { expiresIn: `${QR_SESSION_MIN}m` })
+const QR_EXPIRED = 'La carta se cerró por inactividad. Escanea de nuevo el código QR de tu mesa.'
+// undefined: no trae sesión (escaneo nuevo) · false: vencida o de otra mesa · true: válida
+const qrCheck = (req, token) => {
+  const v = req.get('x-carta-session')
+  if (!v) return undefined
+  try { return jwt.verify(v, JWT_SECRET).qr === token } catch { return false }
+}
 
 const router = express.Router()
 const SHAPES = ['cuadrada', 'redonda', 'barra']
-const CALLS = { mesero: 'Llamar al mesero', cuenta: 'Pedir la cuenta' }
+const CALLS = { mesero: 'Llamar al mesero', cuenta: 'Pedir la cuenta', pedido: 'Pedido desde la mesa' }
+const ORDERING = { llamar: 'Solo llamar al mesero', confirmar: 'Pedir con confirmación del mesero', directo: 'Pedir directo a la cocina y el bar' }
 
 const areaDTO = (a) => ({ id: a.id, siteId: a.site_id, name: a.name, sortOrder: a.sort_order, active: a.active })
 const tableDTO = (t) => ({ id: t.id, siteId: t.site_id, areaId: t.area_id, name: t.name, seats: t.seats, shape: t.shape, sortOrder: t.sort_order, qrToken: t.qr_token, active: t.active })
-const callDTO = (c) => ({ id: c.id, tableId: c.table_id, table: c.table?.name, kind: c.kind, label: CALLS[c.kind], note: c.note, status: c.status, createdAt: c.created_at })
+const callDTO = (c) => ({
+  id: c.id, tableId: c.table_id, table: c.table?.name, kind: c.kind, label: CALLS[c.kind], note: c.note, status: c.status, createdAt: c.created_at,
+  items: c.items || null, total: c.total === null || c.total === undefined ? null : Number(c.total), customerName: c.customer_name ?? null, orderId: c.order_id ?? null, result: c.result ?? null
+})
 
 // ---------------------------------------------------------------- Salón
 router.get('/mesas', auth(STAFF), h(async (req, res) => {
@@ -152,33 +171,52 @@ router.post('/llamados/:id/atender', auth(STAFF), h(async (req, res) => {
   if (!c) return fail(res, 'Llamado no encontrado', 404)
   if (!sameSite(req, c.site_id)) return fail(res, 'El llamado es de otra sucursal', 403)
   if (c.status === 'pendiente') {
-    await supabase.from('table_calls').update({ status: 'atendido', attended_by: req.user.id, attended_at: new Date().toISOString() }).eq('id', c.id)
+    // Un pedido por confirmar que se marca atendido sin aceptarlo queda rechazado.
+    const result = c.kind === 'pedido' && !c.order_id ? 'rechazado' : c.result
+    await supabase.from('table_calls').update({ status: 'atendido', result, note: c.kind === 'pedido' && clean(req.body?.reason) ? clean(req.body.reason).slice(0, 140) : c.note, attended_by: req.user.id, attended_at: new Date().toISOString() }).eq('id', c.id)
+    if (result === 'rechazado') await audit(req, 'rechazar', 'pedido_qr', c.id, { table: c.table?.name, reason: clean(req.body?.reason) })
   }
   res.send({ ok: true })
+}))
+// El mesero acepta el pedido que el cliente armó en la carta: entra a la cuenta de la mesa y a las comandas.
+router.post('/llamados/:id/aceptar', auth(STAFF), h(async (req, res) => {
+  const { addToTable } = require('./orders')
+  const { data: c } = await supabase.from('table_calls').select('*, table:dining_tables(id, name, site_id)').eq('id', Number(req.params.id)).maybeSingle()
+  if (!c || c.kind !== 'pedido') return fail(res, 'Pedido no encontrado', 404)
+  if (!sameSite(req, c.site_id)) return fail(res, 'El pedido es de otra sucursal', 403)
+  if (c.status !== 'pendiente' || c.order_id) return fail(res, 'Este pedido ya fue atendido', 409)
+  if (!(await cashOpenAt(c.site_id))) return fail(res, NO_CASH, 409)
+  const r = await addToTable({ orgId: req.user.org_id, table: c.table, items: c.items, userId: req.user.id, note: c.customer_name ? `Cliente: ${c.customer_name}` : null })
+  if (r.error) return fail(res, r.error, 400)
+  await supabase.from('table_calls').update({ status: 'atendido', result: 'aceptado', order_id: r.order.id, attended_by: req.user.id, attended_at: new Date().toISOString() }).eq('id', c.id)
+  await audit(req, 'aceptar', 'pedido_qr', c.id, { table: c.table?.name, order: r.order.number, items: r.rows.map((x) => `${x.quantity} × ${x.name}`) })
+  res.send({ orderId: r.order.id, number: r.order.number })
 }))
 
 // ---------------------------------------------------------------- Carta pública (QR)
 const publicTable = async (token) => {
   if (!/^[0-9a-f]{8,40}$/i.test(token || '')) return null
-  const { data } = await supabase.from('dining_tables').select('id, org_id, site_id, name, active, site:sites(name, active), org:organizations(status)').eq('qr_token', token).maybeSingle()
+  const { data } = await supabase.from('dining_tables').select('id, org_id, site_id, name, seats, active, area:dining_areas(name), site:sites(name, active), org:organizations(status)').eq('qr_token', token).maybeSingle()
   if (!data || !data.active || !data.site?.active || ['suspendida', 'cancelada'].includes(data.org?.status)) return null
   return data
 }
 
 router.get('/carta/:token', h(async (req, res) => {
+  if (qrCheck(req, req.params.token) === false) return res.status(401).send({ message: QR_EXPIRED, expired: true })
   const t = await publicTable(req.params.token)
   if (!t) return fail(res, 'Este código QR ya no está activo. Pide ayuda al personal.', 404)
   await runAsOrg(t.org_id, async () => {
     const { data: wh } = await supabase.rpc('sale_warehouse', { p_site: t.site_id })
     const [{ data: s }, { data: cats }, { data: prods }, { data: stock }, promos, { data: order }, { data: calls }] = await Promise.all([
-      supabase.from('app_settings').select('business_name, short_name, slogan, logo_url, color_primary, color_secondary, color_accent, font_family, social').maybeSingle(),
+      supabase.from('app_settings').select('business_name, short_name, slogan, logo_url, color_primary, color_secondary, color_accent, font_family, social, qr_ordering').maybeSingle(),
       supabase.from('product_categories').select('id, name, emoji, color, description, sort_order').eq('active', true).eq('show_in_menu', true).order('sort_order').order('name'),
       supabase.from('products').select('id, name, description, price, photo_url, category_id, track_stock, unit').eq('active', true).eq('show_in_menu', true).order('name'),
       supabase.from('warehouse_stock').select('product_id, stock').eq('warehouse_id', wh || 0),
       loadActive(),
-      supabase.from('orders').select('number, total, tip, bill_requested_at, items:order_items(name, quantity, unit_price, courtesy, status)').eq('table_id', t.id).eq('status', 'abierto').maybeSingle(),
-      supabase.from('table_calls').select('kind, created_at').eq('table_id', t.id).eq('status', 'pendiente')
+      supabase.from('orders').select('number, total, tip, guests, opened_at, bill_requested_at, waiter:users!orders_waiter_id_fkey(name), items:order_items(id, name, quantity, unit_price, courtesy, status)').eq('table_id', t.id).eq('status', 'abierto').maybeSingle(),
+      supabase.from('table_calls').select('kind, created_at, items, total, order_id').eq('table_id', t.id).eq('status', 'pendiente')
     ])
+    const cashOpen = await cashOpenAt(t.site_id)
     const left = new Map((stock || []).map((x) => [x.product_id, Number(x.stock)]))
     const products = (prods || []).map((p) => {
       const best = bestFor(promos, p)
@@ -189,23 +227,28 @@ router.get('/carta/:token', h(async (req, res) => {
       }
     })
     res.send({
+      session: qrSign(req.params.token), sessionMinutes: QR_SESSION_MIN,
       business: s ? { name: s.business_name, shortName: s.short_name, slogan: s.slogan, logoUrl: s.logo_url, primary: s.color_primary, secondary: s.color_secondary, accent: s.color_accent, font: s.font_family, social: s.social } : null,
-      table: { name: t.name, site: t.site?.name },
+      table: { name: t.name, site: t.site?.name, area: t.area?.name ?? null, seats: t.seats },
+      // Qué puede hacer el cliente: solo llamar, pedir con confirmación o pedir directo. Sin caja abierta no se pide.
+      ordering: s?.qr_ordering || 'llamar', canOrder: (s?.qr_ordering || 'llamar') !== 'llamar' && cashOpen,
       categories: (cats || []).filter((c) => products.some((p) => p.categoryId === c.id)).map((c) => ({ id: c.id, name: c.name, emoji: c.emoji, color: c.color, description: c.description })),
       products,
       order: order ? {
-        number: order.number, total: Number(order.total), billRequested: Boolean(order.bill_requested_at),
-        items: (order.items || []).filter((i) => i.status !== 'anulado').map((i) => ({ name: i.name, quantity: Number(i.quantity), price: Number(i.unit_price), courtesy: i.courtesy, status: i.status }))
+        number: order.number, total: Number(order.total), billRequested: Boolean(order.bill_requested_at), openedAt: order.opened_at, guests: order.guests, waiter: order.waiter?.name ?? null,
+        items: (order.items || []).filter((i) => i.status !== 'anulado').sort((a, b) => a.id - b.id).map((i) => ({ name: i.name, quantity: Number(i.quantity), price: Number(i.unit_price), courtesy: i.courtesy, status: i.status }))
       } : null,
-      calls: (calls || []).map((c) => c.kind)
+      calls: (calls || []).map((c) => c.kind),
+      pendingOrder: (() => { const p = (calls || []).find((c) => c.kind === 'pedido' && !c.order_id); return p ? { items: p.items || [], total: Number(p.total || 0), at: p.created_at } : null })()
     })
   })
 }))
 
 router.post('/carta/:token/llamar', h(async (req, res) => {
+  if (qrCheck(req, req.params.token) !== true) return res.status(401).send({ message: QR_EXPIRED, expired: true })
   const t = await publicTable(req.params.token)
   if (!t) return fail(res, 'Este código QR ya no está activo. Pide ayuda al personal.', 404)
-  const kind = CALLS[req.body?.kind] ? req.body.kind : 'mesero'
+  const kind = ['mesero', 'cuenta'].includes(req.body?.kind) ? req.body.kind : 'mesero'
   await runAsOrg(t.org_id, async () => {
     const note = clean(req.body?.note)?.slice(0, 140) ?? null
     const { error } = await supabase.from('table_calls').insert({ site_id: t.site_id, table_id: t.id, kind, note })
@@ -216,5 +259,50 @@ router.post('/carta/:token/llamar', h(async (req, res) => {
   })
 }))
 
+// El cliente pide desde la carta. Según la configuración:
+// · confirmar: queda como llamado 'pedido' hasta que el mesero lo acepte (un pedido pendiente por mesa).
+// · directo: entra a la cuenta de la mesa y a las comandas; el personal recibe el aviso.
+router.post('/carta/:token/pedido', h(async (req, res) => {
+  if (qrCheck(req, req.params.token) !== true) return res.status(401).send({ message: QR_EXPIRED, expired: true })
+  const { addToTable } = require('./orders')
+  const t = await publicTable(req.params.token)
+  if (!t) return fail(res, 'Este código QR ya no está activo. Pide ayuda al personal.', 404)
+  const b = req.body || {}
+  const list = (Array.isArray(b.items) ? b.items : []).filter((i) => Number(i.productId) && Number(i.quantity) > 0)
+  if (!list.length) return fail(res, 'Agrega al menos un producto', 400)
+  if (list.length > 30 || list.some((i) => Number(i.quantity) > 20)) return fail(res, 'Para un pedido tan grande, llama al mesero', 400)
+  const items = list.map((i) => ({ productId: Number(i.productId), quantity: Math.round(Number(i.quantity)), note: clean(i.note)?.slice(0, 120) ?? null }))
+  const customer = clean(b.name)?.slice(0, 60) ?? null
+  const note = clean(b.note)?.slice(0, 140) ?? null
+  await runAsOrg(t.org_id, async () => {
+    const { data: st } = await supabase.from('app_settings').select('qr_ordering').maybeSingle()
+    const mode = st?.qr_ordering || 'llamar'
+    if (mode === 'llamar') return fail(res, 'En este lugar los pedidos se hacen con el mesero. Toca "Llamar al mesero".', 403)
+    if (!(await cashOpenAt(t.site_id))) return fail(res, 'Todavía no estamos recibiendo pedidos. Llama al mesero.', 409)
+    const { buildItems } = require('./orders')
+    const built = await buildItems({ user: { id: null } }, items)
+    if (built.error) return fail(res, built.error, 400)
+    const summary = built.rows.map((r) => ({ productId: r.product_id, name: r.name, quantity: Number(r.quantity), price: Number(r.unit_price), note: r.note }))
+    const total = summary.reduce((a, r) => a + r.quantity * r.price, 0)
+    const msg = (extra) => notify('mesas', () => callMessage({ table: t.name, kind: 'pedido', note: [customer, note, extra].filter(Boolean).join(' · ') || null, items: summary, site: t.site?.name, siteId: t.site_id }))
+    if (mode === 'confirmar') {
+      const { error } = await supabase.from('table_calls').insert({ site_id: t.site_id, table_id: t.id, kind: 'pedido', note, items: summary.map((r) => ({ ...r })), total, customer_name: customer })
+      if (error?.code === '23505') return fail(res, 'Ya enviaste un pedido. Espera a que el mesero lo confirme.', 409)
+      if (error) throw error
+      msg('por confirmar')
+      return res.status(201).send({ ok: true, mode, message: 'Listo, tu pedido le llegó al mesero. Te avisamos cuando lo confirme.' })
+    }
+    const r = await addToTable({ orgId: t.org_id, table: t, items, note: customer ? `Cliente: ${customer}` : null })
+    if (r.error) return fail(res, r.error, 400)
+    // Aviso para el personal: si ya hay uno sin ver, se le suman los productos.
+    const { data: prev } = await supabase.from('table_calls').select('id, items, total').eq('table_id', t.id).eq('kind', 'pedido').eq('status', 'pendiente').maybeSingle()
+    if (prev) await supabase.from('table_calls').update({ items: [...(prev.items || []), ...summary], total: Number(prev.total || 0) + total, order_id: r.order.id, result: 'directo' }).eq('id', prev.id)
+    else await supabase.from('table_calls').insert({ site_id: t.site_id, table_id: t.id, kind: 'pedido', note, items: summary, total, customer_name: customer, order_id: r.order.id, result: 'directo' })
+    msg('directo a cocina')
+    res.status(201).send({ ok: true, mode, message: 'Listo, tu pedido ya va para la cocina y el bar.' })
+  })
+}))
+
 module.exports = router
 module.exports.CALLS = CALLS
+module.exports.ORDERING = ORDERING

@@ -39,6 +39,7 @@ const toDTO = (s, o) => ({
   tipSuggested: s?.tip_suggested ?? true,
   receiptFooter: s?.receipt_footer || null,
   social: s?.social || {},
+  qrOrdering: s?.qr_ordering || 'llamar',
   nit: o?.nit || null,
   phone: o?.phone || null,
   email: o?.email || null,
@@ -77,6 +78,7 @@ router.put('/configuracion', auth(ADMIN), h(async (req, res) => {
   if (b.businessType && !BUSINESS_TYPES.includes(b.businessType)) errors.push('Tipo de establecimiento no válido')
   const tip = b.tipPercent === undefined ? 10 : Number(b.tipPercent)
   if (!Number.isFinite(tip) || tip < 0 || tip > 100) errors.push('La propina debe estar entre 0 % y 100 %')
+  if (b.qrOrdering !== undefined && !['llamar', 'confirmar', 'directo'].includes(b.qrOrdering)) errors.push('Opción de pedidos por QR no válida')
   if (errors.length) return fail(res, errors.join('. '), 400)
 
   const { error } = await supabase.from('app_settings').update({
@@ -86,7 +88,8 @@ router.put('/configuracion', auth(ADMIN), h(async (req, res) => {
     tip_percent: tip,
     tip_suggested: b.tipSuggested !== false,
     receipt_footer: clean(b.receiptFooter),
-    social: typeof b.social === 'object' && b.social ? b.social : {}
+    social: typeof b.social === 'object' && b.social ? b.social : {},
+    ...(b.qrOrdering ? { qr_ordering: b.qrOrdering } : {})
   }).eq('org_id', currentOrg())
   if (error) throw error
   const { error: e2 } = await supabase.from('organizations').update({

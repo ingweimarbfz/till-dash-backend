@@ -126,6 +126,31 @@ const insertItems = async (req, order, rows) => {
   return { data }
 }
 
+// Pedido de una mesa desde el QR: usa el pedido abierto de la mesa o abre uno, y le agrega los productos.
+// userId: el mesero que aceptó el pedido, o null si el cliente lo hizo directo (queda a nombre del mesero de la mesa).
+const addToTable = async ({ orgId, table, items, userId = null, note = null }) => {
+  const built = await buildItems({ user: { id: userId } }, items)
+  if (built.error) return { error: built.error }
+  const find = async () => (await supabase.from('orders').select('id, number, site_id, waiter_id').eq('table_id', table.id).eq('status', 'abierto').maybeSingle()).data
+  let o = await find()
+  let created = false
+  if (!o) {
+    const { data: number, error: e1 } = await supabase.rpc('next_consecutive', { p_org: orgId, p_kind: 'pedido', p_site: table.site_id, p_prefix: 'P-' })
+    if (e1) throw e1
+    const { data, error } = await supabase.from('orders').insert({ site_id: table.site_id, number, type: 'mesa', table_id: table.id, waiter_id: userId, opened_by: userId, note })
+      .select('id, number, site_id, waiter_id').single()
+    if (error && error.code !== '23505') throw error
+    if (error) o = await find(); else { o = data; created = true }
+    await supabase.from('dining_tables').update({ to_release_at: null }).eq('id', table.id)
+  }
+  const r = await insertItems(null, o, built.rows.map((x) => ({ ...x, user_id: x.user_id ?? o.waiter_id ?? null })))
+  if (r.error) {
+    if (created) await supabase.from('orders').delete().eq('id', o.id)
+    return { error: r.error.code === 'P0001' ? r.error.message : 'No se pudo agregar el pedido' }
+  }
+  return { order: o, created, rows: built.rows }
+}
+
 // ---------------------------------------------------------------- Abrir pedido
 router.post('/pedidos', auth(STAFF), guard(...SELLERS), h(async (req, res) => {
   const b = req.body || {}
@@ -344,3 +369,5 @@ router.put('/comandas/:itemId', auth(STAFF), guard(...KITCHEN, 'mesero'), h(asyn
 module.exports = router
 module.exports.validatePayments = validatePayments
 module.exports.TYPES = TYPES
+module.exports.addToTable = addToTable
+module.exports.buildItems = buildItems

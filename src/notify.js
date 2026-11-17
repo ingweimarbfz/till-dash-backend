@@ -147,9 +147,10 @@ const incidentMessage = ({ number, type, typeLabel, title, cost, responsible, si
   html: lines([`${INCIDENT_EMOJI[type] || '⚠️'} <b>INCIDENTE · ${esc(number)}</b>`, SEP, `<b>${esc(typeLabel)}</b>: ${esc(title)}`, site ? `📍 ${esc(site)}` : null,
     Number(cost) > 0 ? `💸 Costo: ${cop(cost)}` : null, responsible ? `👤 Responsable: ${esc(responsible)}` : null, who(user)])
 })
-const callMessage = ({ table, kind, site, siteId, note }) => ({
+const callMessage = ({ table, kind, site, siteId, note, items }) => ({
   siteId, path: '/mesas',
-  html: lines([kind === 'cuenta' ? `🧾 <b>${esc(table)} PIDE LA CUENTA</b>` : `🙋 <b>${esc(table)} LLAMA AL MESERO</b>`, note ? `📝 ${esc(note)}` : null,
+  html: lines([kind === 'cuenta' ? `🧾 <b>${esc(table)} PIDE LA CUENTA</b>` : kind === 'pedido' ? `🛎️ <b>${esc(table)} HIZO UN PEDIDO</b>` : `🙋 <b>${esc(table)} LLAMA AL MESERO</b>`,
+    ...(items || []).map((i) => `• ${qty(i.quantity)} × ${esc(i.name)}${i.note ? ` (${esc(i.note)})` : ''}`), note ? `📝 ${esc(note)}` : null,
     site ? `📍 ${esc(site)} · ${hour()}` : hour()])
 })
 

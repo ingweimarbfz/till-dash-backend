@@ -2,7 +2,7 @@
 // Sucursales y bodegas
 // · Cada establecimiento nace con una "Sede principal" y una "Bodega principal" (trigger en la base).
 // · Las bodegas de sucursal pertenecen a una sucursal; la principal es de todo el establecimiento.
-// · El stock por bodega, los traslados y las alertas de stock bajo llegan en la etapa 2.
+// · El stock por bodega, los traslados y las alertas de stock bajo están en routes/inventory.js.
 // =====================================================================
 const express = require('express')
 const supabase = require('../db')
@@ -96,6 +96,10 @@ router.put('/bodegas/:id', auth(ADMIN), h(async (req, res) => {
   if (!cur) return fail(res, 'Bodega no encontrada', 404)
   const { errors, row } = await whRow(req.body || {})
   if (cur.is_main) { row.site_id = null; if (!row.active) errors.push('La bodega principal no se puede desactivar') } else if (!row.site_id) errors.push('Elige la sucursal de la bodega')
+  if (!row.active && !cur.is_main) {
+    const { count } = await supabase.from('warehouse_stock').select('product_id', { count: 'exact', head: true }).eq('warehouse_id', id).gt('stock', 0)
+    if (count) errors.push('La bodega tiene existencias: trasládalas antes de desactivarla')
+  }
   if (errors.length) return fail(res, errors.join('. '), 400)
   const { data, error } = await supabase.from('warehouses').update(row).eq('id', id).select('*').single()
   if (error) return dup(error, 'una bodega') ? fail(res, dup(error, 'una bodega'), 409) : fail(res, error)

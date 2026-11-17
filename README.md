@@ -38,7 +38,7 @@ scripts/seed.js        crea un establecimiento con su super administrador
 
 Un usuario puede tener varios perfiles (por ejemplo admin y empleado cajero) y elige con cuál entra.
 
-## Endpoints (etapa 1)
+## Endpoints (etapa 1: base)
 | Método | Ruta | Rol |
 |---|---|---|
 | POST | `/login` | público |
@@ -53,6 +53,26 @@ Un usuario puede tener varios perfiles (por ejemplo admin y empleado cajero) y e
 | GET | `/bitacora`, `/bitacora/filtros` | superadmin, admin |
 | GET | `/dashboard` | todos (cifras según el rol) |
 | GET | `/buscar?q=` | superadmin, admin, empleado |
+
+## Endpoints (etapa 2: catálogo e inventario)
+| Método | Ruta | Rol |
+|---|---|---|
+| GET/POST/PUT | `/inventario/categorias` | superadmin, admin (lectura: empleados) |
+| GET/POST/PUT | `/inventario/productos`, GET `/inventario/productos/:id` | superadmin, admin (lectura: empleados) |
+| GET | `/inventario/existencias`, `/inventario/bodegas`, `/inventario/resumen` | superadmin, admin, empleado |
+| GET/POST | `/inventario/movimientos` (entrada, ajuste o baja de varios productos) | escritura: superadmin, admin |
+| GET/POST | `/inventario/traslados` | escritura: superadmin, admin |
+| GET | `/inventario/alertas` (stock bajo para los avisos tipo toast) | superadmin, admin, empleado |
+| GET/POST/PUT | `/descuentos` | superadmin, admin (lectura: empleados) |
+| GET/POST/PUT/DELETE | `/promociones` | superadmin, admin (lectura: empleados) |
+| GET/PUT/DELETE | `/notificaciones`, `/notificaciones/bot`, `/notificaciones/canales` | superadmin, admin |
+
+Filtros de lugar: `?sede=` (bodegas de esa sucursal) o `?bodega=`. El empleado siempre ve su sucursal.
+
+### Stock bajo
+Una bodega queda baja en un producto cuando su existencia llega al mínimo del producto o por debajo (con mínimo 0, cuando se agota).
+Después de cada entrada, ajuste, baja o traslado se avisa por Telegram una sola vez por bodega y producto (`warehouse_stock.low_alerted`);
+al reponer se rearma el aviso. El navegador consulta `/inventario/alertas` cada minuto para mostrar los toasts.
 
 ## Consecutivos
 `select public.next_consecutive(org_id, 'orden', site_id, 'OR-')` entrega el siguiente número sin repetirse,

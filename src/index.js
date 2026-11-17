@@ -20,6 +20,9 @@ app.use(require('./routes/sites'))
 app.use(require('./routes/logbook'))
 app.use(require('./routes/dashboard'))
 app.use(require('./routes/search'))
+app.use(require('./routes/inventory'))
+app.use(require('./routes/promotions'))
+app.use(require('./routes/notifications'))
 
 app.use((req, res) => res.status(404).send({ message: 'Ruta no encontrada' }))
 

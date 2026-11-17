@@ -13,7 +13,10 @@ const runAsOrg = (orgId, fn) => ctx.run({ orgId: Number(orgId) }, fn)
 
 // Tablas con org_id. Cada etapa agrega aquí sus tablas nuevas.
 const TENANT_TABLES = new Set([
-  'users', 'app_settings', 'audit_log', 'sites', 'warehouses', 'doc_sequences'
+  'users', 'app_settings', 'audit_log', 'sites', 'warehouses', 'doc_sequences',
+  // Etapa 2: catálogo, inventario, descuentos, promociones y Telegram
+  'product_categories', 'products', 'warehouse_stock', 'inventory_movements', 'discounts', 'promotions',
+  'notification_settings', 'notification_channels', 'notification_log'
 ])
 
 const withOrg = (rows, org) => (Array.isArray(rows) ? rows.map((r) => ({ ...r, org_id: org })) : { ...rows, org_id: org })

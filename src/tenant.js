@@ -19,7 +19,7 @@ const TENANT_TABLES = new Set([
   'notification_settings', 'notification_channels', 'notification_log',
   // Etapa 3: mesas, pedidos, caja, bóveda y cuentas por cobrar
   'dining_areas', 'dining_tables', 'cash_registers', 'cash_sessions', 'vaults', 'vault_movements', 'orders', 'order_items',
-  'order_payments', 'receivables', 'receivable_payments', 'cash_movements', 'table_calls'
+  'order_payments', 'receivables', 'receivable_payments', 'cash_movements', 'table_calls', 'tip_payouts', 'incidents'
 ])
 
 const withOrg = (rows, org) => (Array.isArray(rows) ? rows.map((r) => ({ ...r, org_id: org })) : { ...rows, org_id: org })

@@ -13,6 +13,7 @@ const SECTIONS = {
   pedidos: { label: 'Pedidos', hint: 'Cortesías, anulaciones de productos y de pedidos completos' },
   caja: { label: 'Caja y bóveda', hint: 'Apertura y cierre de turnos con el arqueo, retiros y consignaciones de la bóveda' },
   mesas: { label: 'Mesas', hint: 'Llamados al mesero y cuentas pedidas desde el QR de la mesa' },
+  incidentes: { label: 'Incidentes', hint: 'Platos rotos, daños, faltantes y accidentes reportados por el equipo' },
   resumen: { label: 'Resumen diario', hint: 'Ventas, órdenes y propinas del día (etapa 4)', soon: true }
 }
 const API = 'https://api.telegram.org'
@@ -124,19 +125,27 @@ const cashOpenMessage = ({ number, register, site, siteId, amount, fromVault, us
   html: lines([`🔓 <b>APERTURA DE CAJA · ${esc(number)}</b>`, SEP, `💵 ${esc(register)} · base ${cop(amount)}${fromVault ? ' (desde la bóveda)' : ''}`,
     site ? `📍 ${esc(site)}` : null, who(user)])
 })
-const cashCloseMessage = ({ number, register, site, siteId, sales, byMethod, expected, counted, difference, toVault, tips, orders, user }) => ({
+const cashCloseMessage = ({ number, register, site, siteId, sales, byMethod, expected, counted, difference, toVault, tips, orders, user, tipsPaid = [], nextFloat = 0, note }) => ({
   siteId, path: '/caja',
   html: lines([`🔒 <b>CIERRE DE CAJA · ${esc(number)}</b>`, SEP, `💵 ${esc(register)}${site ? ` · 📍 ${esc(site)}` : ''}`,
     `🧾 ${orders} pedido${orders === 1 ? '' : 's'} · ventas ${cop(sales)} · propinas ${cop(tips)}`,
     ...Object.entries(byMethod).map(([m, v]) => `   ${esc(m)}: ${cop(v)}`),
     `Efectivo esperado: ${cop(expected)}`, `Efectivo contado: ${cop(counted)}`,
     Number(difference) === 0 ? '✅ Cuadra exacto' : `${difference > 0 ? '⬆️ Sobrante' : '⚠️ Faltante'}: ${cop(Math.abs(difference))}`,
-    toVault > 0 ? `🏦 A la bóveda: ${cop(toVault)}` : null, who(user)])
+    tipsPaid.length ? `🤝 Propinas pagadas:` : null, ...tipsPaid.map((t) => `   ${esc(t.name)}: ${cop(t.amount)}`),
+    nextFloat > 0 ? `🪙 Queda en caja para el próximo turno: ${cop(nextFloat)}` : null,
+    toVault > 0 ? `🏦 A la bóveda: ${cop(toVault)}` : null, note ? `📝 ${esc(note)}` : null, who(user)])
 })
 const vaultMessage = ({ label, amount, balance, note, site, siteId, user }) => ({
   siteId, path: '/caja?tab=boveda',
   html: lines([`🏦 <b>BÓVEDA · ${esc(label.toUpperCase())}</b>`, SEP, `${amount > 0 ? '⬆️ Entra' : '⬇️ Sale'} ${cop(Math.abs(amount))} · saldo ${cop(balance)}`,
     note ? `📝 ${esc(note)}` : null, site ? `📍 ${esc(site)}` : null, who(user)])
+})
+const INCIDENT_EMOJI = { rotura: '🍽️', dano: '🛠️', faltante: '📦', accidente: '🚑', queja: '🗣️', otro: '⚠️' }
+const incidentMessage = ({ number, type, typeLabel, title, cost, responsible, site, siteId, user }) => ({
+  siteId, path: '/incidentes',
+  html: lines([`${INCIDENT_EMOJI[type] || '⚠️'} <b>INCIDENTE · ${esc(number)}</b>`, SEP, `<b>${esc(typeLabel)}</b>: ${esc(title)}`, site ? `📍 ${esc(site)}` : null,
+    Number(cost) > 0 ? `💸 Costo: ${cop(cost)}` : null, responsible ? `👤 Responsable: ${esc(responsible)}` : null, who(user)])
 })
 const callMessage = ({ table, kind, site, siteId, note }) => ({
   siteId, path: '/mesas',
@@ -144,4 +153,4 @@ const callMessage = ({ table, kind, site, siteId, note }) => ({
     site ? `📍 ${esc(site)} · ${hour()}` : hour()])
 })
 
-module.exports = { SECTIONS, tg, esc, qty, cop, loadSettings, notify, send, lowStockMessage, movementMessage, transferMessage, courtesyMessage, voidMessage, cashOpenMessage, cashCloseMessage, vaultMessage, callMessage }
+module.exports = { SECTIONS, tg, esc, qty, cop, loadSettings, notify, send, lowStockMessage, movementMessage, transferMessage, courtesyMessage, voidMessage, cashOpenMessage, cashCloseMessage, vaultMessage, callMessage, incidentMessage }

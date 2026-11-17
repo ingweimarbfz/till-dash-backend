@@ -1,6 +1,6 @@
 // =====================================================================
 // Descuentos y promociones (TD-002, modelo de QuontUp360)
-// · Descuento: porcentaje o valor fijo que se aplica al total de un pedido (etapa 3), con ícono y color.
+// · Descuento: porcentaje o valor fijo que se aplica al total de un pedido al cobrar, con ícono y color.
 //   Puede exigir que quien lo aplica escriba el motivo.
 // · Promoción: precio especial automático por producto, categoría o toda la carta, vigente por fechas,
 //   franja horaria (happy hour, también cruzando la medianoche) y días de la semana. src/promo.js decide
@@ -132,9 +132,11 @@ router.put('/promociones/:id', auth(ADMIN), h(async (req, res) => {
   await audit(req, 'editar', 'promocion', data.id, { name: data.name, active: data.active })
   res.send(promotionDTO(data, ...(await catalogs())))
 }))
-// En la etapa 3, una promoción ya usada en pedidos solo se podrá desactivar.
+// Una promoción que ya se usó en pedidos no se borra (quedaría sin rastro en los reportes): se desactiva.
 router.delete('/promociones/:id', auth(ADMIN), h(async (req, res) => {
   const id = Number(req.params.id)
+  const { count } = await supabase.from('order_items').select('id', { count: 'exact', head: true }).eq('promotion_id', id)
+  if (count) return fail(res, `La promoción ya se usó en ${count} producto${count === 1 ? '' : 's'} vendido${count === 1 ? '' : 's'}: desactívala en lugar de eliminarla`, 409)
   const { data } = await supabase.from('promotions').delete().eq('id', id).select('id, name').maybeSingle()
   if (!data) return fail(res, 'Promoción no encontrada', 404)
   await audit(req, 'eliminar', 'promocion', id, { name: data.name })

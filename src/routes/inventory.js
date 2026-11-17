@@ -3,7 +3,7 @@
 // · Categorías de la carta y productos, con precio, costo, unidad y foto.
 // · Existencias por bodega: la bodega principal abastece a las sucursales y cada sucursal tiene las suyas.
 // · Entradas, ajustes y bajas (varios productos a la vez, con un consecutivo), traslados entre bodegas
-//   y, desde la etapa 3, las ventas descuentan de la bodega de la sucursal.
+//   y las ventas (pedidos) descuentan de la bodega de la sucursal.
 // · Alertas de stock bajo: toast en el navegador (/inventario/alertas) y Telegram (src/stock.js).
 // =====================================================================
 const express = require('express')

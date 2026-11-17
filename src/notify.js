@@ -3,17 +3,17 @@
 // · Cada establecimiento conecta su bot (token de @BotFather) y elige qué grupos reciben cada sección.
 // · Un grupo pertenece a una sucursal (solo recibe lo de esa sucursal) o a todas.
 // · El envío corre en segundo plano y nunca hace fallar la petición que lo origina.
-// · Secciones: inventario (stock bajo, entradas, bajas y traslados). Pedidos, caja y mesas llegan
-//   en la etapa 3; se listan para que el establecimiento deje listos sus grupos.
+// · Secciones: inventario (stock bajo, entradas, bajas y traslados), pedidos (anulaciones y cortesías),
+//   caja (apertura, cierre y bóveda) y mesas (llamados desde el QR). El resumen diario llega en la etapa 4.
 // =====================================================================
 const supabase = require('./db')
 
 const SECTIONS = {
   inventario: { label: 'Inventario', hint: 'Productos que llegan al mínimo o se agotan, entradas, bajas y traslados entre bodegas' },
-  pedidos: { label: 'Pedidos', hint: 'Pedidos nuevos, cortesías y anulaciones (etapa 3)', soon: true },
-  caja: { label: 'Caja y bóveda', hint: 'Apertura y cierre de caja, traslados a la bóveda (etapa 3)', soon: true },
-  mesas: { label: 'Mesas', hint: 'Llamados de mesa desde el QR (etapa 3)', soon: true },
-  resumen: { label: 'Resumen diario', hint: 'Ventas, órdenes y propinas del día (etapa 3)', soon: true }
+  pedidos: { label: 'Pedidos', hint: 'Cortesías, anulaciones de productos y de pedidos completos' },
+  caja: { label: 'Caja y bóveda', hint: 'Apertura y cierre de turnos con el arqueo, retiros y consignaciones de la bóveda' },
+  mesas: { label: 'Mesas', hint: 'Llamados al mesero y cuentas pedidas desde el QR de la mesa' },
+  resumen: { label: 'Resumen diario', hint: 'Ventas, órdenes y propinas del día (etapa 4)', soon: true }
 }
 const API = 'https://api.telegram.org'
 const TZ = 'America/Bogota'
@@ -103,4 +103,45 @@ const transferMessage = ({ ref, from, to, items, note, user }) => ({
     (note ? `\n📝 ${esc(note)}` : '') + `\n🧑‍💼 ${esc(fullName(user))} · 🕒 ${hour()}`
 })
 
-module.exports = { SECTIONS, tg, esc, qty, loadSettings, notify, send, lowStockMessage, movementMessage, transferMessage }
+// ---------- Etapa 3: pedidos, caja y mesas ----------
+const cop = (v) => `$${Math.round(Number(v || 0)).toLocaleString('es-CO')}`
+const lines = (a) => a.filter(Boolean).join('\n')
+const who = (user) => `👤 ${esc(fullName(user))} · ${hour()}`
+
+const courtesyMessage = ({ order, item, reason, user, siteId, site }) => ({
+  siteId, path: `/pedidos/${order.id}`,
+  html: lines([`🎁 <b>CORTESÍA · ${esc(order.number)}</b>`, SEP, `${qty(item.quantity)} × ${esc(item.name)} · ${cop(item.quantity * item.unit_price)}`,
+    `📝 ${esc(reason)}`, site ? `📍 ${esc(site)}` : null, who(user)])
+})
+const voidMessage = ({ order, items, reason, user, siteId, site, whole }) => ({
+  siteId, path: `/pedidos/${order.id}`,
+  html: lines([`🚫 <b>${whole ? 'PEDIDO ANULADO' : 'PRODUCTO ANULADO'} · ${esc(order.number)}</b>`, SEP,
+    ...items.map((i) => `• ${qty(i.quantity)} × ${esc(i.name)} · ${cop(i.quantity * i.unit_price)}`),
+    `📝 ${esc(reason)}`, site ? `📍 ${esc(site)}` : null, who(user)])
+})
+const cashOpenMessage = ({ number, register, site, siteId, amount, fromVault, user }) => ({
+  siteId, path: '/caja',
+  html: lines([`🔓 <b>APERTURA DE CAJA · ${esc(number)}</b>`, SEP, `💵 ${esc(register)} · base ${cop(amount)}${fromVault ? ' (desde la bóveda)' : ''}`,
+    site ? `📍 ${esc(site)}` : null, who(user)])
+})
+const cashCloseMessage = ({ number, register, site, siteId, sales, byMethod, expected, counted, difference, toVault, tips, orders, user }) => ({
+  siteId, path: '/caja',
+  html: lines([`🔒 <b>CIERRE DE CAJA · ${esc(number)}</b>`, SEP, `💵 ${esc(register)}${site ? ` · 📍 ${esc(site)}` : ''}`,
+    `🧾 ${orders} pedido${orders === 1 ? '' : 's'} · ventas ${cop(sales)} · propinas ${cop(tips)}`,
+    ...Object.entries(byMethod).map(([m, v]) => `   ${esc(m)}: ${cop(v)}`),
+    `Efectivo esperado: ${cop(expected)}`, `Efectivo contado: ${cop(counted)}`,
+    Number(difference) === 0 ? '✅ Cuadra exacto' : `${difference > 0 ? '⬆️ Sobrante' : '⚠️ Faltante'}: ${cop(Math.abs(difference))}`,
+    toVault > 0 ? `🏦 A la bóveda: ${cop(toVault)}` : null, who(user)])
+})
+const vaultMessage = ({ label, amount, balance, note, site, siteId, user }) => ({
+  siteId, path: '/caja?tab=boveda',
+  html: lines([`🏦 <b>BÓVEDA · ${esc(label.toUpperCase())}</b>`, SEP, `${amount > 0 ? '⬆️ Entra' : '⬇️ Sale'} ${cop(Math.abs(amount))} · saldo ${cop(balance)}`,
+    note ? `📝 ${esc(note)}` : null, site ? `📍 ${esc(site)}` : null, who(user)])
+})
+const callMessage = ({ table, kind, site, siteId, note }) => ({
+  siteId, path: '/mesas',
+  html: lines([kind === 'cuenta' ? `🧾 <b>${esc(table)} PIDE LA CUENTA</b>` : `🙋 <b>${esc(table)} LLAMA AL MESERO</b>`, note ? `📝 ${esc(note)}` : null,
+    site ? `📍 ${esc(site)} · ${hour()}` : hour()])
+})
+
+module.exports = { SECTIONS, tg, esc, qty, cop, loadSettings, notify, send, lowStockMessage, movementMessage, transferMessage, courtesyMessage, voidMessage, cashOpenMessage, cashCloseMessage, vaultMessage, callMessage }

@@ -23,6 +23,9 @@ app.use(require('./routes/search'))
 app.use(require('./routes/inventory'))
 app.use(require('./routes/promotions'))
 app.use(require('./routes/notifications'))
+app.use(require('./routes/tables'))
+app.use(require('./routes/orders'))
+app.use(require('./routes/cash'))
 
 app.use((req, res) => res.status(404).send({ message: 'Ruta no encontrada' }))
 

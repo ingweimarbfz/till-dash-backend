@@ -17,7 +17,7 @@ const { guard, workSite, sameSite, dbError, money, isMoney, PAY_METHODS, fullNam
 const router = express.Router()
 
 const MOVE_TYPES = { apertura: 'Base de apertura', venta: 'Venta', abono: 'Abono a cuenta', ingreso: 'Ingreso', egreso: 'Egreso', a_boveda: 'A la bóveda', propina_pagada: 'Propina pagada' }
-const VAULT_TYPES = { deposito: 'Depósito', retiro: 'Retiro', cierre_caja: 'Cierre de caja', base_caja: 'Base de caja', consignacion: 'Consignación al banco', ajuste: 'Ajuste' }
+const VAULT_TYPES = { deposito: 'Depósito', retiro: 'Retiro', cierre_caja: 'Cierre de caja', base_caja: 'Base de caja', consignacion: 'Consignación al banco', ajuste: 'Ajuste', ingreso: 'Ingreso de dinero', gasto: 'Gasto', traslado: 'Traslado', retiro_socio: 'Retiro de socio', anulacion: 'Anulación' }
 
 const registerDTO = (r) => ({ id: r.id, siteId: r.site_id, site: r.site?.name ?? null, name: r.name, active: r.active, floatAmount: Number(r.float_amount || 0) })
 
@@ -60,11 +60,13 @@ router.get('/caja/cajas', auth(STAFF), h(async (req, res) => {
   let q = supabase.from('cash_registers').select('*, site:sites(name)').order('site_id').order('name')
   const site = ADMIN.includes(req.user.role) ? req.siteId : req.user.site_id
   if (site) q = q.eq('site_id', site)
-  const [{ data, error }, { data: open }] = await Promise.all([q, supabase.from('cash_sessions').select(SESSION_COLUMNS).eq('status', 'abierta')])
+  const [{ data, error }, { data: open }, { data: vaults }] = await Promise.all([q, supabase.from('cash_sessions').select(SESSION_COLUMNS).eq('status', 'abierta'), supabase.from('vaults').select('site_id, balance').not('site_id', 'is', null)])
   if (error) throw error
+  // siteFund: lo que hay en el fondo de la sucursal para completar la base al abrir.
   res.send(data.map((r) => {
     const s = (open || []).find((x) => x.register_id === r.id)
-    return { ...registerDTO(r), session: s ? sessionDTO(s) : null }
+    const v = (vaults || []).find((x) => x.site_id === r.site_id)
+    return { ...registerDTO(r), siteFund: Number(v?.balance || 0), session: s ? sessionDTO(s) : null }
   }))
 }))
 router.post('/caja/cajas', auth(ADMIN), h(async (req, res) => {
@@ -109,11 +111,12 @@ router.get('/caja/turnos/:id', auth(STAFF), guard('cajero'), h(async (req, res) 
 router.post('/caja/turnos', auth(STAFF), guard('cajero'), h(async (req, res) => {
   const b = req.body || {}
   if (!Number(b.registerId)) return fail(res, 'Elige la caja', 400)
-  if (b.openingAmount !== undefined && !isMoney(b.openingAmount)) return fail(res, 'La base no es válida', 400)
-  const { data: reg } = await supabase.from('cash_registers').select('id, name, site_id, site:sites(name)').eq('id', Number(b.registerId)).maybeSingle()
+  if (!isMoney(b.openingAmount) || !(Number(b.openingAmount) > 0)) return fail(res, 'Escribe la base con la que abre la caja', 400)
+  const { data: reg } = await supabase.from('cash_registers').select('id, name, site_id, float_amount, site:sites(name)').eq('id', Number(b.registerId)).maybeSingle()
   if (!reg || !sameSite(req, reg.site_id)) return fail(res, 'Caja no encontrada', 404)
-  const fromVault = Boolean(b.fromVault)
-  const { data: id, error } = await supabase.rpc('open_cash_session', { p: { org_id: req.user.org_id, register_id: reg.id, user_id: req.user.id, opening_amount: money(b.openingAmount), from_vault: fromVault, note: clean(b.note) } })
+  // La base sale de lo que quedó en la caja y, si falta, del fondo de la sucursal (Finanzas → Fondos).
+  const fromVault = money(b.openingAmount) > Number(reg.float_amount || 0)
+  const { data: id, error } = await supabase.rpc('open_cash_session', { p: { org_id: req.user.org_id, register_id: reg.id, user_id: req.user.id, opening_amount: money(b.openingAmount), note: clean(b.note) } })
   if (error) return dbError(res, error)
   const s = await loadSession(id)
   await audit(req, 'abrir', 'turno_caja', s.id, { number: s.number, register: reg.name, opening: Number(s.opening_amount), fromVault })

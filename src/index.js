@@ -28,6 +28,7 @@ app.use(require('./routes/orders'))
 app.use(require('./routes/cash'))
 app.use(require('./routes/incidents'))
 app.use(require('./routes/reports'))
+app.use(require('./routes/finance'))
 
 app.use((req, res) => res.status(404).send({ message: 'Ruta no encontrada' }))
 

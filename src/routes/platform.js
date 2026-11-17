@@ -524,3 +524,5 @@ router.post('/plan/solicitud', auth(OWNER), h(async (req, res) => {
 }))
 
 module.exports = router
+module.exports.pauth = pauth
+module.exports.paudit = paudit

@@ -9,6 +9,7 @@ const { h, todayBogota } = require('../http')
 const { auth } = require('../auth')
 const { dayStart } = require('./logbook')
 const { currentAlerts } = require('../stock')
+const { tableStats } = require('./reports')
 
 const router = express.Router()
 
@@ -36,7 +37,8 @@ router.get('/dashboard', auth(), h(async (req, res) => {
     let whs = null
     if (req.siteId) whs = ((await supabase.from('warehouses').select('id').eq('site_id', req.siteId)).data || []).map((w) => w.id)
     const from = dayStart(today)
-    const [users, employees, sites, warehouses, activityToday, recent, products, alerts, sales, openOrders, tables, occupied, calls, sessions, cxc] = await Promise.all([
+    const month = new Date(Date.now() - 30 * 864e5).toISOString()
+    const [users, employees, sites, warehouses, activityToday, recent, products, alerts, sales, openOrders, tables, occupied, calls, sessions, cxc, used] = await Promise.all([
       count('users', (q) => site(q.eq('active', true))),
       count('users', (q) => site(q.eq('active', true).eq('role', 'empleado'))),
       count('sites', (q) => q.eq('active', true)),
@@ -52,8 +54,11 @@ router.get('/dashboard', auth(), h(async (req, res) => {
       count('orders', (q) => site(q.eq('status', 'abierto').not('table_id', 'is', null))),
       site(supabase.from('table_calls').select('id, kind, created_at, table:dining_tables(name)').eq('status', 'pendiente').order('created_at')),
       site(supabase.from('cash_sessions').select('id, number, opening_amount, opened_at, register:cash_registers(name), site:sites(name)').eq('status', 'abierta')),
-      site(supabase.from('receivables').select('amount, paid').eq('status', 'pendiente'))
+      site(supabase.from('receivables').select('amount, paid').eq('status', 'pendiente')),
+      site(supabase.from('orders').select('id, table_id, guests, total, tip, opened_at, closed_at, table:dining_tables(name, seats, area:dining_areas(name))')
+        .eq('status', 'cobrado').not('table_id', 'is', null).gte('closed_at', month)).order('closed_at', { ascending: false }).limit(3000)
     ])
+    const usage = tableStats(used.data || [])
     return res.send({
       role,
       kpis: {
@@ -62,6 +67,7 @@ router.get('/dashboard', auth(), h(async (req, res) => {
         openOrders, tables, occupiedTables: occupied, pendingCalls: (calls.data || []).length, openSessions: (sessions.data || []).length,
         receivables: (cxc.data || []).reduce((a, r) => a + Number(r.amount) - Number(r.paid), 0)
       },
+      tableUsage: { days: 30, turns: usage.turns, avgMinutes: usage.avgMinutes, medianMinutes: usage.medianMinutes, perHour: usage.perHour, best: usage.rows.slice(0, 5), areas: usage.areas },
       salesByHour: sales.byHour.filter((x) => x.hour >= 6 || x.total > 0),
       calls: (calls.data || []).map((c) => ({ id: c.id, kind: c.kind, table: c.table?.name, createdAt: c.created_at })),
       sessions: (sessions.data || []).map((x) => ({ id: x.id, number: x.number, register: x.register?.name, site: x.site?.name, openingAmount: Number(x.opening_amount), openedAt: x.opened_at })),

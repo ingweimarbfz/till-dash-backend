@@ -40,7 +40,8 @@ router.get('/mesas', auth(STAFF), h(async (req, res) => {
     const live = (o?.items || []).filter((i) => i.status !== 'anulado')
     return {
       ...tableDTO(t),
-      status: !o ? 'libre' : o.bill_requested_at ? 'por_cobrar' : 'ocupada',
+      status: o ? (o.bill_requested_at ? 'por_cobrar' : 'ocupada') : t.to_release_at ? 'por_liberar' : 'libre',
+      releasePending: !o && t.to_release_at ? { since: t.to_release_at, orderId: t.last_order_id } : null,
       order: o ? {
         id: o.id, number: o.number, alias: o.alias, guests: o.guests, total: Number(o.total), openedAt: o.opened_at, billRequestedAt: o.bill_requested_at,
         waiter: fullName(o.waiter), customer: o.customer_name, items: live.length, ready: live.filter((i) => i.status === 'listo').length
@@ -117,6 +118,18 @@ router.put('/mesas/:id', auth(ADMIN), h(async (req, res) => {
   await audit(req, 'editar', 'mesa', data.id, { name: data.name })
   res.send(tableDTO(data))
 }))
+// Mesa cobrada que ya se limpió: queda libre para los siguientes clientes.
+router.post('/mesas/:id/liberar', auth(STAFF), h(async (req, res) => {
+  const { data: t } = await supabase.from('dining_tables').select('id, name, site_id, to_release_at').eq('id', Number(req.params.id)).maybeSingle()
+  if (!t || !sameSite(req, t.site_id)) return fail(res, 'Mesa no encontrada', 404)
+  if (t.to_release_at) {
+    const { error } = await supabase.from('dining_tables').update({ to_release_at: null }).eq('id', t.id)
+    if (error) throw error
+    await audit(req, 'liberar', 'mesa', t.id, { name: t.name })
+  }
+  res.send({ ok: true })
+}))
+
 // Un QR nuevo deja sin servicio el anterior (por ejemplo, si se fotografió y se usa desde fuera).
 router.post('/mesas/:id/qr', auth(ADMIN), h(async (req, res) => {
   const token = require('crypto').randomBytes(9).toString('hex')

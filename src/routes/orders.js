@@ -161,6 +161,7 @@ router.post('/pedidos', auth(STAFF), guard(...SELLERS), h(async (req, res) => {
       return dbError(res, r.error)
     }
   }
+  if (table) await supabase.from('dining_tables').update({ to_release_at: null }).eq('id', table.id)
   await supabase.from('table_calls').update({ status: 'atendido', attended_by: req.user.id, attended_at: new Date().toISOString() }).eq('table_id', table?.id ?? 0).eq('kind', 'mesero').eq('status', 'pendiente')
   await audit(req, 'crear', 'pedido', order.id, { number, table: table?.name ?? null, type })
   res.status(201).send(orderDTO(await loadOrder(order.id)))

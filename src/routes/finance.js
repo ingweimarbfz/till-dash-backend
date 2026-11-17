@@ -19,7 +19,7 @@ const router = express.Router()
 
 const ENTRY_KINDS = { aporte_socio: 'Aporte de socio', capital: 'Capital del negocio', prestamo: 'Préstamo', otro_ingreso: 'Otro ingreso' }
 const EXPENSE_CATEGORIES = {
-  nomina: 'Nómina y prestaciones', arriendo: 'Arriendo', servicios: 'Servicios públicos e internet', compras: 'Compras de inventario',
+  nomina: 'Nómina y prestaciones', arriendo: 'Arriendo', servicios: 'Servicios públicos e internet', compras: 'Compras de inventario', insumos: 'Insumos de operación',
   mantenimiento: 'Mantenimiento y reparaciones', impuestos: 'Impuestos y licencias', marketing: 'Publicidad y marketing',
   transporte: 'Transporte y domicilios', bancarios: 'Gastos bancarios y comisiones', otros: 'Otros gastos'
 }

@@ -141,6 +141,11 @@ const vaultMessage = ({ label, amount, balance, note, site, siteId, user }) => (
   html: lines([`🏦 <b>BÓVEDA · ${esc(label.toUpperCase())}</b>`, SEP, `${amount > 0 ? '⬆️ Entra' : '⬇️ Sale'} ${cop(Math.abs(amount))} · saldo ${cop(balance)}`,
     note ? `📝 ${esc(note)}` : null, site ? `📍 ${esc(site)}` : null, who(user)])
 })
+const cashRequestMessage = ({ number, status, amount, reason, session, register, site, siteId, user }) => ({
+  siteId, path: '/caja?tab=solicitudes',
+  html: lines([status === 'pendiente' ? `🙏 <b>SOLICITUD DE RECURSOS · ${esc(number)}</b>` : status === 'aprobada' ? `✅ <b>RECURSOS APROBADOS · ${esc(number)}</b>` : `❌ <b>RECURSOS RECHAZADOS · ${esc(number)}</b>`, SEP,
+    `💵 ${cop(amount)} para ${esc(register || 'la caja')}${session ? ` (${esc(session)})` : ''}`, reason ? `📝 ${esc(reason)}` : null, site ? `📍 ${esc(site)}` : null, who(user)])
+})
 const INCIDENT_EMOJI = { rotura: '🍽️', dano: '🛠️', faltante: '📦', accidente: '🚑', queja: '🗣️', otro: '⚠️' }
 const incidentMessage = ({ number, type, typeLabel, title, cost, responsible, site, siteId, user }) => ({
   siteId, path: '/incidentes',
@@ -154,4 +159,4 @@ const callMessage = ({ table, kind, site, siteId, note, items }) => ({
     site ? `📍 ${esc(site)} · ${hour()}` : hour()])
 })
 
-module.exports = { SECTIONS, tg, esc, qty, cop, loadSettings, notify, send, lowStockMessage, movementMessage, transferMessage, courtesyMessage, voidMessage, cashOpenMessage, cashCloseMessage, vaultMessage, callMessage, incidentMessage }
+module.exports = { SECTIONS, tg, esc, qty, cop, loadSettings, notify, send, lowStockMessage, movementMessage, transferMessage, courtesyMessage, voidMessage, cashOpenMessage, cashCloseMessage, vaultMessage, callMessage, incidentMessage, cashRequestMessage }

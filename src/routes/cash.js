@@ -11,7 +11,7 @@ const supabase = require('../db')
 const { h, fail, clean } = require('../http')
 const { auth, ADMIN, STAFF } = require('../auth')
 const { audit } = require('../audit')
-const { notify, cashOpenMessage, cashCloseMessage, vaultMessage } = require('../notify')
+const { notify, cashOpenMessage, cashCloseMessage, vaultMessage, cashRequestMessage } = require('../notify')
 const { guard, workSite, sameSite, dbError, money, isMoney, PAY_METHODS, fullName } = require('../ops')
 
 const router = express.Router()
@@ -131,6 +131,7 @@ router.post('/caja/turnos/:id/movimientos', auth(STAFF), guard('cajero'), h(asyn
   const b = req.body || {}
   const type = ['ingreso', 'egreso', 'propina_pagada'].includes(b.type) ? b.type : null
   if (!type) return fail(res, 'Elige si es ingreso o egreso', 400)
+  if (type === 'egreso' && !ADMIN.includes(req.user.role)) return fail(res, 'Registra el egreso como gasto del turno (o pide recursos al administrador si supera el tope)', 403)
   if (!(Number(b.amount) > 0)) return fail(res, 'Escribe un valor mayor que cero', 400)
   if (!clean(b.note)) return fail(res, 'Escribe el concepto', 400)
   const amount = money(b.amount) * (type === 'ingreso' ? 1 : -1)
@@ -192,6 +193,106 @@ router.post('/caja/turnos/:id/cerrar', auth(STAFF), guard('cajero'), h(async (re
     difference: Number(data.difference), toVault: Number(data.toVault), nextFloat: Number(data.nextFloat), tipsPaid: summary.tipPayouts, note: clean(b.note), user: req.user
   }))
   res.send({ ...sessionDTO(after), summary })
+}))
+
+// ---------------------------------------------------------------- Gastos del turno y solicitudes de recursos
+// Gastos menores que salen del efectivo de la caja (hielo, limones, un domicilio). Quedan como gasto en
+// Finanzas. Cada gasto tiene un tope; para compras mayores el cajero pide recursos al administrador.
+const SHIFT_CATEGORIES = { insumos: 'Insumos (hielo, limones, desechables)', mantenimiento: 'Mantenimiento y reparaciones', transporte: 'Transporte y domicilios', servicios: 'Servicios', otros: 'Otros gastos' }
+const REQUEST_STATUS = { pendiente: 'Pendiente', aprobada: 'Aprobada', rechazada: 'Rechazada' }
+const expenseLimit = async () => Number((await supabase.from('app_settings').select('cash_expense_limit').maybeSingle()).data?.cash_expense_limit ?? 100000)
+const requestDTO = (r) => ({
+  id: r.id, number: r.number, siteId: r.site_id, site: r.site?.name ?? null, sessionId: r.session_id, session: r.session?.number ?? null, register: r.session?.register?.name ?? null,
+  sessionOpen: r.session?.status === 'abierta', amount: Number(r.amount), approvedAmount: r.approved_amount === null ? null : Number(r.approved_amount), reason: r.reason,
+  status: r.status, statusLabel: REQUEST_STATUS[r.status], fromGeneral: r.from_general, resolution: r.resolution,
+  requestedBy: fullName(r.requester), resolvedBy: fullName(r.resolver), resolvedAt: r.resolved_at, createdAt: r.created_at
+})
+const REQ_COLUMNS = '*, site:sites(name), session:cash_sessions(number, status, register:cash_registers(name)), requester:users!cash_requests_requested_by_fkey(name, last_name), resolver:users!cash_requests_resolved_by_fkey(name, last_name)'
+
+router.get('/caja/turnos/:id/gastos', auth(STAFF), guard('cajero'), h(async (req, res) => {
+  const s = await loadSession(req.params.id)
+  if (!s || !sameSite(req, s.site_id)) return fail(res, 'Turno no encontrado', 404)
+  const [limit, { data: exp }, { data: reqs }] = await Promise.all([
+    expenseLimit(),
+    supabase.from('expenses').select('id, number, category, description, supplier, amount, status, created_at').eq('session_id', s.id).order('id', { ascending: false }),
+    supabase.from('cash_requests').select(REQ_COLUMNS).eq('session_id', s.id).order('id', { ascending: false })
+  ])
+  res.send({
+    limit, categories: SHIFT_CATEGORIES,
+    expenses: (exp || []).map((e) => ({ id: e.id, number: e.number, category: e.category, categoryLabel: SHIFT_CATEGORIES[e.category] || e.category, description: e.description, supplier: e.supplier, amount: Number(e.amount), status: e.status, createdAt: e.created_at })),
+    requests: (reqs || []).map(requestDTO)
+  })
+}))
+router.post('/caja/turnos/:id/gastos', auth(STAFF), guard('cajero'), h(async (req, res) => {
+  const s = await loadSession(req.params.id)
+  if (!s || !sameSite(req, s.site_id)) return fail(res, 'Turno no encontrado', 404)
+  if (s.status !== 'abierta') return fail(res, 'El turno ya está cerrado', 409)
+  const b = req.body || {}
+  if (!SHIFT_CATEGORIES[b.category]) return fail(res, 'Elige el tipo de gasto', 400)
+  const description = clean(b.description)
+  if (!description || description.length < 3) return fail(res, 'Escribe qué se compró o pagó', 400)
+  if (!(Number(b.amount) > 0)) return fail(res, 'Escribe un valor mayor que cero', 400)
+  const amount = money(b.amount)
+  const limit = await expenseLimit()
+  if (!ADMIN.includes(req.user.role) && limit > 0 && amount > limit) {
+    return fail(res, `El gasto supera el tope de $${Math.round(limit).toLocaleString('es-CO')} por gasto. Pide los recursos al administrador.`, 403)
+  }
+  const { data: id, error } = await supabase.rpc('finance_expense', { p: {
+    org_id: req.user.org_id, user_id: req.user.id, category: b.category, description: description.slice(0, 200), supplier: clean(b.supplier), invoice_ref: clean(b.invoiceRef),
+    amount, source: 'caja', session_id: s.id
+  } })
+  if (error) return dbError(res, error)
+  const { data: e } = await supabase.from('expenses').select('number').eq('id', id).single()
+  await audit(req, 'gasto', 'turno_caja', s.id, { number: e.number, session: s.number, amount, description })
+  res.status(201).send({ id, number: e.number })
+}))
+router.post('/caja/turnos/:id/solicitudes', auth(STAFF), guard('cajero'), h(async (req, res) => {
+  const s = await loadSession(req.params.id)
+  if (!s || !sameSite(req, s.site_id)) return fail(res, 'Turno no encontrado', 404)
+  if (s.status !== 'abierta') return fail(res, 'El turno ya está cerrado', 409)
+  const b = req.body || {}
+  if (!(Number(b.amount) > 0)) return fail(res, 'Escribe cuánto necesitas', 400)
+  const reason = clean(b.reason)
+  if (!reason || reason.length < 3) return fail(res, 'Explica para qué es el dinero', 400)
+  const { count } = await supabase.from('cash_requests').select('id', { count: 'exact', head: true }).eq('session_id', s.id).eq('status', 'pendiente')
+  if (count >= 3) return fail(res, 'Ya hay 3 solicitudes pendientes en este turno. Espera la respuesta del administrador.', 409)
+  const { data: number, error: e1 } = await supabase.rpc('next_consecutive', { p_org: req.user.org_id, p_kind: 'solicitud_caja', p_site: 0, p_prefix: 'SR-' })
+  if (e1) throw e1
+  const { data, error } = await supabase.from('cash_requests').insert({ site_id: s.site_id, session_id: s.id, number, amount: money(b.amount), reason: reason.slice(0, 200), requested_by: req.user.id }).select(REQ_COLUMNS).single()
+  if (error) throw error
+  await audit(req, 'solicitar', 'recursos_caja', data.id, { number, session: s.number, amount: money(b.amount), reason })
+  notify('caja', () => cashRequestMessage({ number, status: 'pendiente', amount: money(b.amount), reason, session: s.number, register: s.register?.name, site: s.site?.name, siteId: s.site_id, user: req.user }))
+  res.status(201).send(requestDTO(data))
+}))
+router.get('/caja/solicitudes', auth(ADMIN), h(async (req, res) => {
+  let q = supabase.from('cash_requests').select(REQ_COLUMNS).order('created_at', { ascending: false }).limit(100)
+  if (req.siteId) q = q.eq('site_id', req.siteId)
+  if (REQUEST_STATUS[req.query.estado]) q = q.eq('status', req.query.estado)
+  const [{ data, error }, { data: vaults }] = await Promise.all([q, supabase.from('vaults').select('site_id, balance')])
+  if (error) throw error
+  const fund = (sid) => Number((vaults || []).find((v) => (v.site_id ?? null) === sid)?.balance || 0)
+  res.send({ rows: data.map((r) => ({ ...requestDTO(r), siteFund: fund(r.site_id), generalFund: fund(null) })), pending: data.filter((r) => r.status === 'pendiente').length })
+}))
+router.post('/caja/solicitudes/:id/aprobar', auth(ADMIN), h(async (req, res) => {
+  const b = req.body || {}
+  if (b.amount !== undefined && b.amount !== '' && !(Number(b.amount) > 0)) return fail(res, 'El valor debe ser mayor que cero', 400)
+  const { data, error } = await supabase.rpc('approve_cash_request', { p: { org_id: req.user.org_id, user_id: req.user.id, id: Number(req.params.id), amount: b.amount ? money(b.amount) : null, from_general: Boolean(b.fromGeneral), note: clean(b.note) } })
+  if (error) return dbError(res, error)
+  const { data: r } = await supabase.from('cash_requests').select(REQ_COLUMNS).eq('id', Number(req.params.id)).single()
+  await audit(req, 'aprobar', 'recursos_caja', r.id, { number: r.number, amount: Number(data.amount), fromGeneral: Boolean(b.fromGeneral) })
+  notify('caja', () => cashRequestMessage({ number: r.number, status: 'aprobada', amount: Number(data.amount), reason: r.reason, session: data.session, register: r.session?.register?.name, site: r.site?.name, siteId: r.site_id, user: req.user }))
+  res.send(requestDTO(r))
+}))
+router.post('/caja/solicitudes/:id/rechazar', auth(ADMIN), h(async (req, res) => {
+  const { data: r } = await supabase.from('cash_requests').select(REQ_COLUMNS).eq('id', Number(req.params.id)).maybeSingle()
+  if (!r) return fail(res, 'Solicitud no encontrada', 404)
+  if (r.status !== 'pendiente') return fail(res, `La solicitud ya fue ${r.status}`, 409)
+  const note = clean(req.body?.note)
+  if (!note) return fail(res, 'Escribe el motivo', 400)
+  await supabase.from('cash_requests').update({ status: 'rechazada', resolution: note.slice(0, 200), resolved_by: req.user.id, resolved_at: new Date().toISOString() }).eq('id', r.id)
+  await audit(req, 'rechazar', 'recursos_caja', r.id, { number: r.number, note })
+  notify('caja', () => cashRequestMessage({ number: r.number, status: 'rechazada', amount: Number(r.amount), reason: `${r.reason} · ${note}`, session: r.session?.number, register: r.session?.register?.name, site: r.site?.name, siteId: r.site_id, user: req.user }))
+  res.send({ ok: true })
 }))
 
 // ---------------------------------------------------------------- Bóveda

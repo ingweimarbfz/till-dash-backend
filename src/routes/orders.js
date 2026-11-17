@@ -36,7 +36,7 @@ const itemDTO = (i) => ({
 })
 const orderDTO = (o) => ({
   id: o.id, number: o.number, siteId: o.site_id, site: o.site?.name ?? null, type: o.type, typeLabel: TYPES[o.type], status: o.status,
-  tableId: o.table_id, table: o.table?.name ?? null, guests: o.guests, customerName: o.customer_name, customerPhone: o.customer_phone,
+  tableId: o.table_id, table: o.table?.name ?? null, alias: o.alias ?? null, guests: o.guests, customerName: o.customer_name, customerPhone: o.customer_phone,
   customerAddress: o.customer_address, note: o.note, waiter: o.waiter ? { id: o.waiter.id, name: fullName(o.waiter) } : null,
   cashier: o.cashier ? { id: o.cashier.id, name: fullName(o.cashier) } : null,
   gross: Number(o.gross), courtesyTotal: Number(o.courtesy_total), subtotal: Number(o.subtotal),
@@ -45,6 +45,9 @@ const orderDTO = (o) => ({
   billRequestedAt: o.bill_requested_at, voidReason: o.void_reason, openedAt: o.opened_at, closedAt: o.closed_at,
   items: o.items ? o.items.sort((a, b) => a.id - b.id).map(itemDTO) : undefined
 })
+
+// Alias temporal de la mesa: texto corto, se borra al cerrar el pedido.
+const aliasOf = (v) => (clean(v) ? clean(v).slice(0, 40) : null)
 
 const loadOrder = async (id) => {
   const { data } = await supabase.from('orders').select(`${ORDER_COLUMNS}, items:order_items(*, user:users!order_items_user_id_fkey(name, last_name))`).eq('id', Number(id)).maybeSingle()
@@ -146,7 +149,7 @@ router.post('/pedidos', auth(STAFF), guard(...SELLERS), h(async (req, res) => {
   if (e1) throw e1
   const { data: order, error } = await supabase.from('orders').insert({
     site_id: site, number, type, table_id: table?.id ?? null, guests: Number(b.guests) > 0 ? Math.min(100, Number(b.guests)) : null,
-    customer_name: clean(b.customerName), customer_phone: clean(b.customerPhone), customer_address: clean(b.customerAddress), note: clean(b.note),
+    alias: aliasOf(b.alias), customer_name: clean(b.customerName), customer_phone: clean(b.customerPhone), customer_address: clean(b.customerAddress), note: clean(b.note),
     waiter_id: waiterId, opened_by: req.user.id
   }).select('id, number').single()
   if (error) return error.code === '23505' ? fail(res, `${table?.name || 'La mesa'} ya tiene un pedido abierto`, 409) : fail(res, error)
@@ -181,12 +184,14 @@ router.put('/pedidos/:id', auth(STAFF), guard(...SELLERS), h(async (req, res) =>
   const patch = {}
   if ('guests' in b) patch.guests = Number(b.guests) > 0 ? Math.min(100, Number(b.guests)) : null
   for (const [k, c] of [['customerName', 'customer_name'], ['customerPhone', 'customer_phone'], ['customerAddress', 'customer_address'], ['note', 'note']]) if (k in b) patch[c] = clean(b[k])
+  if ('alias' in b) patch.alias = aliasOf(b.alias)
   if (Number(b.waiterId)) patch.waiter_id = Number(b.waiterId)
   if (Number(b.tableId) && Number(b.tableId) !== o.table_id) {
     const { data: t } = await supabase.from('dining_tables').select('id, name, site_id, active').eq('id', Number(b.tableId)).maybeSingle()
     if (!t || !t.active || t.site_id !== o.site_id) return fail(res, 'La mesa no existe en esta sucursal', 400)
     patch.table_id = t.id; patch.type = 'mesa'
   }
+  if (!Object.keys(patch).length) return fail(res, 'No hay cambios', 400)
   const { error } = await supabase.from('orders').update(patch).eq('id', o.id)
   if (error) return error.code === '23505' ? fail(res, 'Esa mesa ya tiene un pedido abierto', 409) : fail(res, error)
   if (patch.table_id) await audit(req, 'mover', 'pedido', o.id, { number: o.number, from: o.table?.name ?? null, to: patch.table_id })
@@ -306,14 +311,14 @@ router.get('/comandas', auth(STAFF), guard(...KITCHEN, 'mesero'), h(async (req, 
   const areas = area ? [area] : (ADMIN.includes(req.user.role) || !mine.length ? ['cocina', 'bar', 'barista'] : mine)
   const since = new Date(Date.now() - 16 * 3600e3).toISOString()
   const { data, error } = await supabase.from('order_items')
-    .select('id, name, quantity, note, area, status, courtesy, created_at, started_at, ready_at, order:orders!inner(id, number, site_id, status, type, customer_name, table:dining_tables(name), waiter:users!orders_waiter_id_fkey(name, last_name))')
+    .select('id, name, quantity, note, area, status, courtesy, created_at, started_at, ready_at, order:orders!inner(id, number, site_id, status, type, alias, customer_name, table:dining_tables(name), waiter:users!orders_waiter_id_fkey(name, last_name))')
     .in('area', areas).in('status', req.query.listos === '1' ? ['listo'] : ['pendiente', 'preparando', 'listo'])
     .eq('order.site_id', site).eq('order.status', 'abierto').gte('created_at', since).order('created_at')
   if (error) throw error
   const groups = new Map()
   for (const i of data) {
     const key = `${i.order.id}-${i.area}`
-    if (!groups.has(key)) groups.set(key, { orderId: i.order.id, number: i.order.number, area: i.area, table: i.order.table?.name ?? null, type: TYPES[i.order.type], customer: i.order.customer_name, waiter: fullName(i.order.waiter), since: i.created_at, items: [] })
+    if (!groups.has(key)) groups.set(key, { orderId: i.order.id, number: i.order.number, area: i.area, table: i.order.table?.name ?? null, alias: i.order.alias, type: TYPES[i.order.type], customer: i.order.customer_name, waiter: fullName(i.order.waiter), since: i.created_at, items: [] })
     groups.get(key).items.push({ id: i.id, name: i.name, quantity: Number(i.quantity), note: i.note, status: i.status, courtesy: i.courtesy, createdAt: i.created_at, startedAt: i.started_at, readyAt: i.ready_at })
   }
   res.send({ areas, tickets: [...groups.values()] })

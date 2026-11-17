@@ -29,7 +29,7 @@ router.get('/mesas', auth(STAFF), h(async (req, res) => {
   const [{ data: areas }, { data: tables }, { data: orders }, { data: calls }, { data: siteRow }] = await Promise.all([
     supabase.from('dining_areas').select('*').eq('site_id', site).order('sort_order').order('name'),
     supabase.from('dining_tables').select('*').eq('site_id', site).order('sort_order').order('id'),
-    supabase.from('orders').select('id, number, table_id, guests, total, opened_at, bill_requested_at, customer_name, waiter:users!orders_waiter_id_fkey(name, last_name), items:order_items(status, quantity)')
+    supabase.from('orders').select('id, number, table_id, alias, guests, total, opened_at, bill_requested_at, customer_name, waiter:users!orders_waiter_id_fkey(name, last_name), items:order_items(status, quantity)')
       .eq('site_id', site).eq('status', 'abierto'),
     supabase.from('table_calls').select('*').eq('site_id', site).eq('status', 'pendiente').order('created_at'),
     supabase.from('sites').select('id, name').eq('id', site).maybeSingle()
@@ -42,7 +42,7 @@ router.get('/mesas', auth(STAFF), h(async (req, res) => {
       ...tableDTO(t),
       status: !o ? 'libre' : o.bill_requested_at ? 'por_cobrar' : 'ocupada',
       order: o ? {
-        id: o.id, number: o.number, guests: o.guests, total: Number(o.total), openedAt: o.opened_at, billRequestedAt: o.bill_requested_at,
+        id: o.id, number: o.number, alias: o.alias, guests: o.guests, total: Number(o.total), openedAt: o.opened_at, billRequestedAt: o.bill_requested_at,
         waiter: fullName(o.waiter), customer: o.customer_name, items: live.length, ready: live.filter((i) => i.status === 'listo').length
       } : null,
       calls: (calls || []).filter((c) => c.table_id === t.id).map(callDTO)

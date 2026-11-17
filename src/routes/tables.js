@@ -10,6 +10,7 @@ const supabase = require('../db')
 const { h, fail, clean } = require('../http')
 const { auth, ADMIN, STAFF } = require('../auth')
 const { audit } = require('../audit')
+const plan = require('../plan')
 const { runAsOrg } = require('../tenant')
 const { workSite, sameSite, fullName, cashOpenAt, NO_CASH } = require('../ops')
 const { bestFor, promoBrief, loadActive } = require('../promo')
@@ -118,6 +119,7 @@ router.post('/mesas', auth(ADMIN), h(async (req, res) => {
     if (!clean(b.name)) return fail(res, 'Escribe el nombre o número de la mesa', 400)
     rows = [{ ...tableRow(b), site_id: site }]
   }
+  await plan.checkLimit(req.user.org_id, 'tables', rows.length)
   const { data, error } = await supabase.from('dining_tables').insert(rows).select('*')
   if (error) return error.code === '23505' ? fail(res, 'Ya existe una mesa con ese nombre en la sucursal', 409) : fail(res, error)
   await audit(req, 'crear', 'mesa', data.length === 1 ? data[0].id : null, { names: data.map((t) => t.name) })
@@ -127,6 +129,10 @@ router.put('/mesas/:id', auth(ADMIN), h(async (req, res) => {
   const b = req.body || {}
   if (!clean(b.name)) return fail(res, 'Escribe el nombre o número de la mesa', 400)
   const patch = { ...tableRow(b), active: b.active !== false }
+  if (patch.active) {
+    const { data: cur } = await supabase.from('dining_tables').select('active').eq('id', Number(req.params.id)).maybeSingle()
+    if (cur && !cur.active) await plan.checkLimit(req.user.org_id, 'tables')
+  }
   if (!patch.active) {
     const { count } = await supabase.from('orders').select('id', { count: 'exact', head: true }).eq('table_id', Number(req.params.id)).eq('status', 'abierto')
     if (count) return fail(res, 'La mesa tiene un pedido abierto: cóbralo o muévelo antes de desactivarla', 409)
@@ -198,6 +204,8 @@ const publicTable = async (token) => {
   if (!/^[0-9a-f]{8,40}$/i.test(token || '')) return null
   const { data } = await supabase.from('dining_tables').select('id, org_id, site_id, name, seats, active, area:dining_areas(name), site:sites(name, active), org:organizations(status)').eq('qr_token', token).maybeSingle()
   if (!data || !data.active || !data.site?.active || ['suspendida', 'cancelada'].includes(data.org?.status)) return null
+  // La carta por QR es un módulo del plan.
+  if (!(await plan.orgHas(data.org_id, 'carta_qr'))) return null
   return data
 }
 

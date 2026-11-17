@@ -9,6 +9,7 @@ const supabase = require('../db')
 const { h, fail, clean, PHONE_RE } = require('../http')
 const { auth, ADMIN, STAFF } = require('../auth')
 const { audit } = require('../audit')
+const plan = require('../plan')
 
 const router = express.Router()
 
@@ -37,6 +38,7 @@ const siteRow = (b) => {
 router.post('/sedes', auth(ADMIN), h(async (req, res) => {
   const { errors, row } = siteRow(req.body || {})
   if (errors.length) return fail(res, errors.join('. '), 400)
+  if (row.active) await plan.checkLimit(req.user.org_id, 'sites')
   const { data, error } = await supabase.from('sites').insert(row).select('*, warehouses(*)').single()
   if (error) return dup(error, 'una sucursal') ? fail(res, dup(error, 'una sucursal'), 409) : fail(res, error)
   // Cada sucursal nueva arranca con su propia bodega.
@@ -52,8 +54,9 @@ router.put('/sedes/:id', auth(ADMIN), h(async (req, res) => {
   const id = Number(req.params.id)
   const { errors, row } = siteRow(req.body || {})
   if (errors.length) return fail(res, errors.join('. '), 400)
-  const { data: cur } = await supabase.from('sites').select('id, is_main').eq('id', id).maybeSingle()
+  const { data: cur } = await supabase.from('sites').select('id, is_main, active').eq('id', id).maybeSingle()
   if (!cur) return fail(res, 'Sucursal no encontrada', 404)
+  if (row.active && !cur.active) await plan.checkLimit(req.user.org_id, 'sites')
   if (cur.is_main && !row.active) return fail(res, 'La sede principal no se puede desactivar', 400)
   const { data, error } = await supabase.from('sites').update(row).eq('id', id).select('*, warehouses(*)').single()
   if (error) return dup(error, 'una sucursal') ? fail(res, dup(error, 'una sucursal'), 409) : fail(res, error)

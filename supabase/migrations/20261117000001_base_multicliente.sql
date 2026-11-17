@@ -183,3 +183,4 @@ alter table public.audit_log enable row level security;
 alter table public.doc_sequences enable row level security;
 revoke all on public.organizations, public.sites, public.warehouses, public.users, public.app_settings, public.audit_log, public.doc_sequences from anon, authenticated;
 revoke execute on function public.next_consecutive(bigint, text, bigint, text) from public, anon, authenticated;
+grant execute on function public.next_consecutive(bigint, text, bigint, text) to service_role;

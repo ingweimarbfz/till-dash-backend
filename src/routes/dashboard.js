@@ -100,6 +100,44 @@ const productMix = async (site, since) => {
   }
 }
 
+// Tiempos de preparación (últimos 30 días): de lo que pasa por cocina, bar o barista, cuánto tarda
+// desde que se pide hasta que queda listo. Si la estación lo marcó "en preparación", también se separa
+// la espera en cola del tiempo de preparación. Más de 6 horas se descarta (lo marcaron tarde u olvidaron).
+const PREP_MAX_MIN = 360
+const prepTimes = async (since, siteId) => {
+  const rows = await pages(() => {
+    let q = supabase.from('order_items').select('product_id, name, area, quantity, created_at, started_at, ready_at, order:orders!inner(site_id)')
+      .neq('area', 'ninguna').neq('status', 'anulado').not('ready_at', 'is', null).gte('created_at', since).order('id')
+    if (siteId) q = q.eq('order.site_id', siteId)
+    return q
+  })
+  const mins = (a, b) => (new Date(b) - new Date(a)) / 60000
+  const avg = (xs) => (xs.length ? Math.round((xs.reduce((a, x) => a + x, 0) / xs.length) * 10) / 10 : null)
+  const median = (xs) => { if (!xs.length) return null; const v = [...xs].sort((a, b) => a - b); const m = v.length >> 1; return Math.round((v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2) * 10) / 10 }
+  const items = rows.map((r) => ({ ...r, total: mins(r.created_at, r.ready_at), prep: r.started_at ? mins(r.started_at, r.ready_at) : null, wait: r.started_at ? mins(r.created_at, r.started_at) : null }))
+    .filter((r) => r.total >= 0 && r.total <= PREP_MAX_MIN)
+  const group = (key) => {
+    const g = {}
+    for (const r of items) { const k = key(r); (g[k] = g[k] || []).push(r) }
+    return g
+  }
+  const summary = (list) => {
+    const prep = list.map((r) => r.prep).filter((x) => x !== null && x >= 0)
+    const wait = list.map((r) => r.wait).filter((x) => x !== null && x >= 0)
+    return { count: list.length, avgMinutes: avg(list.map((r) => r.total)), medianMinutes: median(list.map((r) => r.total)), maxMinutes: list.length ? Math.round(Math.max(...list.map((r) => r.total)) * 10) / 10 : null, avgPrepMinutes: avg(prep), avgWaitMinutes: avg(wait) }
+  }
+  const products = Object.values(group((r) => r.product_id || r.name)).map((list) => ({ id: list[0].product_id, name: list[0].name, area: list[0].area, ...summary(list) }))
+  // Con pocos datos se acepta una sola medición; con más, se piden al menos 3 para no castigar un caso aislado.
+  const minCount = products.filter((p) => p.count >= 3).length >= 6 ? 3 : 1
+  const ranked = products.filter((p) => p.count >= minCount)
+  const byArea = Object.entries(group((r) => r.area)).map(([area, list]) => ({ area, ...summary(list) })).sort((a, b) => b.avgMinutes - a.avgMinutes)
+  return {
+    days: 30, minCount, ...summary(items), areas: byArea, products: products.length,
+    slowest: [...ranked].sort((a, b) => b.avgMinutes - a.avgMinutes).slice(0, 6),
+    fastest: [...ranked].sort((a, b) => a.avgMinutes - b.avgMinutes).slice(0, 6)
+  }
+}
+
 const count = async (table, f = (q) => q) => (await f(supabase.from(table).select('id', { count: 'exact', head: true }))).count || 0
 // Consulta que no tumba el dashboard si una tabla nueva aún no existe (migración sin correr).
 const safe = (p, fallback) => Promise.resolve(p).then((r) => (r?.error ? { data: fallback, count: 0 } : r)).catch(() => ({ data: fallback, count: 0 }))
@@ -158,6 +196,7 @@ router.get('/dashboard', auth(), h(async (req, res) => {
       staffRanking: await staffRanking(site, month),
       shifts: await safe(shiftStats(site, month).then((data) => ({ data })), null).then((r) => r.data),
       productMix: await safe(productMix(site, month).then((data) => ({ data })), null).then((r) => r.data),
+      prepTimes: await safe(prepTimes(month, req.siteId).then((data) => ({ data })), null).then((r) => r.data),
       tableUsage: { days: 30, turns: usage.turns, avgMinutes: usage.avgMinutes, medianMinutes: usage.medianMinutes, perHour: usage.perHour, best: usage.rows.slice(0, 5), areas: usage.areas },
       salesByHour: sales.byHour.filter((x) => x.hour >= 6 || x.total > 0),
       calls: (calls.data || []).map((c) => ({ id: c.id, kind: c.kind, table: c.table?.name, createdAt: c.created_at })),

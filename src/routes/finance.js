@@ -10,6 +10,7 @@
 const express = require('express')
 const supabase = require('../db')
 const { h, fail, clean, EMAIL_RE } = require('../http')
+const { resolveSupplier } = require('../suppliers')
 const { auth, ADMIN, OWNER } = require('../auth')
 const { audit } = require('../audit')
 const { dbError, money, isMoney, fullName } = require('../ops')
@@ -243,7 +244,7 @@ router.post('/finanzas/traslados', auth(ADMIN), h(async (req, res) => {
 // ---------------------------------------------------------------- Gastos
 const expenseDTO = (sites) => (e) => ({
   id: e.id, number: e.number, siteId: e.site_id, site: siteName(sites, e.site_id), category: e.category, categoryLabel: EXPENSE_CATEGORIES[e.category],
-  description: e.description, supplier: e.supplier, invoiceRef: e.invoice_ref, amount: Number(e.amount), paidOn: e.paid_on,
+  description: e.description, supplier: e.supplier, supplierId: e.supplier_id ?? null, invoiceRef: e.invoice_ref, amount: Number(e.amount), paidOn: e.paid_on,
   source: e.source, sourceLabel: e.vault?.kind === 'subcuenta' ? `Subcuenta ${e.vault.name}` : SOURCES[e.source], session: e.session?.number ?? null, partnerId: e.partner_id, partner: e.partner?.name ?? null,
   status: e.status, voidReason: e.void_reason, createdBy: fullName(e.creator), createdAt: e.created_at
 })
@@ -275,12 +276,15 @@ router.post('/finanzas/gastos', auth(ADMIN), h(async (req, res) => {
   const sub = b.source === 'fondo' && SUB_RE.test(String(b.fund || '')) ? await vaultForKey(req.user.org_id, b.fund) : null
   if (b.source === 'fondo' && SUB_RE.test(String(b.fund || '')) && !sub) return fail(res, 'Subcuenta no encontrada', 404)
   if (sub && !sub.active) return fail(res, 'La subcuenta está inactiva', 409)
+  const sup = await resolveSupplier(b)
+  if (sup.error) return fail(res, sup.error, 400)
   const { failed, data: id } = await run(res, 'finance_expense', {
     org_id: req.user.org_id, user_id: req.user.id, site_id: sub ? sub.siteId : fundSite(b.siteId), vault_id: sub ? sub.id : null, category: b.category, description: description.slice(0, 200),
-    supplier: clean(b.supplier), invoice_ref: clean(b.invoiceRef), amount: money(b.amount), paid_on: b.paidOn || null, source: b.source,
+    supplier: sup.name, invoice_ref: clean(b.invoiceRef), amount: money(b.amount), paid_on: b.paidOn || null, source: b.source,
     session_id: b.source === 'caja' ? Number(b.sessionId) : null, partner_id: b.source === 'socio' ? Number(b.partnerId) : null
   })
   if (failed) return
+  if (sup.id) await supabase.from('expenses').update({ supplier_id: sup.id }).eq('id', id)
   const { data } = await supabase.from('expenses').select('number, amount').eq('id', id).single()
   await audit(req, 'crear', 'gasto', id, { number: data.number, amount: Number(data.amount), category: b.category, source: b.source })
   res.status(201).send({ id, number: data.number })

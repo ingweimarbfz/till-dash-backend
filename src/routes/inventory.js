@@ -16,6 +16,7 @@ const plan = require('../plan')
 const { currentOrg } = require('../tenant')
 const { notify, movementMessage, transferMessage } = require('../notify')
 const { isLow, checkLowStock, currentAlerts } = require('../stock')
+const { resolveSupplier } = require('../suppliers')
 
 const router = express.Router()
 
@@ -90,7 +91,7 @@ router.put('/inventario/categorias/:id', auth(ADMIN), h(async (req, res) => {
 }))
 
 // ---------------------------------------------------------------- Productos
-const PRODUCT_COLUMNS = 'id, sku, name, category_id, description, unit, cost, price, track_stock, stock, min_stock, photo_url, show_in_menu, active, category:product_categories(id, name, emoji, color, area)'
+const PRODUCT_COLUMNS = 'id, sku, name, category_id, description, unit, cost, price, track_stock, stock, min_stock, photo_url, show_in_menu, active, supplier_id, category:product_categories(id, name, emoji, color, area), supplier:suppliers(id, name)'
 // promos: promociones activas; si alguna está vigente para el producto, se informa el precio con promoción.
 const productDTO = (p, promos = []) => {
   const best = bestFor(promos, p)
@@ -98,7 +99,7 @@ const productDTO = (p, promos = []) => {
     id: p.id, sku: p.sku, name: p.name, categoryId: p.category_id, category: p.category?.name ?? null, categoryEmoji: p.category?.emoji ?? null,
     categoryColor: p.category?.color ?? null, area: p.category?.area ?? null, description: p.description, unit: p.unit, unitLabel: UNITS[p.unit],
     cost: Number(p.cost), price: Number(p.price), trackStock: p.track_stock, stock: Number(p.stock), minStock: Number(p.min_stock),
-    lowStock: p.track_stock && isLow(p.stock, p.min_stock), photoUrl: p.photo_url, showInMenu: p.show_in_menu, active: p.active,
+    lowStock: p.track_stock && isLow(p.stock, p.min_stock), photoUrl: p.photo_url, showInMenu: p.show_in_menu, active: p.active, supplierId: p.supplier_id ?? null, supplier: p.supplier?.name ?? null,
     promo: best ? promoBrief(best.promo, best.price, Number(p.price)) : null, finalPrice: best ? best.price : Number(p.price),
     ...(p.gallery !== undefined ? { gallery: p.gallery || [] } : {})
   }
@@ -116,6 +117,10 @@ const validateProduct = async (b) => {
   if (b.cost !== undefined && b.cost !== '' && !(Number(b.cost) >= 0)) errors.push('Costo inválido')
   if (b.minStock !== undefined && b.minStock !== '' && !(Number(b.minStock) >= 0)) errors.push('Stock mínimo inválido')
   const e = imageError(b.photoUrl, 600); if (e) errors.push(`Foto: ${e}`)
+  if (Number(b.supplierId)) {
+    const { data: s } = await supabase.from('suppliers').select('id').eq('id', Number(b.supplierId)).maybeSingle()
+    if (!s) errors.push('El proveedor no existe')
+  }
   if (b.gallery !== undefined) {
     if (!Array.isArray(b.gallery) || b.gallery.length > 3) errors.push('Puedes agregar hasta 3 imágenes adicionales')
     else b.gallery.forEach((g, i) => { const ge = imageError(g, 600); if (ge) errors.push(`Imagen adicional ${i + 1}: ${ge}`) })
@@ -125,7 +130,7 @@ const validateProduct = async (b) => {
 const productRow = (b) => ({
   sku: clean(b.sku), name: clean(b.name), category_id: num(b.categoryId), description: clean(b.description), unit: UNITS[b.unit] ? b.unit : 'und',
   cost: Number(b.cost) || 0, price: Number(b.price) || 0, track_stock: b.trackStock !== false, min_stock: qty(Number(b.minStock) || 0),
-  photo_url: clean(b.photoUrl), show_in_menu: b.showInMenu !== false, active: b.active !== false,
+  photo_url: clean(b.photoUrl), show_in_menu: b.showInMenu !== false, active: b.active !== false, supplier_id: num(b.supplierId) || null,
   ...(Array.isArray(b.gallery) ? { gallery: b.gallery.filter(Boolean).slice(0, 3) } : {})
 })
 
@@ -196,12 +201,12 @@ router.put('/inventario/productos/:id', auth(ADMIN), h(async (req, res) => {
   const id = Number(req.params.id)
   const b = req.body || {}
   const errors = await validateProduct(b)
-  const { data: cur } = await supabase.from('products').select('id, stock, track_stock, min_stock, active').eq('id', id).maybeSingle()
+  const { data: cur } = await supabase.from('products').select('id, stock, track_stock, min_stock, active, supplier_id').eq('id', id).maybeSingle()
   if (!cur) return fail(res, 'Producto no encontrado', 404)
   if (b.active !== false && !cur.active) await plan.checkLimit(req.user.org_id, 'products')
   if (b.trackStock === false && Number(cur.stock) > 0) errors.push('El producto tiene existencias: dales de baja antes de quitarle el inventario')
   if (errors.length) return fail(res, errors.join('. '), 400)
-  const { data, error } = await supabase.from('products').update(productRow(b)).eq('id', id).select(PRODUCT_COLUMNS).maybeSingle()
+  const { data, error } = await supabase.from('products').update({ ...productRow(b), ...(b.supplierId === undefined ? { supplier_id: cur.supplier_id } : {}) }).eq('id', id).select(PRODUCT_COLUMNS).maybeSingle()
   if (error) return error.code === '23505' ? fail(res, 'Ya existe un producto con ese código (SKU)', 409) : fail(res, error)
   // Si cambió el mínimo, se revisan sus bodegas: puede quedar bajo (o dejar de estarlo) sin moverse el stock.
   if (Number(cur.min_stock) !== Number(data.min_stock)) {
@@ -266,12 +271,13 @@ const moveDTO = (m) => ({
   id: m.id, type: m.type, typeLabel: MOVE_LABELS[m.type], quantity: Number(m.quantity), stockAfter: m.stock_after === null ? null : Number(m.stock_after),
   unitCost: m.unit_cost === null || m.unit_cost === undefined ? null : Number(m.unit_cost), note: m.note, ref: m.ref, createdAt: m.created_at,
   warehouse: m.warehouse ? { id: m.warehouse.id, name: m.warehouse.name } : null,
+  supplierId: m.supplier_id ?? null, supplier: m.supplier?.name ?? null, invoiceRef: m.invoice_ref ?? null,
   product: m.product || null, user: m.user ? `${m.user.name} ${m.user.last_name || ''}`.trim() : null
 })
 
 router.get('/inventario/movimientos', auth(STAFF), h(async (req, res) => {
   let q = supabase.from('inventory_movements')
-    .select('id, type, quantity, stock_after, unit_cost, note, ref, created_at, warehouse_id, warehouse:warehouses(id, name), product:products(id, name, sku, unit), user:users(name, last_name)')
+    .select('id, type, quantity, stock_after, unit_cost, note, ref, invoice_ref, supplier_id, created_at, warehouse_id, supplier:suppliers(name), warehouse:warehouses(id, name), product:products(id, name, sku, unit), user:users(name, last_name)')
     .order('created_at', { ascending: false }).order('id', { ascending: false }).limit(Math.min(Number(req.query.limit) || 200, 500))
   if (Number(req.query.producto)) q = q.eq('product_id', Number(req.query.producto))
   if (req.query.tipo && MOVE_LABELS[req.query.tipo]) q = q.eq('type', req.query.tipo)
@@ -309,11 +315,14 @@ router.post('/inventario/movimientos', auth(ADMIN), h(async (req, res) => {
   }
   const { data: ref, error: e1 } = await supabase.rpc('next_consecutive', { p_org: currentOrg(), p_kind: b.type, p_site: 0, p_prefix: MOVE_PREFIX[b.type] })
   if (e1) throw e1
-  const note = [clean(b.supplier) && `Proveedor: ${clean(b.supplier)}`, clean(b.invoice) && `Factura: ${clean(b.invoice)}`, clean(b.note)].filter(Boolean).join(' · ') || null
+  const sup = b.type === 'entrada' ? await resolveSupplier(b) : { id: null, name: null }
+  if (sup.error) return fail(res, sup.error, 400)
+  const invoice = b.type === 'entrada' ? clean(b.invoice)?.slice(0, 40) ?? null : null
+  const note = [sup.name && `Proveedor: ${sup.name}`, invoice && `Factura: ${invoice}`, clean(b.note)].filter(Boolean).join(' · ') || null
   // Un solo insert: si un producto no alcanza, no se registra ninguno.
   const { error } = await supabase.from('inventory_movements').insert(items.map((i) => ({
     warehouse_id: warehouseId, product_id: i.productId, type: b.type, quantity: b.type === 'baja' ? -i.quantity : i.quantity,
-    unit_cost: b.type === 'entrada' ? i.unitCost : null, ref, note, user_id: req.user.id
+    unit_cost: b.type === 'entrada' ? i.unitCost : null, ref, note, user_id: req.user.id, supplier_id: sup.id, invoice_ref: invoice
   })))
   if (error) return p0001(res, error)
   const signed = items.map((i) => ({ ...i, quantity: b.type === 'baja' ? -i.quantity : i.quantity }))

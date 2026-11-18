@@ -17,6 +17,7 @@ const { currentOrg } = require('../tenant')
 const { notify, movementMessage, transferMessage } = require('../notify')
 const { isLow, checkLowStock, currentAlerts } = require('../stock')
 const { resolveSupplier } = require('../suppliers')
+const { parsePayment, checkPayment, settle } = require('../purchases')
 
 const router = express.Router()
 
@@ -182,19 +183,36 @@ router.post('/inventario/productos', auth(ADMIN), h(async (req, res) => {
   if (!(initial >= 0)) errors.push('Stock inicial inválido')
   if (b.trackStock === false && initial > 0) errors.push('Un producto sin inventario no lleva stock inicial')
   if (errors.length) return fail(res, errors.join('. '), 400)
+  // TD-011: el stock inicial también dice de dónde se pagó (o si es inventario que ya estaba).
+  let pay = null; let check = null; let sup = { id: null, name: null }
+  const total = Math.round(initial * (Number(b.cost) || 0))
+  if (initial > 0) {
+    sup = await resolveSupplier(b)
+    if (sup.error) return fail(res, sup.error, 400)
+    const parsed = parsePayment(b, { role: req.user.role, total, supplierId: sup.id })
+    if (parsed.error) return fail(res, parsed.error, 400)
+    pay = parsed.pay
+    check = await checkPayment(pay, total)
+    if (check.error) return fail(res, check.error, check.status || 400)
+  }
   if (b.active !== false) await plan.checkLimit(req.user.org_id, 'products')
   const { data, error } = await supabase.from('products').insert(productRow(b)).select('id').single()
   if (error) return error.code === '23505' ? fail(res, 'Ya existe un producto con ese código (SKU)', 409) : fail(res, error)
+  let paid = {}
   if (initial > 0) {
     const warehouseId = Number(b.warehouseId) || (await mainWarehouse()).id
     const { data: ref } = await supabase.rpc('next_consecutive', { p_org: currentOrg(), p_kind: 'entrada', p_site: 0, p_prefix: 'EN-' })
-    const { error: e2 } = await supabase.from('inventory_movements').insert({ warehouse_id: warehouseId, product_id: data.id, type: 'entrada', quantity: initial, unit_cost: Number(b.cost) || 0, ref, note: 'Stock inicial', user_id: req.user.id })
+    const { error: e2 } = await supabase.from('inventory_movements').insert({ warehouse_id: warehouseId, product_id: data.id, type: 'entrada', quantity: initial, unit_cost: Number(b.cost) || 0, ref, note: pay.method === 'inicial' ? 'Stock inicial (inventario existente)' : 'Stock inicial', user_id: req.user.id, supplier_id: sup.id })
     if (e2) return p0001(res, e2)
     await checkLowStock([{ warehouseId, productId: data.id }])
+    paid = await settle({ pay, check, total, ref, items: [{ name: clean(b.name) }], supplier: sup, invoice: null, userId: req.user.id })
+    if (paid.error) { paid = { payError: paid.error } }
+    if (paid.expense) await audit(req, 'gasto', pay.method === 'caja' ? 'turno_caja' : 'fondo', paid.expense.id, { number: paid.expense.number, amount: total, description: `Compra ${ref}` })
+    if (paid.payable) await audit(req, 'crear', 'cuenta_por_pagar', paid.payable.id, { number: paid.payable.number, amount: total, supplier: paid.payable.supplier, ref })
   }
   await audit(req, 'crear', 'producto', data.id, { name: clean(b.name) })
   const { data: p } = await supabase.from('products').select(PRODUCT_COLUMNS).eq('id', data.id).single()
-  res.status(201).send(productDTO(p, await loadActive()))
+  res.status(201).send({ ...productDTO(p, await loadActive()), purchase: initial > 0 ? { payment: pay.method, expense: paid.expense ?? null, payable: paid.payable ?? null, payError: paid.payError ?? null } : null })
 }))
 
 router.put('/inventario/productos/:id', auth(ADMIN), h(async (req, res) => {
@@ -313,22 +331,20 @@ router.post('/inventario/movimientos', auth(ADMIN), h(async (req, res) => {
     if (!p.track_stock) return fail(res, `"${p.name}" no maneja inventario`, 400)
     i.name = p.name; i.unit = p.unit
   }
-  // Compra pagada con el efectivo de un turno abierto: además de la entrada queda como gasto del turno
-  // (sale de la caja). Sin esto, la entrada solo suma inventario y no toca la caja.
+  // TD-011: toda entrada dice de dónde se pagó; caja y cuenta deben tener con qué pagar antes de sumar inventario.
   const total = Math.round(items.reduce((a, i) => a + i.quantity * (i.unitCost || 0), 0))
-  let pay = null
-  if (b.type === 'entrada' && Number(b.paySessionId)) {
-    const { data: ps } = await supabase.from('cash_sessions').select('id, number, status, site_id').eq('id', Number(b.paySessionId)).maybeSingle()
-    if (!ps || ps.status !== 'abierta') return fail(res, 'El turno de caja elegido para pagar ya no está abierto', 409)
-    if (!(total > 0)) return fail(res, 'Escribe el costo de los productos para descontarlo de la caja', 400)
-    const { data: cash } = await supabase.rpc('session_cash', { p_session: ps.id })
-    if (Number(cash) < total) return fail(res, `No hay suficiente efectivo en la caja ${ps.number} (disponible: $${Math.round(Number(cash)).toLocaleString('es-CO')})`, 400)
-    pay = ps
+  const sup = b.type === 'entrada' ? await resolveSupplier(b) : { id: null, name: null }
+  if (sup.error) return fail(res, sup.error, 400)
+  let pay = null; let check = null
+  if (b.type === 'entrada') {
+    const parsed = parsePayment(b, { role: req.user.role, total, supplierId: sup.id })
+    if (parsed.error) return fail(res, parsed.error, 400)
+    pay = parsed.pay
+    check = await checkPayment(pay, total)
+    if (check.error) return fail(res, check.error, check.status || 400)
   }
   const { data: ref, error: e1 } = await supabase.rpc('next_consecutive', { p_org: currentOrg(), p_kind: b.type, p_site: 0, p_prefix: MOVE_PREFIX[b.type] })
   if (e1) throw e1
-  const sup = b.type === 'entrada' ? await resolveSupplier(b) : { id: null, name: null }
-  if (sup.error) return fail(res, sup.error, 400)
   const invoice = b.type === 'entrada' ? clean(b.invoice)?.slice(0, 40) ?? null : null
   const note = [sup.name && `Proveedor: ${sup.name}`, invoice && `Factura: ${invoice}`, clean(b.note)].filter(Boolean).join(' · ') || null
   // Un solo insert: si un producto no alcanza, no se registra ninguno.
@@ -341,21 +357,14 @@ router.post('/inventario/movimientos', auth(ADMIN), h(async (req, res) => {
   await audit(req, 'crear', 'movimiento_inventario', ref, { type: b.type, warehouse: wh.name, items: signed.map((i) => ({ product: i.name, quantity: i.quantity })) })
   notify('inventario', async () => movementMessage({ type: b.type, ref, warehouse: placeOf(wh), items: signed, note, user: req.user }))
   const alerts = await checkLowStock(items.map((i) => ({ warehouseId, productId: i.productId })))
-  let expense = null; let payError = null
+  let paid = {}; let payError = null
   if (pay) {
-    const { data: eid, error: e3 } = await supabase.rpc('finance_expense', { p: {
-      org_id: currentOrg(), user_id: req.user.id, category: 'insumos', description: `Compra ${ref}: ${items.map((i) => i.name).join(', ')}`.slice(0, 200),
-      supplier: sup.name, invoice_ref: invoice, amount: total, source: 'caja', session_id: pay.id
-    } })
-    if (e3) payError = e3.message
-    else {
-      if (sup.id) await supabase.from('expenses').update({ supplier_id: sup.id }).eq('id', eid)
-      const { data: ex } = await supabase.from('expenses').select('number').eq('id', eid).single()
-      expense = { id: eid, number: ex?.number, amount: total, session: pay.number }
-      await audit(req, 'gasto', 'turno_caja', pay.id, { number: ex?.number, session: pay.number, amount: total, description: `Compra ${ref}` })
-    }
+    paid = await settle({ pay, check, total, ref, items, supplier: sup, invoice, userId: req.user.id })
+    if (paid.error) { payError = paid.error; paid = {} }
+    if (paid.expense) await audit(req, 'gasto', pay.method === 'caja' ? 'turno_caja' : 'fondo', paid.expense.id, { number: paid.expense.number, amount: total, description: `Compra ${ref}` })
+    if (paid.payable) await audit(req, 'crear', 'cuenta_por_pagar', paid.payable.id, { number: paid.payable.number, amount: total, supplier: paid.payable.supplier, ref })
   }
-  res.status(201).send({ ref, items: items.length, alerts, expense, payError })
+  res.status(201).send({ ref, items: items.length, alerts, payment: pay?.method ?? null, expense: paid.expense ?? null, payable: paid.payable ?? null, payError })
 }))
 
 // ---------------------------------------------------------------- Traslados entre bodegas

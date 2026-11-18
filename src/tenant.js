@@ -23,7 +23,9 @@ const TENANT_TABLES = new Set([
   // Etapa 4: finanzas
   'partners', 'money_entries', 'fund_transfers', 'expenses', 'partner_withdrawals', 'cash_requests', 'menus', 'service_ratings', 'suppliers', 'cash_reopen_requests', 'courier_payouts', 'courier_floats',
   // TD-010: clientes (distribuidoras)
-  'customers'
+  'customers',
+  // TD-011: cuentas por pagar a proveedores
+  'supplier_payables'
 ])
 
 const withOrg = (rows, org) => (Array.isArray(rows) ? rows.map((r) => ({ ...r, org_id: org })) : { ...rows, org_id: org })

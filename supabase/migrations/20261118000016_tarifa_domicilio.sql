@@ -250,3 +250,19 @@ begin
 end $function$;
 revoke execute on function public.reopen_cash_session(jsonb) from public, anon, authenticated;
 grant execute on function public.reopen_cash_session(jsonb) to service_role;
+
+-- Forma de pago del domicilio (se pregunta al abrir el pedido):
+-- · orders.delivery_pay_method: 'efectivo' (le paga al domiciliario) u otro medio (transferencia, nequi, daviplata, tarjeta).
+-- · orders.delivery_cash_with: con cuánto paga en efectivo, para que el domiciliario lleve el cambio.
+-- · app_settings.delivery_transfer_timing: con otro medio, 'antes' = se cobra antes de despachar (no sale sin pagar);
+--   'al_entregar' = el cliente transfiere cuando le llega el pedido.
+alter table public.orders add column if not exists delivery_pay_method text;
+alter table public.orders add column if not exists delivery_cash_with numeric(14,2);
+do $$ begin
+  alter table public.orders add constraint orders_delivery_pay_method_check
+    check (delivery_pay_method in ('efectivo', 'tarjeta', 'transferencia', 'nequi', 'daviplata', 'otro'));
+exception when duplicate_object then null; end $$;
+alter table public.app_settings add column if not exists delivery_transfer_timing text not null default 'antes';
+do $$ begin
+  alter table public.app_settings add constraint app_settings_delivery_transfer_timing_check check (delivery_transfer_timing in ('antes', 'al_entregar'));
+exception when duplicate_object then null; end $$;

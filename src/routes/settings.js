@@ -44,6 +44,7 @@ const toDTO = (s, o) => ({
   cashReopenHours: Number(s?.cash_reopen_hours ?? 12),
   deliveryFeeDefault: Number(s?.delivery_fee_default ?? 0),
   courierShareMode: s?.courier_share_mode || 'todo',
+  deliveryTransferTiming: s?.delivery_transfer_timing || 'antes',
   courierSharePercent: Number(s?.courier_share_percent ?? 100),
   nit: o?.nit || null,
   phone: o?.phone || null,
@@ -99,6 +100,7 @@ router.put('/configuracion', auth(ADMIN), h(async (req, res) => {
     ...(b.qrOrdering ? { qr_ordering: b.qrOrdering } : {}),
     ...(b.cashExpenseLimit !== undefined && b.cashExpenseLimit !== '' ? { cash_expense_limit: Math.round(Number(b.cashExpenseLimit)) } : {}),
     ...(b.cashReopenHours !== undefined && b.cashReopenHours !== '' ? { cash_reopen_hours: Math.round(Number(b.cashReopenHours)) } : {}),
+    ...(b.deliveryTransferTiming === 'antes' || b.deliveryTransferTiming === 'al_entregar' ? { delivery_transfer_timing: b.deliveryTransferTiming } : {}),
     ...(b.courierShareMode === 'todo' || b.courierShareMode === 'porcentaje' ? { courier_share_mode: b.courierShareMode } : {}),
     ...(b.courierSharePercent !== undefined && b.courierSharePercent !== '' && Number(b.courierSharePercent) >= 0 && Number(b.courierSharePercent) <= 100 ? { courier_share_percent: Number(b.courierSharePercent) } : {}),
     ...(b.deliveryFeeDefault !== undefined && b.deliveryFeeDefault !== '' && Number(b.deliveryFeeDefault) >= 0 ? { delivery_fee_default: Math.round(Number(b.deliveryFeeDefault)) } : {})

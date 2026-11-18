@@ -25,6 +25,8 @@ const KITCHEN = ['cocina', 'bartender', 'barista']
 const AREA_OF_POSITION = { cocina: 'cocina', bartender: 'bar', barista: 'barista' }
 const SELLERS = ['mesero', 'cajero', 'host', 'bartender', 'barista']
 
+// Formas de pago del domicilio: efectivo al domiciliario u otro medio.
+const DELIVERY_PAY = ['efectivo', 'tarjeta', 'transferencia', 'nequi', 'daviplata', 'otro']
 const ORDER_COLUMNS = `*, site:sites(name), table:dining_tables!orders_table_id_fkey(id, name),
   waiter:users!orders_waiter_id_fkey(id, name, last_name), cashier:users!orders_cashier_id_fkey(id, name, last_name),
   courier:users!orders_courier_id_fkey(id, name, last_name)`
@@ -43,7 +45,7 @@ const orderDTO = (o) => ({
   gross: Number(o.gross), courtesyTotal: Number(o.courtesy_total), subtotal: Number(o.subtotal),
   discount: o.discount_type ? { id: o.discount_id, name: o.discount_name, type: o.discount_type, value: Number(o.discount_value), reason: o.discount_reason } : null,
   discountTotal: Number(o.discount_total), tip: Number(o.tip), deliveryFee: Number(o.delivery_fee || 0), total: Number(o.total), paid: Number(o.paid),
-  courier: o.courier ? { id: o.courier.id, name: fullName(o.courier) } : null, deliveryStatus: o.delivery_status || null, dispatchedAt: o.dispatched_at || null, arrivedAt: o.arrived_at || null,
+  courier: o.courier ? { id: o.courier.id, name: fullName(o.courier) } : null, deliveryStatus: o.delivery_status || null, deliveryPayMethod: o.delivery_pay_method || null, deliveryCashWith: o.delivery_cash_with === null || o.delivery_cash_with === undefined ? null : Number(o.delivery_cash_with), dispatchedAt: o.dispatched_at || null, arrivedAt: o.arrived_at || null,
   billRequestedAt: o.bill_requested_at, voidReason: o.void_reason, openedAt: o.opened_at, closedAt: o.closed_at,
   items: o.items ? o.items.sort((a, b) => a.id - b.id).map(itemDTO) : undefined
 })
@@ -167,6 +169,7 @@ router.post('/pedidos', auth(STAFF), guard(...SELLERS), h(async (req, res) => {
   }
   if (type === 'domicilio' && !clean(b.customerAddress)) return fail(res, 'Escribe la dirección del domicilio', 400)
   if (b.deliveryFee !== undefined && b.deliveryFee !== null && b.deliveryFee !== '' && !isMoney(b.deliveryFee)) return fail(res, 'El valor del domicilio no es válido', 400)
+  if (type === 'domicilio' && !DELIVERY_PAY.includes(b.deliveryPayMethod)) return fail(res, 'Elige cómo paga el cliente el domicilio', 400)
   if (!(await cashOpenAt(site))) return fail(res, NO_CASH, 409)
   let built = null
   if (Array.isArray(b.items) && b.items.length) {
@@ -178,7 +181,7 @@ router.post('/pedidos', auth(STAFF), guard(...SELLERS), h(async (req, res) => {
   if (e1) throw e1
   const { data: order, error } = await supabase.from('orders').insert({
     site_id: site, number, type, table_id: table?.id ?? null, guests: Number(b.guests) > 0 ? Math.min(100, Number(b.guests)) : null,
-    alias: aliasOf(b.alias), ...(type === 'domicilio' ? { delivery_status: 'por_despachar', courier_id: Number(b.courierId) || null, ...(money(b.deliveryFee) > 0 ? { delivery_fee: money(b.deliveryFee) } : {}) } : {}), customer_name: clean(b.customerName), customer_phone: clean(b.customerPhone), customer_address: clean(b.customerAddress), note: clean(b.note),
+    alias: aliasOf(b.alias), ...(type === 'domicilio' ? { delivery_status: 'por_despachar', courier_id: Number(b.courierId) || null, delivery_pay_method: b.deliveryPayMethod, delivery_cash_with: b.deliveryPayMethod === 'efectivo' && money(b.deliveryCashWith) > 0 ? money(b.deliveryCashWith) : null, ...(money(b.deliveryFee) > 0 ? { delivery_fee: money(b.deliveryFee) } : {}) } : {}), customer_name: clean(b.customerName), customer_phone: clean(b.customerPhone), customer_address: clean(b.customerAddress), note: clean(b.note),
     waiter_id: waiterId, opened_by: req.user.id
   }).select('id, number').single()
   if (error) return error.code === '23505' ? fail(res, `${table?.name || 'La mesa'} ya tiene un pedido abierto`, 409) : fail(res, error)
@@ -216,6 +219,13 @@ router.put('/pedidos/:id', auth(STAFF), guard(...SELLERS), h(async (req, res) =>
   if ('guests' in b) patch.guests = Number(b.guests) > 0 ? Math.min(100, Number(b.guests)) : null
   for (const [k, c] of [['customerName', 'customer_name'], ['customerPhone', 'customer_phone'], ['customerAddress', 'customer_address'], ['note', 'note']]) if (k in b) patch[c] = clean(b[k])
   if ('alias' in b) patch.alias = aliasOf(b.alias)
+  if ('deliveryPayMethod' in b || 'deliveryCashWith' in b) {
+    if (o.type !== 'domicilio') return fail(res, 'Solo los pedidos a domicilio llevan forma de pago del domicilio', 400)
+    const method = 'deliveryPayMethod' in b ? b.deliveryPayMethod : o.delivery_pay_method
+    if (!DELIVERY_PAY.includes(method)) return fail(res, 'Forma de pago no válida', 400)
+    patch.delivery_pay_method = method
+    patch.delivery_cash_with = method === 'efectivo' && money('deliveryCashWith' in b ? b.deliveryCashWith : o.delivery_cash_with) > 0 ? money('deliveryCashWith' in b ? b.deliveryCashWith : o.delivery_cash_with) : null
+  }
   if ('deliveryFee' in b) {
     if (o.type !== 'domicilio') return fail(res, 'Solo los pedidos a domicilio llevan valor de domicilio', 400)
     if (b.deliveryFee !== null && b.deliveryFee !== '' && !isMoney(b.deliveryFee)) return fail(res, 'El valor del domicilio no es válido', 400)

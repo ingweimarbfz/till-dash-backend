@@ -80,3 +80,18 @@ por establecimiento, sucursal y tipo de documento. Lo usan las órdenes, cierres
 
 ## Despliegue
 `render.yaml` lista para Render. Variables: `SUPABASE_SECRET_KEY` y `CORS_ORIGIN` (URL del frontend en Vercel).
+
+## Plan Distribuidora (TD-010): sin mesas, con domicilios y clientes
+Para distribuidoras de cerveza, licores y bebidas que llevan el pedido hasta su cliente.
+- `mesas` dejó de ser módulo del núcleo. Un plan sin `mesas` trabaja en modo **distribuidora** (`/plan/modulos` devuelve `mode`):
+  se bloquean `/mesas`, el QR de mesa y los pedidos en mesa o barra; se vende a domicilio y para recoger.
+- Módulos nuevos: `domicilios` (pedidos a domicilio, domiciliarios, bases) y `clientes` (directorio).
+- Migración: `supabase/migrations/20261118000017_plan_distribuidora.sql` (crea el plan, los módulos y la tabla `customers`).
+
+| Método | Ruta | Rol |
+|---|---|---|
+| GET | `/clientes?q=&zona=&ligero=1`, `/clientes/zonas`, `/clientes/:id` (pedidos, cuentas por cobrar, lo que más compra) | vendedores y domiciliario |
+| POST/PUT | `/clientes`, `/clientes/:id` (activar o desactivar: solo admin) | vendedores y admin |
+
+`POST /pedidos` acepta `customerId` (completa nombre, celular, dirección y valor del domicilio) o `saveCustomer: true`
+para guardar al cliente nuevo. Al cobrar a crédito, la cuenta por cobrar toma los datos y el plazo (`credit_days`) del cliente.

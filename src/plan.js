@@ -8,6 +8,9 @@ const { HttpError } = require('./http')
 
 // Ruta de la API → módulo que la habilita. Lo que no aparece aquí es del núcleo (siempre disponible).
 const FEATURE_ROUTES = [
+  ['/mesas', 'mesas'],
+  ['/domicilios', 'domicilios'],
+  ['/clientes', 'clientes'],
   ['/comandas', 'comandas'],
   ['/llamados', 'carta_qr'],
   ['/cuentas-por-cobrar', 'cuentas_por_cobrar'],
@@ -54,6 +57,8 @@ const ensure = async (orgId) => {
 }
 const refresh = async (orgId) => { if (orgId) states.delete(Number(orgId)); else states.clear() }
 const has = (st, feature) => !st.features || st.features.includes(feature)
+// Modo de trabajo: sin el módulo de mesas el establecimiento es una distribuidora (vende a domicilio y para recoger).
+const modeOf = (st) => (has(st, 'mesas') ? 'salon' : 'distribuidora')
 // ¿El establecimiento tiene el módulo? (para rutas públicas como la carta QR)
 const orgHas = async (orgId, feature) => has(await ensure(orgId), feature)
 
@@ -108,4 +113,4 @@ const annual = (price, discount) => {
 }
 const limitsDTO = (p) => ({ sites: p.max_sites, admins: p.max_admins, employees: p.max_employees, tables: p.max_tables, products: p.max_products })
 
-module.exports = { FEATURE_ROUTES, featureFor, LIMITS, load, ensure, refresh, has, orgHas, blockedFor, usage, checkLimit, roleLimit, annual, limitsDTO }
+module.exports = { FEATURE_ROUTES, featureFor, LIMITS, load, ensure, refresh, has, modeOf, orgHas, blockedFor, usage, checkLimit, roleLimit, annual, limitsDTO }

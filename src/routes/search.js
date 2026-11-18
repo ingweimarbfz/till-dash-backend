@@ -6,6 +6,7 @@ const express = require('express')
 const supabase = require('../db')
 const { h } = require('../http')
 const { auth, ADMIN, STAFF } = require('../auth')
+const plan = require('../plan')
 
 const router = express.Router()
 const fold = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim()
@@ -17,7 +18,7 @@ router.get('/buscar', auth(STAFF), h(async (req, res) => {
   if (raw.length < 2) return res.send({ q: raw, groups: [] })
   const q = safe(raw)
   const admin = ADMIN.includes(req.user.role)
-  const groups = { pedidos: [], mesas: [], productos: [], cuentas: [], categorias: [], promociones: [], usuarios: [], sucursales: [], bodegas: [] }
+  const groups = { pedidos: [], clientes: [], mesas: [], productos: [], cuentas: [], categorias: [], promociones: [], usuarios: [], sucursales: [], bodegas: [] }
   const mySite = (qb) => (admin ? (req.siteId ? qb.eq('site_id', req.siteId) : qb) : qb.eq('site_id', req.user.site_id || 0))
   const cop = (v) => `$ ${Math.round(Number(v)).toLocaleString('es-CO')}`
   const STATUS = { abierto: 'abierto', cobrado: 'cobrado', anulado: 'anulado' }
@@ -33,7 +34,14 @@ router.get('/buscar', auth(STAFF), h(async (req, res) => {
   jobs.push(mySite(supabase.from('orders').select('id, number, status, total, customer_name, table:dining_tables!orders_table_id_fkey(name)'))
     .or(`number.ilike.%${q}%,customer_name.ilike.%${q}%`).order('opened_at', { ascending: false }).limit(6)
     .then(({ data }) => (data || []).forEach((o) => groups.pedidos.push({ id: o.id, title: `Pedido ${o.number}`, subtitle: [o.table?.name, o.customer_name, cop(o.total), STATUS[o.status]].filter(Boolean).join(' · '), to: `/pedidos/${o.id}` }))))
-  jobs.push(mySite(supabase.from('dining_tables').select('id, name, site:sites(name)')).ilike('name', `%${q}%`).eq('active', true).limit(5)
+  const st = await plan.ensure(req.user.org_id)
+  const sells = admin || (req.user.positions || []).some((p) => ['mesero', 'cajero', 'host', 'bartender', 'barista', 'domiciliario'].includes(p))
+  if (plan.has(st, 'clientes') && sells) {
+    jobs.push(supabase.from('customers').select('id, name, phone, address, zone, doc').eq('active', true)
+      .or(`name.ilike.%${q}%,doc.ilike.%${q}%,phone.ilike.%${q}%,address.ilike.%${q}%`).limit(6)
+      .then(({ data }) => (data || []).forEach((c) => groups.clientes.push({ id: c.id, title: c.name, subtitle: [c.phone, c.address, c.zone].filter(Boolean).join(' · ') || 'Cliente', to: `/clientes?id=${c.id}` }))))
+  }
+  if (plan.has(st, 'mesas')) jobs.push(mySite(supabase.from('dining_tables').select('id, name, site:sites(name)')).ilike('name', `%${q}%`).eq('active', true).limit(5)
     .then(({ data }) => (data || []).forEach((t) => groups.mesas.push({ id: t.id, title: t.name, subtitle: t.site?.name || 'Mesa', to: `/mesas?mesa=${t.id}` }))))
   if (admin || (req.user.positions || []).includes('cajero')) {
     jobs.push(mySite(supabase.from('receivables').select('id, number, customer_name, amount, paid, status'))
@@ -58,7 +66,7 @@ router.get('/buscar', auth(STAFF), h(async (req, res) => {
   await Promise.all(jobs)
   // En cada grupo, primero lo que empieza igual que la búsqueda.
   const f = fold(raw)
-  const LABELS = { pedidos: 'Pedidos', mesas: 'Mesas', cuentas: 'Cuentas por cobrar', productos: 'Productos', categorias: 'Categorías', promociones: 'Promociones', usuarios: 'Usuarios', sucursales: 'Sucursales', bodegas: 'Bodegas' }
+  const LABELS = { pedidos: 'Pedidos', clientes: 'Clientes', mesas: 'Mesas', cuentas: 'Cuentas por cobrar', productos: 'Productos', categorias: 'Categorías', promociones: 'Promociones', usuarios: 'Usuarios', sucursales: 'Sucursales', bodegas: 'Bodegas' }
   res.send({
     q: raw,
     groups: Object.entries(groups).filter(([, items]) => items.length).map(([key, items]) => ({

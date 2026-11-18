@@ -31,9 +31,9 @@ const shareRule = async () => {
 // El empleado que solo es domiciliario ve únicamente lo suyo.
 const onlyCourier = (user) => !can(user, ...SELLERS)
 
-const COLUMNS = 'id, number, site_id, status, type, customer_name, customer_phone, customer_address, note, delivery_pay_method, delivery_cash_with, total, tip, delivery_fee, paid, opened_at, closed_at, session_id, courier_id, delivery_status, dispatched_at, arrived_at, courier:users!orders_courier_id_fkey(id, name, last_name), items:order_items(name, quantity, status)'
+const COLUMNS = 'id, number, site_id, status, type, customer_name, customer_phone, customer_address, note, delivery_pay_method, delivery_cash_with, total, tip, delivery_fee, paid, opened_at, closed_at, session_id, courier_id, delivery_status, dispatched_at, arrived_at, courier:users!orders_courier_id_fkey(id, name, last_name), customer:customers(id, zone), items:order_items(name, quantity, status)'
 const deliveryDTO = (o, rule) => ({
-  id: o.id, number: o.number, siteId: o.site_id, status: o.status, customerName: o.customer_name, customerPhone: o.customer_phone, address: o.customer_address, note: o.note,
+  id: o.id, number: o.number, siteId: o.site_id, status: o.status, customerName: o.customer_name, customerPhone: o.customer_phone, address: o.customer_address, note: o.note, customerId: o.customer?.id ?? null, zone: o.customer?.zone ?? null,
   payMethod: o.delivery_pay_method || null, cashWith: o.delivery_cash_with === null ? null : Number(o.delivery_cash_with),
   change: o.delivery_cash_with !== null && o.delivery_pay_method === 'efectivo' ? Math.max(0, Number(o.delivery_cash_with) - Number(o.total)) : null,
   mustPayFirst: Boolean(o.delivery_pay_method && o.delivery_pay_method !== 'efectivo' && o.status === 'abierto' && rule.timing === 'antes'),

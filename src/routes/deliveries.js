@@ -7,10 +7,10 @@
 // =====================================================================
 const express = require('express')
 const supabase = require('../db')
-const { h, fail, todayBogota } = require('../http')
+const { h, fail, clean, todayBogota } = require('../http')
 const { auth, STAFF } = require('../auth')
 const { audit } = require('../audit')
-const { can, guard, workSite, sameSite, fullName, PAY_METHODS } = require('../ops')
+const { can, guard, workSite, sameSite, fullName, PAY_METHODS, money, isMoney } = require('../ops')
 const { dayStart } = require('./logbook')
 
 const router = express.Router()
@@ -190,6 +190,105 @@ const courierSettlement = async (sessionId) => {
   const rows = Object.values(m).map((c) => ({ ...c, suggested: c.share + c.tips })).sort((a, b) => a.name.localeCompare(b.name))
   return { rule: { mode: rule.mode, percent: rule.percent }, rows, total: rows.reduce((a, r) => a + r.suggested, 0), businessShare: rows.reduce((a, r) => a + r.fees - r.share, 0) }
 }
+
+// ---------------------------------------------------------------- Base de cambio del domiciliario
+// Sale del efectivo de un turno abierto. Al liquidar, el domiciliario entrega la base más el efectivo de sus
+// domicilios (los que se pagan en efectivo y se cobraron en caja después de darle la base).
+const FLOAT_COLUMNS = '*, user:users!courier_floats_user_id_fkey(id, name, last_name), session:cash_sessions!courier_floats_session_id_fkey(id, number, status, register:cash_registers(name))'
+const floatDTO = (f) => ({
+  id: f.id, userId: f.user_id, name: fullName(f.user), amount: Number(f.amount), status: f.status, sessionId: f.session_id, session: f.session?.number ?? null,
+  register: f.session?.register?.name ?? null, sessionOpen: f.session?.status === 'abierta', createdAt: f.created_at, settledAt: f.settled_at,
+  ordersCash: f.orders_cash === null ? null : Number(f.orders_cash), expected: f.expected === null ? null : Number(f.expected),
+  returned: f.returned === null ? null : Number(f.returned), difference: f.difference === null ? null : Number(f.difference), note: f.note, orders: f.orders || []
+})
+// Domicilios en efectivo del domiciliario desde que se le dio la base y que no entraron en otra liquidación.
+const floatOrders = async (f) => {
+  const [{ data: orders }, { data: settled }] = await Promise.all([
+    supabase.from('orders').select('id, number, status, total, customer_name, customer_address, delivery_pay_method, delivery_status, opened_at, dispatched_at, closed_at, payments:order_payments(method, amount)')
+      .eq('type', 'domicilio').eq('courier_id', f.user_id).in('status', ['abierto', 'cobrado']).or(`dispatched_at.gte.${f.created_at},closed_at.gte.${f.created_at},opened_at.gte.${f.created_at}`).order('opened_at'),
+    supabase.from('courier_floats').select('orders').eq('user_id', f.user_id).eq('status', 'liquidada').neq('id', f.id).gte('settled_at', new Date(new Date(f.created_at).getTime() - 7 * 864e5).toISOString())
+  ])
+  const done = new Set((settled || []).flatMap((x) => (x.orders || []).map((o) => o.id)))
+  return (orders || []).filter((o) => !done.has(o.id) && (!o.delivery_pay_method || o.delivery_pay_method === 'efectivo')).map((o) => ({
+    id: o.id, number: o.number, customerName: o.customer_name, address: o.customer_address, total: Number(o.total), paid: o.status === 'cobrado', deliveryStatus: o.delivery_status,
+    cash: (o.payments || []).filter((p) => p.method === 'efectivo').reduce((a, p) => a + Number(p.amount), 0),
+    other: (o.payments || []).filter((p) => p.method !== 'efectivo').reduce((a, p) => a + Number(p.amount), 0)
+  }))
+}
+const loadFloat = async (req, res) => {
+  const { data: f } = await supabase.from('courier_floats').select(FLOAT_COLUMNS).eq('id', Number(req.params.id)).maybeSingle()
+  if (!f) { fail(res, 'Base no encontrada', 404); return null }
+  if (!sameSite(req, f.site_id)) { fail(res, 'La base es de otra sucursal', 403); return null }
+  return f
+}
+
+router.get('/domicilios/bases', auth(STAFF), guard(...SELLERS, 'domiciliario'), h(async (req, res) => {
+  const mine = onlyCourier(req.user)
+  const site = await workSite(req, req.query.sede)
+  let q = supabase.from('courier_floats').select(FLOAT_COLUMNS).eq('site_id', site).or(`status.eq.abierta,settled_at.gte.${dayStart(todayBogota())}`).order('created_at', { ascending: false })
+  if (mine) q = q.eq('user_id', req.user.id)
+  const { data, error } = await q
+  if (error) throw error
+  const rows = await Promise.all((data || []).map(async (f) => {
+    const dto = floatDTO(f)
+    if (f.status !== 'abierta') return dto
+    const orders = await floatOrders(f)
+    const cash = orders.filter((o) => o.paid).reduce((a, o) => a + o.cash, 0)
+    const unpaid = orders.filter((o) => !o.paid).reduce((a, o) => a + o.total, 0)
+    return { ...dto, ordersCash: cash, unpaid, toReturn: dto.amount + cash + unpaid, orders }
+  }))
+  res.send({ rows })
+}))
+
+router.post('/domicilios/bases', auth(STAFF), guard('cajero'), h(async (req, res) => {
+  const b = req.body || {}
+  const site = await workSite(req, b.siteId)
+  if (!isMoney(b.amount) || !(money(b.amount) > 0)) return fail(res, 'Escribe el valor de la base', 400)
+  const { data: u } = await supabase.from('users').select('id, name, last_name, active, positions').eq('id', Number(b.courierId)).maybeSingle()
+  if (!u || !u.active || !(u.positions || []).includes('domiciliario')) return fail(res, 'Elige un domiciliario activo', 400)
+  const { data: open } = await supabase.from('courier_floats').select('id').eq('user_id', u.id).eq('status', 'abierta').limit(1)
+  if ((open || []).length) return fail(res, `${fullName(u)} ya tiene una base sin liquidar. Liquídala antes de darle otra.`, 409)
+  const { data: sessions } = await supabase.from('cash_sessions').select('id, number, opened_by').eq('site_id', site).eq('status', 'abierta')
+  const list = sessions || []
+  const s = Number(b.sessionId) ? list.find((x) => x.id === Number(b.sessionId)) : list.find((x) => x.opened_by === req.user.id) || list[0]
+  if (!s) return fail(res, 'No hay un turno de caja abierto para sacar la base', 409)
+  const { data: cash } = await supabase.rpc('session_cash', { p_session: s.id })
+  if (Number(cash || 0) < money(b.amount)) return fail(res, `En la caja hay ${Number(cash || 0).toLocaleString('es-CO')} en efectivo; no alcanza para la base`, 409)
+  const { data: f, error } = await supabase.from('courier_floats').insert({ site_id: site, session_id: s.id, user_id: u.id, amount: money(b.amount), note: clean(b.note), given_by: req.user.id }).select('id').single()
+  if (error) throw error
+  const { error: e2 } = await supabase.from('cash_movements').insert({ session_id: s.id, type: 'base_domiciliario', method: 'efectivo', amount: -money(b.amount), ref: s.number, note: `Base de cambio para ${fullName(u)}`, user_id: req.user.id })
+  if (e2) { await supabase.from('courier_floats').delete().eq('id', f.id); throw e2 }
+  await audit(req, 'base_domiciliario', 'turno_caja', s.id, { courier: fullName(u), amount: money(b.amount) })
+  res.status(201).send({ id: f.id })
+}))
+
+router.post('/domicilios/bases/:id/liquidar', auth(STAFF), guard('cajero'), h(async (req, res) => {
+  const f = await loadFloat(req, res)
+  if (!f) return
+  if (f.status !== 'abierta') return fail(res, 'Esta base ya se liquidó', 409)
+  const b = req.body || {}
+  if (!isMoney(b.returned)) return fail(res, 'Escribe cuánto dinero entregó el domiciliario', 400)
+  if (f.session?.status !== 'abierta') return fail(res, `El turno ${f.session?.number} ya está cerrado`, 409)
+  const orders = await floatOrders(f)
+  const unpaid = orders.filter((o) => !o.paid)
+  if (unpaid.length) return fail(res, `Primero cobra ${unpaid.map((o) => o.number).join(', ')}: el domiciliario trae ese dinero.`, 409)
+  const ordersCash = orders.reduce((a, o) => a + o.cash, 0)
+  const expected = Number(f.amount) + ordersCash
+  const returned = money(b.returned)
+  const difference = returned - expected
+  // El efectivo de los domicilios ya entró a la caja al cobrarlos: lo que vuelve aparte es lo entregado menos eso.
+  const back = returned - ordersCash
+  const { error } = await supabase.from('courier_floats').update({
+    status: 'liquidada', orders_cash: ordersCash, expected, returned, difference, note: clean(b.note) || f.note, settled_by: req.user.id, settled_session_id: f.session_id,
+    settled_at: new Date().toISOString(), orders: orders.map((o) => ({ id: o.id, number: o.number, cash: o.cash }))
+  }).eq('id', f.id).eq('status', 'abierta')
+  if (error) throw error
+  if (back !== 0) {
+    await supabase.from('cash_movements').insert({ session_id: f.session_id, type: 'retorno_domiciliario', method: 'efectivo', amount: back, ref: f.session?.number, note: `Devolución de la base de ${fullName(f.user)}${difference ? ` (${difference > 0 ? 'sobrante' : 'faltante'} ${Math.abs(difference).toLocaleString('es-CO')})` : ''}`, user_id: req.user.id })
+  }
+  await audit(req, 'liquidar_base_domiciliario', 'turno_caja', f.session_id, { courier: fullName(f.user), base: Number(f.amount), ordersCash, returned, difference })
+  res.send({ ...floatDTO({ ...f, status: 'liquidada', orders_cash: ordersCash, expected, returned, difference }) })
+}))
 
 router.get('/caja/turnos/:id/domiciliarios', auth(STAFF), guard('cajero'), h(async (req, res) => {
   const { data: s } = await supabase.from('cash_sessions').select('id, site_id').eq('id', Number(req.params.id)).maybeSingle()

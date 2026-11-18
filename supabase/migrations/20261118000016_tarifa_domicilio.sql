@@ -266,3 +266,35 @@ alter table public.app_settings add column if not exists delivery_transfer_timin
 do $$ begin
   alter table public.app_settings add constraint app_settings_delivery_transfer_timing_check check (delivery_transfer_timing in ('antes', 'al_entregar'));
 exception when duplicate_object then null; end $$;
+
+-- Base de cambio del domiciliario: sale del efectivo de la caja al darla; al final de la jornada el domiciliario
+-- devuelve la base más lo que cobró en efectivo de sus domicilios. Se registra lo devuelto y el faltante o sobrante.
+-- · cash_movements 'base_domiciliario' (salida) y 'retorno_domiciliario' (lo devuelto menos lo que ya entró como venta).
+create table if not exists public.courier_floats (
+  id bigint generated always as identity primary key,
+  org_id bigint not null references public.organizations(id) on delete cascade,
+  site_id bigint references public.sites(id) on delete cascade,
+  session_id bigint not null references public.cash_sessions(id) on delete cascade,
+  user_id bigint not null references public.users(id) on delete restrict,
+  amount numeric(14,2) not null check (amount > 0),          -- base entregada
+  status text not null default 'abierta' check (status in ('abierta', 'liquidada')),
+  orders_cash numeric(14,2),                                  -- efectivo de sus domicilios al liquidar
+  expected numeric(14,2),                                     -- base + efectivo de domicilios
+  returned numeric(14,2),                                     -- lo que entregó
+  difference numeric(14,2),                                   -- returned - expected
+  note text,
+  given_by bigint references public.users(id) on delete set null,
+  settled_by bigint references public.users(id) on delete set null,
+  settled_session_id bigint references public.cash_sessions(id) on delete set null,
+  created_at timestamptz not null default now(),
+  settled_at timestamptz
+);
+create index if not exists courier_floats_session_idx on public.courier_floats (session_id);
+create index if not exists courier_floats_user_idx on public.courier_floats (user_id, status);
+alter table public.courier_floats enable row level security;
+revoke all on public.courier_floats from anon, authenticated;
+
+alter table public.cash_movements drop constraint if exists cash_movements_type_check;
+alter table public.cash_movements add constraint cash_movements_type_check
+  check (type in ('apertura', 'venta', 'abono', 'ingreso', 'egreso', 'a_boveda', 'propina_pagada', 'domicilio_pagado', 'base_domiciliario', 'retorno_domiciliario'));
+alter table public.courier_floats add column if not exists orders jsonb;  -- pedidos incluidos en la liquidación [{id, number, cash}]

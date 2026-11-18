@@ -146,8 +146,9 @@ router.get('/clientes/:id(\\d+)', auth(STAFF), guard(...SELLERS, 'domiciliario')
   // Lo que más compra (de sus últimos pedidos cobrados).
   const top = {}
   for (const o of (orders || []).filter((x) => x.status === 'cobrado')) for (const i of o.items || []) if (i.status !== 'anulado') top[i.name] = (top[i.name] || 0) + Number(i.quantity)
+  const { orders: paidOrders, ...st } = stats.get(c.id)
   res.send({
-    ...customerDTO(c), ...stats.get(c.id),
+    ...customerDTO(c), ...st, paidOrders,
     topProducts: Object.entries(top).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([name, quantity]) => ({ name, quantity })),
     orders: (orders || []).map((o) => ({ id: o.id, number: o.number, type: o.type, status: o.status, total: Number(o.total), openedAt: o.opened_at, closedAt: o.closed_at, deliveryStatus: o.delivery_status, seller: fullName(o.waiter), items: (o.items || []).filter((i) => i.status !== 'anulado').length })),
     receivables: (cxc || []).map((r) => ({ id: r.id, number: r.number, order: r.order?.number, orderId: r.order?.id, amount: Number(r.amount), paid: Number(r.paid), balance: Number(r.amount) - Number(r.paid), status: r.status, dueDate: r.due_date, createdAt: r.created_at, overdue: r.status === 'pendiente' && r.due_date && r.due_date < new Date().toISOString().slice(0, 10) }))

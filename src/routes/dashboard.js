@@ -11,6 +11,7 @@ const { dayStart } = require('./logbook')
 const { currentAlerts } = require('../stock')
 const { tableStats } = require('./reports')
 
+const plan = require('../plan')
 const router = express.Router()
 
 // Ranking del personal por las calificaciones del cliente (últimos 30 días).
@@ -173,6 +174,9 @@ router.get('/dashboard', auth(), h(async (req, res) => {
         .eq('status', 'cobrado').not('table_id', 'is', null).gte('closed_at', month)).order('closed_at', { ascending: false }).limit(3000)
     ])
     const usage = tableStats(used.data || [])
+    // Domicilios abiertos (en una distribuidora es el tablero principal).
+    const { data: dl } = await site(supabase.from('orders').select('delivery_status').eq('type', 'domicilio').eq('status', 'abierto'))
+    const st = await plan.ensure(req.user.org_id)
     const monthStart = `${today.slice(0, 7)}-01`
     const [vaults, expMonth, requests, incidents] = await Promise.all([
       safe(supabase.from('vaults').select('site_id, balance'), []),
@@ -191,13 +195,16 @@ router.get('/dashboard', auth(), h(async (req, res) => {
         users, employees, sites, warehouses, activityToday, products, lowStock: alerts.filter((a) => !a.out).length, outOfStock: alerts.filter((a) => a.out).length,
         salesToday: sales.sales, ordersToday: sales.orders, tipsToday: sales.tips, avgTicket: sales.avgTicket, discountsToday: sales.discounts, courtesiesToday: sales.courtesies,
         openOrders, tables, occupiedTables: occupied, pendingCalls: (calls.data || []).length, openSessions: (sessions.data || []).length,
-        receivables: (cxc.data || []).reduce((a, r) => a + Number(r.amount) - Number(r.paid), 0)
+        receivables: (cxc.data || []).reduce((a, r) => a + Number(r.amount) - Number(r.paid), 0),
+        deliveriesPending: (dl || []).filter((o) => (o.delivery_status || 'por_despachar') === 'por_despachar').length,
+        deliveriesOnTheWay: (dl || []).filter((o) => o.delivery_status === 'en_camino').length
       },
+      mode: plan.modeOf(st),
       staffRanking: await staffRanking(site, month),
       shifts: await safe(shiftStats(site, month).then((data) => ({ data })), null).then((r) => r.data),
       productMix: await safe(productMix(site, month).then((data) => ({ data })), null).then((r) => r.data),
       prepTimes: await safe(prepTimes(month, req.siteId).then((data) => ({ data })), null).then((r) => r.data),
-      tableUsage: { days: 30, turns: usage.turns, avgMinutes: usage.avgMinutes, medianMinutes: usage.medianMinutes, perHour: usage.perHour, best: usage.rows.slice(0, 5), areas: usage.areas },
+      tableUsage: !plan.has(st, 'mesas') ? null : { days: 30, turns: usage.turns, avgMinutes: usage.avgMinutes, medianMinutes: usage.medianMinutes, perHour: usage.perHour, best: usage.rows.slice(0, 5), areas: usage.areas },
       salesByHour: sales.byHour.filter((x) => x.hour >= 6 || x.total > 0),
       calls: (calls.data || []).map((c) => ({ id: c.id, kind: c.kind, table: c.table?.name, createdAt: c.created_at })),
       sessions: (sessions.data || []).map((x) => ({ id: x.id, number: x.number, register: x.register?.name, site: x.site?.name, openingAmount: Number(x.opening_amount), openedAt: x.opened_at, minutes: minutesSince(x.opened_at) })),

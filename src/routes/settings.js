@@ -41,6 +41,7 @@ const toDTO = (s, o) => ({
   social: s?.social || {},
   qrOrdering: s?.qr_ordering || 'llamar',
   cashExpenseLimit: Number(s?.cash_expense_limit ?? 100000),
+  cashReopenHours: Number(s?.cash_reopen_hours ?? 12),
   nit: o?.nit || null,
   phone: o?.phone || null,
   email: o?.email || null,
@@ -80,6 +81,7 @@ router.put('/configuracion', auth(ADMIN), h(async (req, res) => {
   const tip = b.tipPercent === undefined ? 10 : Number(b.tipPercent)
   if (!Number.isFinite(tip) || tip < 0 || tip > 100) errors.push('La propina debe estar entre 0 % y 100 %')
   if (b.cashExpenseLimit !== undefined && b.cashExpenseLimit !== '' && !(Number(b.cashExpenseLimit) >= 0)) errors.push('El tope de gastos de caja no es válido')
+  if (b.cashReopenHours !== undefined && b.cashReopenHours !== '' && !(Number(b.cashReopenHours) >= 0 && Number(b.cashReopenHours) <= 72)) errors.push('Las horas para reabrir un turno deben estar entre 0 y 72')
   if (b.qrOrdering !== undefined && !['llamar', 'confirmar', 'directo'].includes(b.qrOrdering)) errors.push('Opción de pedidos por QR no válida')
   if (errors.length) return fail(res, errors.join('. '), 400)
 
@@ -92,7 +94,8 @@ router.put('/configuracion', auth(ADMIN), h(async (req, res) => {
     receipt_footer: clean(b.receiptFooter),
     social: typeof b.social === 'object' && b.social ? b.social : {},
     ...(b.qrOrdering ? { qr_ordering: b.qrOrdering } : {}),
-    ...(b.cashExpenseLimit !== undefined && b.cashExpenseLimit !== '' ? { cash_expense_limit: Math.round(Number(b.cashExpenseLimit)) } : {})
+    ...(b.cashExpenseLimit !== undefined && b.cashExpenseLimit !== '' ? { cash_expense_limit: Math.round(Number(b.cashExpenseLimit)) } : {}),
+    ...(b.cashReopenHours !== undefined && b.cashReopenHours !== '' ? { cash_reopen_hours: Math.round(Number(b.cashReopenHours)) } : {})
   }).eq('org_id', currentOrg())
   if (error) throw error
   const { error: e2 } = await supabase.from('organizations').update({

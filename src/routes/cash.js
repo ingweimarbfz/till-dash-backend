@@ -12,7 +12,7 @@ const { resolveSupplier } = require('../suppliers')
 const { h, fail, clean } = require('../http')
 const { auth, ADMIN, STAFF } = require('../auth')
 const { audit } = require('../audit')
-const { notify, cashOpenMessage, cashCloseMessage, vaultMessage, cashRequestMessage } = require('../notify')
+const { notify, cashOpenMessage, cashCloseMessage, vaultMessage, cashRequestMessage, cashReopenMessage } = require('../notify')
 const { guard, workSite, sameSite, dbError, money, isMoney, PAY_METHODS, fullName } = require('../ops')
 
 const router = express.Router()
@@ -24,14 +24,18 @@ const registerDTO = (r) => ({ id: r.id, siteId: r.site_id, site: r.site?.name ??
 
 // Resumen de un turno: ventas por forma de pago, propinas, abonos, ingresos, egresos y efectivo esperado.
 const sessionSummary = async (s) => {
-  const [{ data: moves }, { data: orders }, { data: payouts }] = await Promise.all([
+  const [{ data: moves }, { data: orders }, { data: payouts }, { data: credit }] = await Promise.all([
     supabase.from('cash_movements').select('*, user:users(name, last_name)').eq('session_id', s.id).order('created_at'),
     supabase.from('orders').select('id, number, total, tip, discount_total, courtesy_total, table:dining_tables!orders_table_id_fkey(name), closed_at').eq('session_id', s.id).eq('status', 'cobrado').order('closed_at'),
-    supabase.from('tip_payouts').select('id, amount, user_id, user:users!tip_payouts_user_id_fkey(name, last_name)').eq('session_id', s.id).order('id')
+    supabase.from('tip_payouts').select('id, amount, user_id, user:users!tip_payouts_user_id_fkey(name, last_name)').eq('session_id', s.id).order('id'),
+    // Cobrado a cuenta por cobrar: no entra dinero a la caja, pero se vendió en el turno.
+    supabase.from('order_payments').select('amount').eq('session_id', s.id).eq('method', 'cuenta_por_cobrar')
   ])
   const m = moves || []
   const byMethod = {}
   for (const x of m.filter((y) => y.type === 'venta' || y.type === 'abono')) byMethod[x.method] = (byMethod[x.method] || 0) + Number(x.amount)
+  const cxc = (credit || []).reduce((a, x) => a + Number(x.amount), 0)
+  if (cxc) byMethod.cuenta_por_cobrar = (byMethod.cuenta_por_cobrar || 0) + cxc
   const sum = (t) => m.filter((x) => x.type === t).reduce((a, x) => a + Number(x.amount), 0)
   const expected = m.filter((x) => x.method === 'efectivo').reduce((a, x) => a + Number(x.amount), 0)
   const os = orders || []
@@ -52,7 +56,8 @@ const sessionDTO = (s) => ({
   id: s.id, number: s.number, status: s.status, siteId: s.site_id, site: s.site?.name ?? null, registerId: s.register_id, register: s.register?.name ?? null,
   openingAmount: Number(s.opening_amount), expectedCash: s.expected_cash === null ? null : Number(s.expected_cash), countedCash: s.counted_cash === null ? null : Number(s.counted_cash),
   difference: s.difference === null ? null : Number(s.difference), toVault: Number(s.to_vault), tipsPaid: Number(s.tips_paid || 0), nextFloat: Number(s.next_float || 0), openedBy: fullName(s.opener), closedBy: fullName(s.closer),
-  openedById: s.opened_by, openedAt: s.opened_at, closedAt: s.closed_at, note: s.note, closeNote: s.close_note
+  openedById: s.opened_by, openedAt: s.opened_at, closedAt: s.closed_at, note: s.note, closeNote: s.close_note,
+  reopenCount: Number(s.reopen_count || 0), reopenedAt: s.reopened_at || null
 })
 const loadSession = async (id) => (await supabase.from('cash_sessions').select(SESSION_COLUMNS).eq('id', Number(id)).maybeSingle()).data
 
@@ -107,7 +112,8 @@ router.get('/caja/turnos', auth(STAFF), guard('cajero'), h(async (req, res) => {
 router.get('/caja/turnos/:id', auth(STAFF), guard('cajero'), h(async (req, res) => {
   const s = await loadSession(req.params.id)
   if (!s || !sameSite(req, s.site_id)) return fail(res, 'Turno no encontrado', 404)
-  res.send({ ...sessionDTO(s), summary: await sessionSummary(s) })
+  const [summary, reopen] = await Promise.all([sessionSummary(s), reopenInfo(s)])
+  res.send({ ...sessionDTO(s), summary, reopen })
 }))
 router.post('/caja/turnos', auth(STAFF), guard('cajero'), h(async (req, res) => {
   const b = req.body || {}
@@ -310,6 +316,85 @@ router.post('/caja/solicitudes/:id/rechazar', auth(ADMIN), h(async (req, res) =>
   await supabase.from('cash_requests').update({ status: 'rechazada', resolution: note.slice(0, 200), resolved_by: req.user.id, resolved_at: new Date().toISOString() }).eq('id', r.id)
   await audit(req, 'rechazar', 'recursos_caja', r.id, { number: r.number, note })
   notify('caja', () => cashRequestMessage({ number: r.number, status: 'rechazada', amount: Number(r.amount), reason: `${r.reason} · ${note}`, session: r.session?.number, register: r.session?.register?.name, site: r.site?.name, siteId: r.site_id, user: req.user }))
+  res.send({ ok: true })
+}))
+
+// ---------------------------------------------------------------- Reabrir un turno cerrado (TD-006)
+// Si hubo un error en el cierre (o un cobro mal registrado), se pide reabrir el turno con el motivo.
+// Solo el administrador lo aprueba, dentro de las horas configuradas y antes de abrir un turno nuevo en esa caja.
+const REOPEN_COLUMNS = '*, session:cash_sessions(number, status, register:cash_registers(name)), site:sites(name), requester:users!cash_reopen_requests_requested_by_fkey(name, last_name), resolver:users!cash_reopen_requests_resolved_by_fkey(name, last_name)'
+const reopenDTO = (r) => ({
+  id: r.id, sessionId: r.session_id, session: r.session?.number ?? null, register: r.session?.register?.name ?? null, siteId: r.site_id, site: r.site?.name ?? null,
+  reason: r.reason, status: r.status, statusLabel: REQUEST_STATUS[r.status], resolution: r.resolution, snapshot: r.snapshot || null,
+  requestedBy: fullName(r.requester), resolvedBy: fullName(r.resolver), resolvedAt: r.resolved_at, createdAt: r.created_at
+})
+const reopenHours = async () => Number((await supabase.from('app_settings').select('cash_reopen_hours').maybeSingle()).data?.cash_reopen_hours ?? 12)
+// ¿Se puede reabrir? Devuelve hasta cuándo y por qué no.
+const reopenInfo = async (s) => {
+  if (s.status !== 'cerrada') return { allowed: false }
+  const hours = await reopenHours()
+  const until = new Date(new Date(s.closed_at).getTime() + hours * 3600e3).toISOString()
+  const [{ data: newer }, { data: pend }] = await Promise.all([
+    supabase.from('cash_sessions').select('id, number').eq('register_id', s.register_id).neq('id', s.id).or(`status.eq.abierta,opened_at.gt."${s.closed_at}"`).limit(1),
+    supabase.from('cash_reopen_requests').select(REOPEN_COLUMNS).eq('session_id', s.id).eq('status', 'pendiente').maybeSingle()
+  ])
+  const why = hours <= 0 ? 'La reapertura de turnos está desactivada en Configuración.'
+    : (newer || []).length ? `Ya se abrió el turno ${newer[0].number} en esta caja.`
+      : Date.now() > new Date(until).getTime() ? `Pasaron más de ${hours} horas desde el cierre.` : null
+  return { allowed: !why, why, hours, until, pending: pend ? reopenDTO(pend) : null }
+}
+const approveReopen = async (req, id, note) => {
+  const { data, error } = await supabase.rpc('reopen_cash_session', { p: { org_id: req.user.org_id, user_id: req.user.id, request_id: id, note: note || null } })
+  if (error) return { error }
+  const { data: r } = await supabase.from('cash_reopen_requests').select(REOPEN_COLUMNS).eq('id', id).single()
+  await audit(req, 'reabrir', 'turno_caja', r.session_id, { number: r.session?.number, reason: r.reason, closed: data.snapshot })
+  notify('caja', () => cashReopenMessage({ status: 'aprobada', session: r.session?.number, register: r.session?.register?.name, reason: r.reason, note, site: r.site?.name, siteId: r.site_id, user: req.user }))
+  return { row: r }
+}
+// El cajero (o el administrador) pide reabrir con el motivo. Si lo pide el administrador, se reabre de una vez.
+router.post('/caja/turnos/:id/reabrir', auth(STAFF), guard('cajero'), h(async (req, res) => {
+  const s = await loadSession(req.params.id)
+  if (!s || !sameSite(req, s.site_id)) return fail(res, 'Turno no encontrado', 404)
+  const reason = clean(req.body?.reason)
+  if (!reason || reason.length < 5) return fail(res, 'Explica el motivo para reabrir el turno', 400)
+  const info = await reopenInfo(s)
+  if (!info.allowed) return fail(res, info.why || 'El turno no está cerrado', 409)
+  if (info.pending) return fail(res, 'Ya hay una solicitud pendiente para reabrir este turno', 409)
+  const { data: r, error } = await supabase.from('cash_reopen_requests').insert({ site_id: s.site_id, session_id: s.id, reason: reason.slice(0, 300), requested_by: req.user.id }).select('id').single()
+  if (error) return dbError(res, error)
+  if (ADMIN.includes(req.user.role)) {
+    const done = await approveReopen(req, r.id, null)
+    if (done.error) { await supabase.from('cash_reopen_requests').delete().eq('id', r.id); return dbError(res, done.error) }
+    const after = await loadSession(s.id)
+    return res.status(201).send({ reopened: true, request: reopenDTO(done.row), session: sessionDTO(after) })
+  }
+  await audit(req, 'solicitar', 'reabrir_turno', r.id, { session: s.number, reason })
+  notify('caja', () => cashReopenMessage({ status: 'pendiente', session: s.number, register: s.register?.name, reason, site: s.site?.name, siteId: s.site_id, user: req.user }))
+  const { data: row } = await supabase.from('cash_reopen_requests').select(REOPEN_COLUMNS).eq('id', r.id).single()
+  res.status(201).send({ reopened: false, request: reopenDTO(row) })
+}))
+router.get('/caja/reaperturas', auth(ADMIN), h(async (req, res) => {
+  let q = supabase.from('cash_reopen_requests').select(REOPEN_COLUMNS).order('created_at', { ascending: false }).limit(100)
+  if (req.siteId) q = q.eq('site_id', req.siteId)
+  if (REQUEST_STATUS[req.query.estado]) q = q.eq('status', req.query.estado)
+  const [{ data, error }, hours] = await Promise.all([q, reopenHours()])
+  if (error) throw error
+  res.send({ hours, rows: data.map(reopenDTO), pending: data.filter((r) => r.status === 'pendiente').length })
+}))
+router.post('/caja/reaperturas/:id(\\d+)/aprobar', auth(ADMIN), h(async (req, res) => {
+  const done = await approveReopen(req, Number(req.params.id), clean(req.body?.note))
+  if (done.error) return dbError(res, done.error)
+  res.send(reopenDTO(done.row))
+}))
+router.post('/caja/reaperturas/:id(\\d+)/rechazar', auth(ADMIN), h(async (req, res) => {
+  const { data: r } = await supabase.from('cash_reopen_requests').select(REOPEN_COLUMNS).eq('id', Number(req.params.id)).maybeSingle()
+  if (!r) return fail(res, 'Solicitud no encontrada', 404)
+  if (r.status !== 'pendiente') return fail(res, `La solicitud ya fue ${r.status}`, 409)
+  const note = clean(req.body?.note)
+  if (!note) return fail(res, 'Escribe el motivo', 400)
+  await supabase.from('cash_reopen_requests').update({ status: 'rechazada', resolution: note.slice(0, 200), resolved_by: req.user.id, resolved_at: new Date().toISOString() }).eq('id', r.id)
+  await audit(req, 'rechazar', 'reabrir_turno', r.id, { session: r.session?.number, note })
+  notify('caja', () => cashReopenMessage({ status: 'rechazada', session: r.session?.number, register: r.session?.register?.name, reason: r.reason, note, site: r.site?.name, siteId: r.site_id, user: req.user }))
   res.send({ ok: true })
 }))
 

@@ -222,6 +222,8 @@ router.get('/carta/:token', h(async (req, res) => {
   if (qrCheck(req, req.params.token) === false) return res.status(401).send({ message: QR_EXPIRED, expired: true })
   const t = await publicTable(req.params.token)
   if (!t) return fail(res, 'Este código QR ya no está activo. Pide ayuda al personal.', 404)
+  // Siempre fresco: el cliente ve al instante cuando el mesero confirma o entrega.
+  res.set('Cache-Control', 'no-store')
   await runAsOrg(t.org_id, async () => {
     const rateable = await rateableOrder(t.id)
     const { data: given } = rateable ? await supabase.from('service_ratings').select('stars, comment').eq('order_id', rateable.id).maybeSingle() : { data: null }
@@ -240,13 +242,15 @@ router.get('/carta/:token', h(async (req, res) => {
       ordering: m.orderMode, canOrder: m.orderMode !== 'none' && cashOpen,
       categories: m.categories,
       products: m.products,
+      // Cuenta del cliente según la configuración: completa, solo productos y estado (sin valores) u oculta.
+      billView: m.qr.billView,
       order: order ? {
-        number: order.number, total: Number(order.total), billRequested: Boolean(order.bill_requested_at), openedAt: order.opened_at, guests: order.guests, waiter: order.waiter?.name ?? null,
-        items: (order.items || []).filter((i) => i.status !== 'anulado').sort((a, b) => a.id - b.id).map((i) => ({ name: i.name, quantity: Number(i.quantity), price: Number(i.unit_price), courtesy: i.courtesy, status: i.status }))
+        number: order.number, total: m.qr.billView === 'completa' ? Number(order.total) : null, billRequested: Boolean(order.bill_requested_at), openedAt: order.opened_at, guests: order.guests, waiter: order.waiter?.name ?? null,
+        items: m.qr.billView === 'oculta' ? [] : (order.items || []).filter((i) => i.status !== 'anulado').sort((a, b) => a.id - b.id).map((i) => ({ name: i.name, quantity: Number(i.quantity), price: m.qr.billView === 'completa' ? Number(i.unit_price) : null, courtesy: i.courtesy, status: i.status }))
       } : null,
       calls: (calls || []).map((c) => c.kind),
       rating: { canRate: Boolean(rateable), stars: given?.stars ?? null, comment: given?.comment ?? null },
-      pendingOrder: (() => { const p = (calls || []).find((c) => c.kind === 'pedido' && !c.order_id); return p ? { items: p.items || [], total: Number(p.total || 0), at: p.created_at } : null })()
+      pendingOrder: (() => { const p = (calls || []).find((c) => c.kind === 'pedido' && !c.order_id); return p ? { items: p.items || [], total: m.qr.billView === 'completa' ? Number(p.total || 0) : null, at: p.created_at } : null })()
     })
   })
 }))

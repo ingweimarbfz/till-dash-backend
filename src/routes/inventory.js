@@ -313,6 +313,18 @@ router.post('/inventario/movimientos', auth(ADMIN), h(async (req, res) => {
     if (!p.track_stock) return fail(res, `"${p.name}" no maneja inventario`, 400)
     i.name = p.name; i.unit = p.unit
   }
+  // Compra pagada con el efectivo de un turno abierto: además de la entrada queda como gasto del turno
+  // (sale de la caja). Sin esto, la entrada solo suma inventario y no toca la caja.
+  const total = Math.round(items.reduce((a, i) => a + i.quantity * (i.unitCost || 0), 0))
+  let pay = null
+  if (b.type === 'entrada' && Number(b.paySessionId)) {
+    const { data: ps } = await supabase.from('cash_sessions').select('id, number, status, site_id').eq('id', Number(b.paySessionId)).maybeSingle()
+    if (!ps || ps.status !== 'abierta') return fail(res, 'El turno de caja elegido para pagar ya no está abierto', 409)
+    if (!(total > 0)) return fail(res, 'Escribe el costo de los productos para descontarlo de la caja', 400)
+    const { data: cash } = await supabase.rpc('session_cash', { p_session: ps.id })
+    if (Number(cash) < total) return fail(res, `No hay suficiente efectivo en la caja ${ps.number} (disponible: $${Math.round(Number(cash)).toLocaleString('es-CO')})`, 400)
+    pay = ps
+  }
   const { data: ref, error: e1 } = await supabase.rpc('next_consecutive', { p_org: currentOrg(), p_kind: b.type, p_site: 0, p_prefix: MOVE_PREFIX[b.type] })
   if (e1) throw e1
   const sup = b.type === 'entrada' ? await resolveSupplier(b) : { id: null, name: null }
@@ -329,7 +341,21 @@ router.post('/inventario/movimientos', auth(ADMIN), h(async (req, res) => {
   await audit(req, 'crear', 'movimiento_inventario', ref, { type: b.type, warehouse: wh.name, items: signed.map((i) => ({ product: i.name, quantity: i.quantity })) })
   notify('inventario', async () => movementMessage({ type: b.type, ref, warehouse: placeOf(wh), items: signed, note, user: req.user }))
   const alerts = await checkLowStock(items.map((i) => ({ warehouseId, productId: i.productId })))
-  res.status(201).send({ ref, items: items.length, alerts })
+  let expense = null; let payError = null
+  if (pay) {
+    const { data: eid, error: e3 } = await supabase.rpc('finance_expense', { p: {
+      org_id: currentOrg(), user_id: req.user.id, category: 'insumos', description: `Compra ${ref}: ${items.map((i) => i.name).join(', ')}`.slice(0, 200),
+      supplier: sup.name, invoice_ref: invoice, amount: total, source: 'caja', session_id: pay.id
+    } })
+    if (e3) payError = e3.message
+    else {
+      if (sup.id) await supabase.from('expenses').update({ supplier_id: sup.id }).eq('id', eid)
+      const { data: ex } = await supabase.from('expenses').select('number').eq('id', eid).single()
+      expense = { id: eid, number: ex?.number, amount: total, session: pay.number }
+      await audit(req, 'gasto', 'turno_caja', pay.id, { number: ex?.number, session: pay.number, amount: total, description: `Compra ${ref}` })
+    }
+  }
+  res.status(201).send({ ref, items: items.length, alerts, expense, payError })
 }))
 
 // ---------------------------------------------------------------- Traslados entre bodegas

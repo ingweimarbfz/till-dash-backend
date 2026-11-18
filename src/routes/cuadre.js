@@ -42,6 +42,13 @@ const buildCuadre = async ({ day, siteId }) => {
     supabase.from('sites').select('id, name').then((r) => r.data || [])
   ])
   const ids = sessions.map((s) => s.id)
+  // Gastos de los turnos del cuadre aunque se hayan registrado el día anterior (turno abierto antes de medianoche).
+  if (ids.length) {
+    const seen = new Set(expenses.map((e) => e.id))
+    const extra = await all(() => supabase.from('expenses').select('id, number, category, description, supplier, amount, source, session_id, created_at').eq('status', 'activo').in('session_id', ids).order('created_at'))
+    for (const e of extra) if (!seen.has(e.id)) expenses.push(e)
+    expenses.sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
+  }
   const [moves, payouts, credit] = ids.length ? await Promise.all([
     all(() => supabase.from('cash_movements').select('session_id, type, method, amount, created_at').in('session_id', ids)),
     all(() => supabase.from('tip_payouts').select('session_id, amount').in('session_id', ids)),
@@ -70,7 +77,7 @@ const buildCuadre = async ({ day, siteId }) => {
       byMethod: Object.entries(byMethod).map(([method, amount]) => ({ method, label: PAY_METHODS[method] || method, amount: round(amount) })).sort((a, b) => b.amount - a.amount),
       cashSales: round(byMethod.efectivo || 0), income: round(sum('ingreso')), expenses: round(-sum('egreso')),
       tips: round(os.reduce((a, o) => a + Number(o.tip), 0)), tipsPaid: round(payouts.filter((t) => t.session_id === s.id).reduce((a, t) => a + Number(t.amount), 0)),
-      orders: os.length,
+      couriersPaid: round(-sum('domicilio_pagado')), orders: os.length,
       expected: open ? round(cashNow) : round(s.expected_cash), counted: open ? null : round(s.counted_cash), difference: open ? null : round(s.difference),
       toVault: round(s.to_vault), nextFloat: round(s.next_float), reopened: Number(s.reopen_count || 0), closeNote: s.close_note
     }

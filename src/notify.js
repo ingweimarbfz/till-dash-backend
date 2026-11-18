@@ -125,7 +125,7 @@ const cashOpenMessage = ({ number, register, site, siteId, amount, fromVault, us
   html: lines([`🔓 <b>APERTURA DE CAJA · ${esc(number)}</b>`, SEP, `💵 ${esc(register)} · base ${cop(amount)}${fromVault ? ' (desde la bóveda)' : ''}`,
     site ? `📍 ${esc(site)}` : null, who(user)])
 })
-const cashCloseMessage = ({ number, register, site, siteId, sales, byMethod, expected, counted, difference, toVault, tips, orders, user, tipsPaid = [], nextFloat = 0, note }) => ({
+const cashCloseMessage = ({ number, register, site, siteId, sales, byMethod, expected, counted, difference, toVault, tips, orders, user, tipsPaid = [], couriersPaid = [], nextFloat = 0, note }) => ({
   siteId, path: '/caja',
   html: lines([`🔒 <b>CIERRE DE CAJA · ${esc(number)}</b>`, SEP, `💵 ${esc(register)}${site ? ` · 📍 ${esc(site)}` : ''}`,
     `🧾 ${orders} pedido${orders === 1 ? '' : 's'} · ventas ${cop(sales)} · propinas ${cop(tips)}`,
@@ -133,6 +133,7 @@ const cashCloseMessage = ({ number, register, site, siteId, sales, byMethod, exp
     `Efectivo esperado: ${cop(expected)}`, `Efectivo contado: ${cop(counted)}`,
     Number(difference) === 0 ? '✅ Cuadra exacto' : `${difference > 0 ? '⬆️ Sobrante' : '⚠️ Faltante'}: ${cop(Math.abs(difference))}`,
     tipsPaid.length ? `🤝 Propinas pagadas:` : null, ...tipsPaid.map((t) => `   ${esc(t.name)}: ${cop(t.amount)}`),
+    couriersPaid.length ? `🛵 Domiciliarios:` : null, ...couriersPaid.map((t) => `   ${esc(t.name)}: ${cop(t.amount)} (${t.deliveries} domicilio${t.deliveries === 1 ? '' : 's'})`),
     nextFloat > 0 ? `🪙 Queda en caja para el próximo turno: ${cop(nextFloat)}` : null,
     toVault > 0 ? `🏦 A la bóveda: ${cop(toVault)}` : null, note ? `📝 ${esc(note)}` : null, who(user)])
 })

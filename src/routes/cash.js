@@ -16,20 +16,22 @@ const { notify, cashOpenMessage, cashCloseMessage, vaultMessage, cashRequestMess
 const { guard, workSite, sameSite, dbError, money, isMoney, PAY_METHODS, fullName } = require('../ops')
 
 const router = express.Router()
+const { courierSettlement } = require('./deliveries')
 
-const MOVE_TYPES = { apertura: 'Base de apertura', venta: 'Venta', abono: 'Abono a cuenta', ingreso: 'Ingreso', egreso: 'Egreso', a_boveda: 'A la bóveda', propina_pagada: 'Propina pagada' }
+const MOVE_TYPES = { apertura: 'Base de apertura', venta: 'Venta', abono: 'Abono a cuenta', ingreso: 'Ingreso', egreso: 'Egreso', a_boveda: 'A la bóveda', propina_pagada: 'Propina pagada', domicilio_pagado: 'Pago a domiciliario', base_domiciliario: 'Base al domiciliario', retorno_domiciliario: 'Devolución del domiciliario' }
 const VAULT_TYPES = { deposito: 'Depósito', retiro: 'Retiro', cierre_caja: 'Cierre de caja', base_caja: 'Base de caja', consignacion: 'Consignación al banco', ajuste: 'Ajuste', ingreso: 'Ingreso de dinero', gasto: 'Gasto', traslado: 'Traslado', retiro_socio: 'Retiro de socio', anulacion: 'Anulación' }
 
 const registerDTO = (r) => ({ id: r.id, siteId: r.site_id, site: r.site?.name ?? null, name: r.name, active: r.active, floatAmount: Number(r.float_amount || 0) })
 
 // Resumen de un turno: ventas por forma de pago, propinas, abonos, ingresos, egresos y efectivo esperado.
 const sessionSummary = async (s) => {
-  const [{ data: moves }, { data: orders }, { data: payouts }, { data: credit }] = await Promise.all([
+  const [{ data: moves }, { data: orders }, { data: payouts }, { data: credit }, { data: couriers }] = await Promise.all([
     supabase.from('cash_movements').select('*, user:users(name, last_name)').eq('session_id', s.id).order('created_at'),
     supabase.from('orders').select('id, number, total, tip, discount_total, courtesy_total, table:dining_tables!orders_table_id_fkey(name), closed_at').eq('session_id', s.id).eq('status', 'cobrado').order('closed_at'),
     supabase.from('tip_payouts').select('id, amount, user_id, user:users!tip_payouts_user_id_fkey(name, last_name)').eq('session_id', s.id).order('id'),
     // Cobrado a cuenta por cobrar: no entra dinero a la caja, pero se vendió en el turno.
-    supabase.from('order_payments').select('amount').eq('session_id', s.id).eq('method', 'cuenta_por_cobrar')
+    supabase.from('order_payments').select('amount').eq('session_id', s.id).eq('method', 'cuenta_por_cobrar'),
+    supabase.from('courier_payouts').select('id, amount, deliveries, fees, share, tips, user_id, user:users!courier_payouts_user_id_fkey(name, last_name)').eq('session_id', s.id).order('id').then((r) => (r.error ? { data: [] } : r))
   ])
   const m = moves || []
   const byMethod = {}
@@ -44,10 +46,11 @@ const sessionSummary = async (s) => {
     tips: os.reduce((a, o) => a + Number(o.tip), 0), discounts: os.reduce((a, o) => a + Number(o.discount_total), 0),
     courtesies: os.reduce((a, o) => a + Number(o.courtesy_total), 0), orders: os.length,
     byMethod: Object.entries(byMethod).map(([method, amount]) => ({ method, label: PAY_METHODS[method], amount })),
-    tipsPaid: -sum('propina_pagada'),
+    tipsPaid: -sum('propina_pagada'), couriersPaid: -sum('domicilio_pagado'), courierFloats: sum('base_domiciliario') + sum('retorno_domiciliario'),
     expectedCash: s.status === 'cerrada' ? Number(s.expected_cash) : expected,
     movements: m.map((x) => ({ id: x.id, type: x.type, typeLabel: MOVE_TYPES[x.type], method: x.method, methodLabel: PAY_METHODS[x.method], amount: Number(x.amount), ref: x.ref, note: x.note, orderId: x.order_id, user: fullName(x.user), createdAt: x.created_at })),
     tipPayouts: (payouts || []).map((t) => ({ id: t.id, userId: t.user_id, name: fullName(t.user), amount: Number(t.amount) })),
+    courierPayouts: (couriers || []).map((t) => ({ id: t.id, userId: t.user_id, name: fullName(t.user), amount: Number(t.amount), deliveries: t.deliveries, fees: Number(t.fees), share: Number(t.share), tips: Number(t.tips) })),
     orderList: os.map((o) => ({ id: o.id, number: o.number, table: o.table?.name ?? null, total: Number(o.total), tip: Number(o.tip), closedAt: o.closed_at }))
   }
 }
@@ -55,7 +58,7 @@ const SESSION_COLUMNS = '*, register:cash_registers(name), site:sites(name), ope
 const sessionDTO = (s) => ({
   id: s.id, number: s.number, status: s.status, siteId: s.site_id, site: s.site?.name ?? null, registerId: s.register_id, register: s.register?.name ?? null,
   openingAmount: Number(s.opening_amount), expectedCash: s.expected_cash === null ? null : Number(s.expected_cash), countedCash: s.counted_cash === null ? null : Number(s.counted_cash),
-  difference: s.difference === null ? null : Number(s.difference), toVault: Number(s.to_vault), tipsPaid: Number(s.tips_paid || 0), nextFloat: Number(s.next_float || 0), openedBy: fullName(s.opener), closedBy: fullName(s.closer),
+  difference: s.difference === null ? null : Number(s.difference), toVault: Number(s.to_vault), tipsPaid: Number(s.tips_paid || 0), couriersPaid: Number(s.couriers_paid || 0), nextFloat: Number(s.next_float || 0), openedBy: fullName(s.opener), closedBy: fullName(s.closer),
   openedById: s.opened_by, openedAt: s.opened_at, closedAt: s.closed_at, note: s.note, closeNote: s.close_note,
   reopenCount: Number(s.reopen_count || 0), reopenedAt: s.reopened_at || null
 })
@@ -159,7 +162,7 @@ router.get('/caja/turnos/:id/propinas', auth(STAFF), guard('cajero'), h(async (r
   const month = new Date(Date.now() - 30 * 864e5).toISOString()
   const [{ data: staff }, { data: orders }, { data: sessOrders }, { data: monthRatings }] = await Promise.all([
     supabase.from('users').select('id, name, last_name, role, positions, site_id').eq('active', true).in('role', ['empleado', 'admin']).order('name'),
-    supabase.from('orders').select('waiter_id, tip').eq('session_id', s.id).eq('status', 'cobrado').gt('tip', 0),
+    supabase.from('orders').select('waiter_id, tip, type, courier_id').eq('session_id', s.id).eq('status', 'cobrado').gt('tip', 0),
     supabase.from('orders').select('id').eq('session_id', s.id),
     supabase.from('service_ratings').select('waiter_id, stars').gte('created_at', month)
   ])
@@ -174,7 +177,8 @@ router.get('/caja/turnos/:id/propinas', auth(STAFF), guard('cajero'), h(async (r
   const shiftR = avgBy(shiftRatings); const monthR = avgBy(monthRatings)
   const rating = (m, id) => (m[id] ? { avg: Math.round((m[id].sum / m[id].n) * 10) / 10, count: m[id].n } : null)
   const byWaiter = {}
-  for (const o of orders || []) if (o.waiter_id) byWaiter[o.waiter_id] = (byWaiter[o.waiter_id] || 0) + Number(o.tip)
+  // Las propinas de un domicilio con domiciliario son de él y se le pagan aparte (Domiciliarios).
+  for (const o of (orders || []).filter((x) => !(x.type === 'domicilio' && x.courier_id))) if (o.waiter_id) byWaiter[o.waiter_id] = (byWaiter[o.waiter_id] || 0) + Number(o.tip)
   const total = Object.values(byWaiter).reduce((a, x) => a + x, 0)
   res.send({
     total,
@@ -196,13 +200,21 @@ router.post('/caja/turnos/:id/cerrar', auth(STAFF), guard('cajero'), h(async (re
   const tips = (Array.isArray(b.tips) ? b.tips : []).filter((t) => Number(t?.amount) > 0)
   if (tips.some((t) => !Number(t.userId) || !isMoney(t.amount))) return fail(res, 'Revisa los valores de las propinas', 400)
   if (new Set(tips.map((t) => Number(t.userId))).size !== tips.length) return fail(res, 'Un empleado aparece dos veces en las propinas', 400)
+  const couriers = (Array.isArray(b.couriers) ? b.couriers : []).filter((t) => Number(t?.amount) > 0)
+  if (couriers.some((t) => !Number(t.userId) || !isMoney(t.amount))) return fail(res, 'Revisa los valores de los domiciliarios', 400)
+  // Lo que el sistema calculó para cada domiciliario (domicilios y propinas) queda guardado con el pago.
+  const settle = couriers.length ? await courierSettlement(s.id) : { rows: [] }
+  // El domiciliario que tiene una base de este turno debe liquidarla antes del cierre (trae la base y lo cobrado).
+  const { data: floats } = await supabase.from('courier_floats').select('id, user:users!courier_floats_user_id_fkey(name, last_name)').eq('session_id', s.id).eq('status', 'abierta').then((r) => (r.error ? { data: [] } : r))
+  if ((floats || []).length) return fail(res, `Falta liquidar la base de ${floats.map((f) => fullName(f.user)).join(', ')}. Hazlo en Domicilios antes de cerrar.`, 409)
   const { count } = await supabase.from('orders').select('id', { count: 'exact', head: true }).eq('site_id', s.site_id).eq('status', 'abierto')
   const { data: open } = await supabase.from('cash_sessions').select('id').eq('site_id', s.site_id).eq('status', 'abierta')
   if (count && (open || []).length === 1 && !b.force) return fail(res, `Quedan ${count} pedido${count === 1 ? '' : 's'} abierto${count === 1 ? '' : 's'} en la sucursal. Cóbralos o confirma el cierre igualmente.`, 409)
   const before = await sessionSummary(s)
   const { data, error } = await supabase.rpc('close_cash_session', { p: {
     org_id: req.user.org_id, session_id: s.id, user_id: req.user.id, counted_cash: money(b.countedCash), next_float: money(b.nextFloat),
-    tips: tips.map((t) => ({ user_id: Number(t.userId), amount: money(t.amount) })), note: clean(b.note)
+    tips: tips.map((t) => ({ user_id: Number(t.userId), amount: money(t.amount) })), note: clean(b.note),
+    couriers: couriers.map((t) => { const c = settle.rows.find((r) => r.userId === Number(t.userId)) || {}; return { user_id: Number(t.userId), amount: money(t.amount), deliveries: c.deliveries || 0, fees: c.fees || 0, share: c.share || 0, tips: c.tips || 0 } })
   } })
   if (error) return dbError(res, error)
   const after = await loadSession(s.id)
@@ -211,7 +223,7 @@ router.post('/caja/turnos/:id/cerrar', auth(STAFF), guard('cajero'), h(async (re
   notify('caja', () => cashCloseMessage({
     number: s.number, register: s.register?.name, site: s.site?.name, siteId: s.site_id, sales: before.sales, tips: before.tips, orders: before.orders,
     byMethod: Object.fromEntries(before.byMethod.map((x) => [x.label, x.amount])), expected: Number(data.expected), counted: Number(data.counted),
-    difference: Number(data.difference), toVault: Number(data.toVault), nextFloat: Number(data.nextFloat), tipsPaid: summary.tipPayouts, note: clean(b.note), user: req.user
+    difference: Number(data.difference), toVault: Number(data.toVault), nextFloat: Number(data.nextFloat), tipsPaid: summary.tipPayouts, couriersPaid: summary.courierPayouts, note: clean(b.note), user: req.user
   }))
   res.send({ ...sessionDTO(after), summary })
 }))

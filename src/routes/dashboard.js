@@ -47,6 +47,59 @@ const salesOf = async (from, filter) => {
   return { sales, orders: rows.length, tips: sum('tip'), discounts: sum('discount_total'), courtesies: sum('courtesy_total'), avgTicket: rows.length ? Math.round(sales / rows.length) : 0, byHour, rows }
 }
 
+// PostgREST devuelve máximo 1000 filas por consulta: se pide por páginas.
+const pages = async (build) => {
+  const out = []
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await build().range(from, from + 999)
+    if (error) throw error
+    out.push(...data)
+    if (data.length < 1000) return out
+  }
+}
+
+// Duración de los turnos de caja (desde que se abre hasta que se cierra), últimos 30 días.
+const shiftStats = async (site, since) => {
+  const rows = await pages(() => site(supabase.from('cash_sessions').select('id, number, status, opened_at, closed_at, register:cash_registers(name)').gte('opened_at', since)).order('opened_at', { ascending: false }))
+  const closed = rows.filter((r) => r.closed_at).map((r) => ({ ...r, minutes: Math.max(0, Math.round((new Date(r.closed_at) - new Date(r.opened_at)) / 60000)) }))
+  const mins = closed.map((r) => r.minutes)
+  return {
+    days: 30, closed: closed.length,
+    avgMinutes: mins.length ? Math.round(mins.reduce((a, x) => a + x, 0) / mins.length) : 0,
+    maxMinutes: mins.length ? Math.max(...mins) : 0, minMinutes: mins.length ? Math.min(...mins) : 0,
+    recent: closed.slice(0, 6).map((r) => ({ id: r.id, number: r.number, register: r.register?.name ?? null, openedAt: r.opened_at, closedAt: r.closed_at, minutes: r.minutes }))
+  }
+}
+
+// Productos más y menos vendidos (últimos 30 días). Los menos vendidos incluyen los que no se vendieron
+// nada y están en la carta: candidatos para una promoción o publicidad.
+const productMix = async (site, since) => {
+  const orders = await pages(() => site(supabase.from('orders').select('id').eq('status', 'cobrado').gte('closed_at', since)))
+  const ids = orders.map((o) => o.id)
+  const items = []
+  for (let i = 0; i < ids.length; i += 300) items.push(...await pages(() => supabase.from('order_items').select('order_id, product_id, quantity, unit_price, courtesy, status').in('order_id', ids.slice(i, i + 300))))
+  const { data: prods } = await supabase.from('products').select('id, name, price, photo_url, show_in_menu, created_at, category:product_categories(name, emoji)').eq('active', true)
+  const m = {}
+  for (const it of items.filter((x) => x.status !== 'anulado' && x.product_id)) {
+    const k = it.product_id
+    m[k] = m[k] || { qty: 0, revenue: 0, orders: new Set() }
+    m[k].qty += Number(it.quantity); if (!it.courtesy) m[k].revenue += Number(it.quantity) * Number(it.unit_price); m[k].orders.add(it.order_id)
+  }
+  const rows = (prods || []).map((p) => ({
+    id: p.id, name: p.name, price: Number(p.price), photoUrl: p.photo_url, inMenu: p.show_in_menu, category: p.category?.name || 'Sin categoría', emoji: p.category?.emoji || '',
+    qty: Math.round((m[p.id]?.qty || 0) * 100) / 100, revenue: Math.round(m[p.id]?.revenue || 0), orders: m[p.id]?.orders.size || 0,
+    isNew: Date.now() - new Date(p.created_at).getTime() < 7 * 864e5
+  }))
+  const totalQty = rows.reduce((a, r) => a + r.qty, 0)
+  const withShare = (r) => ({ ...r, share: totalQty ? Math.round((r.qty / totalQty) * 1000) / 10 : 0 })
+  return {
+    days: 30, orders: ids.length,
+    top: [...rows].filter((r) => r.qty > 0).sort((a, b) => b.qty - a.qty || b.revenue - a.revenue).slice(0, 6).map(withShare),
+    bottom: [...rows].filter((r) => r.inMenu && !r.isNew).sort((a, b) => a.qty - b.qty || a.revenue - b.revenue).slice(0, 6).map(withShare),
+    unsold: rows.filter((r) => r.inMenu && !r.isNew && r.qty === 0).length
+  }
+}
+
 const count = async (table, f = (q) => q) => (await f(supabase.from(table).select('id', { count: 'exact', head: true }))).count || 0
 // Consulta que no tumba el dashboard si una tabla nueva aún no existe (migración sin correr).
 const safe = (p, fallback) => Promise.resolve(p).then((r) => (r?.error ? { data: fallback, count: 0 } : r)).catch(() => ({ data: fallback, count: 0 }))
@@ -103,10 +156,12 @@ router.get('/dashboard', auth(), h(async (req, res) => {
         receivables: (cxc.data || []).reduce((a, r) => a + Number(r.amount) - Number(r.paid), 0)
       },
       staffRanking: await staffRanking(site, month),
+      shifts: await safe(shiftStats(site, month).then((data) => ({ data })), null).then((r) => r.data),
+      productMix: await safe(productMix(site, month).then((data) => ({ data })), null).then((r) => r.data),
       tableUsage: { days: 30, turns: usage.turns, avgMinutes: usage.avgMinutes, medianMinutes: usage.medianMinutes, perHour: usage.perHour, best: usage.rows.slice(0, 5), areas: usage.areas },
       salesByHour: sales.byHour.filter((x) => x.hour >= 6 || x.total > 0),
       calls: (calls.data || []).map((c) => ({ id: c.id, kind: c.kind, table: c.table?.name, createdAt: c.created_at })),
-      sessions: (sessions.data || []).map((x) => ({ id: x.id, number: x.number, register: x.register?.name, site: x.site?.name, openingAmount: Number(x.opening_amount), openedAt: x.opened_at })),
+      sessions: (sessions.data || []).map((x) => ({ id: x.id, number: x.number, register: x.register?.name, site: x.site?.name, openingAmount: Number(x.opening_amount), openedAt: x.opened_at, minutes: minutesSince(x.opened_at) })),
       alerts: alerts.slice(0, 8),
       recent: (recent.data || []).map((a) => ({ id: a.id, action: a.action, entity: a.entity, createdAt: a.created_at, user: a.user ? `${a.user.name} ${a.user.last_name || ''}`.trim() : null }))
     })

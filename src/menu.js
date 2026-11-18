@@ -14,6 +14,7 @@ const DEFAULT_PRESENTATION = { layout: 'lista', showPhotos: true, showDescriptio
 const qrOptionsOf = (s) => ({
   callWaiter: s?.qr_call_waiter ?? true,
   requestBill: s?.qr_request_bill ?? true,
+  billView: ['completa', 'sin_valores', 'oculta'].includes(s?.qr_bill_view) ? s.qr_bill_view : 'completa',
   orderConfirm: s?.qr_order_confirm ?? s?.qr_ordering === 'confirmar',
   orderDirect: s?.qr_order_direct ?? s?.qr_ordering === 'directo',
   directCategories: (s?.qr_direct_categories || []).map(Number)
@@ -69,7 +70,7 @@ const pickMenu = async ({ siteId, menuId, tz }) => {
 // Debe correr en el contexto del establecimiento (runAsOrg o una petición autenticada).
 const buildMenu = async ({ siteId, menuId = null }) => {
   const { data: s } = await supabase.from('app_settings')
-    .select('business_name, short_name, slogan, logo_url, color_primary, color_secondary, color_accent, font_family, social, timezone, qr_ordering, qr_call_waiter, qr_request_bill, qr_order_confirm, qr_order_direct, qr_direct_categories')
+    .select('business_name, short_name, slogan, logo_url, color_primary, color_secondary, color_accent, font_family, social, timezone, qr_ordering, qr_call_waiter, qr_request_bill, qr_bill_view, qr_order_confirm, qr_order_direct, qr_direct_categories')
     .maybeSingle()
   const menu = await pickMenu({ siteId, menuId, tz: s?.timezone })
   const { data: wh } = siteId ? await supabase.rpc('sale_warehouse', { p_site: siteId }) : { data: null }

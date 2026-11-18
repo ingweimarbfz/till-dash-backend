@@ -146,6 +146,11 @@ const cashRequestMessage = ({ number, status, amount, reason, session, register,
   html: lines([status === 'pendiente' ? `🙏 <b>SOLICITUD DE RECURSOS · ${esc(number)}</b>` : status === 'aprobada' ? `✅ <b>RECURSOS APROBADOS · ${esc(number)}</b>` : `❌ <b>RECURSOS RECHAZADOS · ${esc(number)}</b>`, SEP,
     `💵 ${cop(amount)} para ${esc(register || 'la caja')}${session ? ` (${esc(session)})` : ''}`, reason ? `📝 ${esc(reason)}` : null, site ? `📍 ${esc(site)}` : null, who(user)])
 })
+const cashReopenMessage = ({ status, session, register, reason, note, site, siteId, user }) => ({
+  siteId, path: '/caja?tab=reaperturas',
+  html: lines([status === 'pendiente' ? `🔓 <b>SOLICITUD PARA REABRIR ${esc(session)}</b>` : status === 'aprobada' ? `🔓 <b>TURNO ${esc(session)} REABIERTO</b>` : `❌ <b>NO SE REABRE ${esc(session)}</b>`, SEP,
+    `🏧 ${esc(register || 'Caja')}`, reason ? `📝 ${esc(reason)}` : null, note ? `💬 ${esc(note)}` : null, site ? `📍 ${esc(site)}` : null, who(user)])
+})
 const INCIDENT_EMOJI = { rotura: '🍽️', dano: '🛠️', faltante: '📦', accidente: '🚑', queja: '🗣️', otro: '⚠️' }
 const incidentMessage = ({ number, type, typeLabel, title, cost, responsible, site, siteId, user }) => ({
   siteId, path: '/incidentes',
@@ -159,4 +164,4 @@ const callMessage = ({ table, kind, site, siteId, note, items }) => ({
     site ? `📍 ${esc(site)} · ${hour()}` : hour()])
 })
 
-module.exports = { SECTIONS, tg, esc, qty, cop, loadSettings, notify, send, lowStockMessage, movementMessage, transferMessage, courtesyMessage, voidMessage, cashOpenMessage, cashCloseMessage, vaultMessage, callMessage, incidentMessage, cashRequestMessage }
+module.exports = { SECTIONS, tg, esc, qty, cop, loadSettings, notify, send, lowStockMessage, movementMessage, transferMessage, courtesyMessage, voidMessage, cashOpenMessage, cashCloseMessage, vaultMessage, callMessage, incidentMessage, cashRequestMessage, cashReopenMessage }

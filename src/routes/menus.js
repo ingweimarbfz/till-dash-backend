@@ -88,7 +88,7 @@ router.delete('/cartas/:id(\\d+)', auth(ADMIN), h(async (req, res) => {
 // ---------------------------------------------------------------- Opciones del QR
 const optionsDTO = (s) => { const o = qrOptionsOf(s); return { ...o, mode: orderMode(o) } }
 router.get('/cartas/opciones', auth(STAFF), h(async (req, res) => {
-  const { data } = await supabase.from('app_settings').select('qr_ordering, qr_call_waiter, qr_request_bill, qr_order_confirm, qr_order_direct, qr_direct_categories').maybeSingle()
+  const { data } = await supabase.from('app_settings').select('qr_ordering, qr_call_waiter, qr_request_bill, qr_bill_view, qr_order_confirm, qr_order_direct, qr_direct_categories').maybeSingle()
   res.send({ ...optionsDTO(data), qrModule: await plan.orgHas(req.user.org_id, 'carta_qr') })
 }))
 router.put('/cartas/opciones', auth(ADMIN), h(async (req, res) => {
@@ -96,15 +96,16 @@ router.put('/cartas/opciones', auth(ADMIN), h(async (req, res) => {
   if (!(await plan.orgHas(req.user.org_id, 'carta_qr'))) return fail(res, 'Tu plan no incluye la carta por QR. Pide un cambio en "Mi plan".', 403)
   const row = {
     qr_call_waiter: b.callWaiter !== false, qr_request_bill: b.requestBill !== false,
+    qr_bill_view: ['completa', 'sin_valores', 'oculta'].includes(b.billView) ? b.billView : 'completa',
     qr_order_confirm: Boolean(b.orderConfirm), qr_order_direct: Boolean(b.orderDirect),
     qr_direct_categories: ids(b.directCategories)
   }
   if (row.qr_order_confirm && row.qr_order_direct && !row.qr_direct_categories.length) return fail(res, 'Con las dos formas de pedir activas, elige qué categorías van directo a cocina y bar', 400)
   // Compatibilidad con la opción anterior (una sola forma).
   row.qr_ordering = row.qr_order_direct && !row.qr_order_confirm ? 'directo' : row.qr_order_confirm ? 'confirmar' : 'llamar'
-  const { data, error } = await supabase.from('app_settings').update(row).eq('org_id', currentOrg()).select('qr_ordering, qr_call_waiter, qr_request_bill, qr_order_confirm, qr_order_direct, qr_direct_categories').single()
+  const { data, error } = await supabase.from('app_settings').update(row).eq('org_id', currentOrg()).select('qr_ordering, qr_call_waiter, qr_request_bill, qr_bill_view, qr_order_confirm, qr_order_direct, qr_direct_categories').single()
   if (error) throw error
-  await audit(req, 'editar', 'opciones_qr', null, { callWaiter: row.qr_call_waiter, requestBill: row.qr_request_bill, confirm: row.qr_order_confirm, direct: row.qr_order_direct })
+  await audit(req, 'editar', 'opciones_qr', null, { callWaiter: row.qr_call_waiter, requestBill: row.qr_request_bill, billView: row.qr_bill_view, confirm: row.qr_order_confirm, direct: row.qr_order_direct })
   res.send({ ...optionsDTO(data), qrModule: true })
 }))
 

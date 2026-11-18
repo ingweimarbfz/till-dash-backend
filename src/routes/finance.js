@@ -290,6 +290,51 @@ router.post('/finanzas/gastos', auth(ADMIN), h(async (req, res) => {
   res.status(201).send({ id, number: data.number })
 }))
 
+// ---------------------------------------------------------------- Cuentas por pagar a proveedores (TD-011)
+// Compras de inventario a crédito. Cada abono es un gasto "compras" pagado desde una cuenta, la caja, el banco o un socio.
+const payableDTO = (p) => ({
+  id: p.id, number: p.number, supplierId: p.supplier_id, supplier: p.supplier?.name ?? null, movementRef: p.movement_ref, invoiceRef: p.invoice_ref,
+  description: p.description, amount: Number(p.amount), paid: Number(p.paid), pending: Math.round(Number(p.amount) - Number(p.paid)),
+  status: p.status, dueOn: p.due_on, overdue: p.status === 'pendiente' && p.due_on && p.due_on < new Date(Date.now() - 5 * 3600e3).toISOString().slice(0, 10),
+  createdBy: fullName(p.creator), createdAt: p.created_at, paidAt: p.paid_at
+})
+router.get('/finanzas/por-pagar', auth(ADMIN), h(async (req, res) => {
+  let q = supabase.from('supplier_payables').select('*, supplier:suppliers(name), creator:users!supplier_payables_created_by_fkey(name, last_name)')
+    .order('status', { ascending: false }).order('due_on', { ascending: true }).order('id', { ascending: false }).limit(300)
+  if (['pendiente', 'pagada', 'anulada'].includes(req.query.estado)) q = q.eq('status', req.query.estado)
+  if (Number(req.query.proveedor)) q = q.eq('supplier_id', Number(req.query.proveedor))
+  const { data, error } = await q
+  if (error) throw error
+  const rows = (data || []).map(payableDTO)
+  const open = rows.filter((r) => r.status === 'pendiente')
+  res.send({ rows, totals: { pending: open.reduce((a, r) => a + r.pending, 0), overdue: open.filter((r) => r.overdue).reduce((a, r) => a + r.pending, 0), count: open.length }, sources: SOURCES })
+}))
+router.post('/finanzas/por-pagar/:id/abonos', auth(ADMIN), h(async (req, res) => {
+  const b = req.body || {}
+  if (!(Number(b.amount) > 0)) return fail(res, 'Escribe un valor mayor que cero', 400)
+  if (!SOURCES[b.source]) return fail(res, 'Elige con qué se pagó', 400)
+  if (b.source === 'caja' && !Number(b.sessionId)) return fail(res, 'Elige el turno de caja del que sale el dinero', 400)
+  if (b.source === 'socio' && !Number(b.partnerId)) return fail(res, 'Elige el socio que lo pagó', 400)
+  if (b.paidOn && !isDay(b.paidOn)) return fail(res, 'Fecha no válida', 400)
+  const { data: cp } = await supabase.from('supplier_payables').select('id, number, description, invoice_ref, supplier:suppliers(name)').eq('id', Number(req.params.id)).maybeSingle()
+  if (!cp) return fail(res, 'Cuenta por pagar no encontrada', 404)
+  let vault = null
+  if (b.source === 'fondo') {
+    vault = await vaultForKey(req.user.org_id, b.fund ?? 'general')
+    if (!vault) return fail(res, 'Cuenta no encontrada', 404)
+    if (!vault.active) return fail(res, 'La subcuenta está inactiva', 409)
+  }
+  const { failed, data: id } = await run(res, 'pay_supplier_payable', {
+    payable_id: cp.id, org_id: req.user.org_id, user_id: req.user.id, site_id: vault ? vault.siteId : null, vault_id: vault ? vault.id : null,
+    description: `Abono ${cp.number}: ${cp.description}`.slice(0, 200), supplier: cp.supplier?.name ?? null, invoice_ref: cp.invoice_ref, amount: money(b.amount),
+    paid_on: b.paidOn || null, source: b.source, session_id: b.source === 'caja' ? Number(b.sessionId) : null, partner_id: b.source === 'socio' ? Number(b.partnerId) : null
+  })
+  if (failed) return
+  const { data } = await supabase.from('expenses').select('number').eq('id', id).single()
+  await audit(req, 'abonar', 'cuenta_por_pagar', cp.id, { number: cp.number, expense: data?.number, amount: money(b.amount), source: b.source })
+  res.status(201).send({ id, number: data?.number })
+}))
+
 // ---------------------------------------------------------------- Socios
 const partnerDTO = (p) => ({ id: p.id, name: p.name, document: p.document, phone: p.phone, email: p.email, sharePct: Number(p.share_pct), active: p.active, note: p.note })
 const partnerFields = (b) => {

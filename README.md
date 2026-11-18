@@ -84,7 +84,7 @@ por establecimiento, sucursal y tipo de documento. Lo usan las órdenes, cierres
 ## Plan Distribuidora (TD-010): sin mesas, con domicilios y clientes
 Para distribuidoras de cerveza, licores y bebidas que llevan el pedido hasta su cliente.
 - `mesas` dejó de ser módulo del núcleo. Un plan sin `mesas` trabaja en modo **distribuidora** (`/plan/modulos` devuelve `mode`):
-  se bloquean `/mesas`, el QR de mesa y los pedidos en mesa o barra; se vende a domicilio y para recoger.
+  se bloquean `/mesas`, el QR de mesa y los pedidos en mesa o barra; se vende a domicilio y en mostrador (el cliente compra directo en la distribuidora).
 - Módulos nuevos: `domicilios` (pedidos a domicilio, domiciliarios, bases) y `clientes` (directorio).
 - Migración: `supabase/migrations/20261118000017_plan_distribuidora.sql` (crea el plan, los módulos y la tabla `customers`).
 

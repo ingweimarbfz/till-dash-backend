@@ -165,7 +165,7 @@ router.post('/pedidos', auth(STAFF), guard(...SELLERS), h(async (req, res) => {
   const type = TYPES[b.type] ? b.type : (b.tableId ? 'mesa' : 'llevar')
   const site = await workSite(req, b.siteId)
   // Plan sin mesas (distribuidora): solo domicilio y para recoger. Sin domicilios: no hay pedidos a domicilio.
-  if ((type === 'mesa' || type === 'barra') && !(await plan.orgHas(req.user.org_id, 'mesas'))) return fail(res, 'Tu plan no incluye mesas: abre el pedido a domicilio o para recoger.', 403)
+  if ((type === 'mesa' || type === 'barra') && !(await plan.orgHas(req.user.org_id, 'mesas'))) return fail(res, 'Tu plan no incluye mesas: abre el pedido a domicilio o como venta en mostrador.', 403)
   if (type === 'domicilio' && !(await plan.orgHas(req.user.org_id, 'domicilios'))) return fail(res, 'Tu plan no incluye domicilios. Pide un cambio en "Mi plan".', 403)
   // Cliente del directorio: completa nombre, celular y dirección; o se guarda como cliente nuevo.
   const cust = await customerFromBody(req, b, site)

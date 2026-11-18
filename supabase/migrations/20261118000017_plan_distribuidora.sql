@@ -2,7 +2,7 @@
 -- TD-010 · Plan Distribuidora: negocios que venden y llevan a domicilio sin mesas
 -- (distribuidoras de cerveza, licores, bebidas, víveres…).
 -- · "mesas" deja de ser del núcleo: un plan puede no incluirla. Sin "mesas" el sistema trabaja sin salón:
---   no hay mesas, zonas, QR de mesa ni pedidos en mesa o barra; se vende a domicilio y para recoger.
+--   no hay mesas, zonas, QR de mesa ni pedidos en mesa o barra; se vende a domicilio y en mostrador (el cliente compra directo en la distribuidora).
 -- · Módulos nuevos: "domicilios" (pedidos a domicilio, domiciliarios y sus bases) y "clientes"
 --   (directorio de clientes con dirección, zona de reparto, historial y saldo por cobrar).
 --   Los planes actuales quedan con domicilios; Profesional y Premium también con clientes.

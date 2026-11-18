@@ -13,7 +13,7 @@ const { audit } = require('../audit')
 const plan = require('../plan')
 const { runAsOrg } = require('../tenant')
 const { workSite, sameSite, fullName, cashOpenAt, NO_CASH } = require('../ops')
-const { bestFor, promoBrief, loadActive } = require('../promo')
+const { buildMenu, qrOptionsOf, orderMode, goesDirect } = require('../menu')
 const { notify, callMessage } = require('../notify')
 const jwt = require('jsonwebtoken')
 const { JWT_SECRET } = require('../config')
@@ -200,6 +200,15 @@ router.post('/llamados/:id/aceptar', auth(STAFF), h(async (req, res) => {
 }))
 
 // ---------------------------------------------------------------- Carta pública (QR)
+// Pedido que el cliente puede calificar: el abierto de la mesa o el último cobrado en las últimas 3 horas.
+const rateableOrder = async (tableId) => {
+  const { data: open } = await supabase.from('orders').select('id, site_id, waiter_id').eq('table_id', tableId).eq('status', 'abierto').maybeSingle()
+  if (open) return open
+  const since = new Date(Date.now() - 3 * 3600e3).toISOString()
+  const { data: last } = await supabase.from('orders').select('id, site_id, waiter_id').eq('table_id', tableId).eq('status', 'cobrado').gte('closed_at', since).order('closed_at', { ascending: false }).limit(1).maybeSingle()
+  return last || null
+}
+
 const publicTable = async (token) => {
   if (!/^[0-9a-f]{8,40}$/i.test(token || '')) return null
   const { data } = await supabase.from('dining_tables').select('id, org_id, site_id, name, seats, active, area:dining_areas(name), site:sites(name, active), org:organizations(status)').eq('qr_token', token).maybeSingle()
@@ -214,39 +223,29 @@ router.get('/carta/:token', h(async (req, res) => {
   const t = await publicTable(req.params.token)
   if (!t) return fail(res, 'Este código QR ya no está activo. Pide ayuda al personal.', 404)
   await runAsOrg(t.org_id, async () => {
-    const { data: wh } = await supabase.rpc('sale_warehouse', { p_site: t.site_id })
-    const [{ data: s }, { data: cats }, { data: prods }, { data: stock }, promos, { data: order }, { data: calls }] = await Promise.all([
-      supabase.from('app_settings').select('business_name, short_name, slogan, logo_url, color_primary, color_secondary, color_accent, font_family, social, qr_ordering').maybeSingle(),
-      supabase.from('product_categories').select('id, name, emoji, color, description, sort_order').eq('active', true).eq('show_in_menu', true).order('sort_order').order('name'),
-      supabase.from('products').select('id, name, description, price, photo_url, category_id, track_stock, unit').eq('active', true).eq('show_in_menu', true).order('name'),
-      supabase.from('warehouse_stock').select('product_id, stock').eq('warehouse_id', wh || 0),
-      loadActive(),
+    const rateable = await rateableOrder(t.id)
+    const { data: given } = rateable ? await supabase.from('service_ratings').select('stars, comment').eq('order_id', rateable.id).maybeSingle() : { data: null }
+    const [m, { data: order }, { data: calls }, cashOpen] = await Promise.all([
+      buildMenu({ siteId: t.site_id }),
       supabase.from('orders').select('number, total, tip, guests, opened_at, bill_requested_at, waiter:users!orders_waiter_id_fkey(name), items:order_items(id, name, quantity, unit_price, courtesy, status)').eq('table_id', t.id).eq('status', 'abierto').maybeSingle(),
-      supabase.from('table_calls').select('kind, created_at, items, total, order_id').eq('table_id', t.id).eq('status', 'pendiente')
+      supabase.from('table_calls').select('kind, created_at, items, total, order_id').eq('table_id', t.id).eq('status', 'pendiente'),
+      cashOpenAt(t.site_id)
     ])
-    const cashOpen = await cashOpenAt(t.site_id)
-    const left = new Map((stock || []).map((x) => [x.product_id, Number(x.stock)]))
-    const products = (prods || []).map((p) => {
-      const best = bestFor(promos, p)
-      return {
-        id: p.id, name: p.name, description: p.description, photoUrl: p.photo_url, categoryId: p.category_id, unit: p.unit,
-        price: Number(p.price), finalPrice: best ? best.price : Number(p.price), promo: best ? promoBrief(best.promo, best.price, Number(p.price)) : null,
-        soldOut: p.track_stock && !(left.get(p.id) > 0)
-      }
-    })
     res.send({
       session: qrSign(req.params.token), sessionMinutes: QR_SESSION_MIN,
-      business: s ? { name: s.business_name, shortName: s.short_name, slogan: s.slogan, logoUrl: s.logo_url, primary: s.color_primary, secondary: s.color_secondary, accent: s.color_accent, font: s.font_family, social: s.social } : null,
+      business: m.business, menu: m.menu,
       table: { name: t.name, site: t.site?.name, area: t.area?.name ?? null, seats: t.seats },
-      // Qué puede hacer el cliente: solo llamar, pedir con confirmación o pedir directo. Sin caja abierta no se pide.
-      ordering: s?.qr_ordering || 'llamar', canOrder: (s?.qr_ordering || 'llamar') !== 'llamar' && cashOpen,
-      categories: (cats || []).filter((c) => products.some((p) => p.categoryId === c.id)).map((c) => ({ id: c.id, name: c.name, emoji: c.emoji, color: c.color, description: c.description })),
-      products,
+      // Qué puede hacer el cliente (cada opción por separado). Sin caja abierta no se pide.
+      actions: { callWaiter: m.qr.callWaiter, requestBill: m.qr.requestBill },
+      ordering: m.orderMode, canOrder: m.orderMode !== 'none' && cashOpen,
+      categories: m.categories,
+      products: m.products,
       order: order ? {
         number: order.number, total: Number(order.total), billRequested: Boolean(order.bill_requested_at), openedAt: order.opened_at, guests: order.guests, waiter: order.waiter?.name ?? null,
         items: (order.items || []).filter((i) => i.status !== 'anulado').sort((a, b) => a.id - b.id).map((i) => ({ name: i.name, quantity: Number(i.quantity), price: Number(i.unit_price), courtesy: i.courtesy, status: i.status }))
       } : null,
       calls: (calls || []).map((c) => c.kind),
+      rating: { canRate: Boolean(rateable), stars: given?.stars ?? null, comment: given?.comment ?? null },
       pendingOrder: (() => { const p = (calls || []).find((c) => c.kind === 'pedido' && !c.order_id); return p ? { items: p.items || [], total: Number(p.total || 0), at: p.created_at } : null })()
     })
   })
@@ -258,12 +257,34 @@ router.post('/carta/:token/llamar', h(async (req, res) => {
   if (!t) return fail(res, 'Este código QR ya no está activo. Pide ayuda al personal.', 404)
   const kind = ['mesero', 'cuenta'].includes(req.body?.kind) ? req.body.kind : 'mesero'
   await runAsOrg(t.org_id, async () => {
+    const { data: st } = await supabase.from('app_settings').select('qr_call_waiter, qr_request_bill').maybeSingle()
+    const o = qrOptionsOf(st)
+    if (kind === 'mesero' && !o.callWaiter) return fail(res, 'Esta opción no está disponible en este lugar.', 403)
+    if (kind === 'cuenta' && !o.requestBill) return fail(res, 'Pide la cuenta directamente al personal.', 403)
     const note = clean(req.body?.note)?.slice(0, 140) ?? null
     const { error } = await supabase.from('table_calls').insert({ site_id: t.site_id, table_id: t.id, kind, note })
     if (error && error.code !== '23505') throw error
     if (!error) notify('mesas', () => callMessage({ table: t.name, kind, note, site: t.site?.name, siteId: t.site_id }))
     if (kind === 'cuenta') await supabase.from('orders').update({ bill_requested_at: new Date().toISOString() }).eq('table_id', t.id).eq('status', 'abierto').is('bill_requested_at', null)
     res.status(error ? 200 : 201).send({ ok: true, message: kind === 'cuenta' ? 'Listo, ya le avisamos al personal que quieres la cuenta.' : 'Listo, tu mesero viene en camino.' })
+  })
+}))
+
+// El cliente califica el servicio (1 a 5 estrellas). Puede cambiar su calificación mientras siga en la mesa.
+router.post('/carta/:token/calificar', h(async (req, res) => {
+  if (qrCheck(req, req.params.token) !== true) return res.status(401).send({ message: QR_EXPIRED, expired: true })
+  const t = await publicTable(req.params.token)
+  if (!t) return fail(res, 'Este código QR ya no está activo. Pide ayuda al personal.', 404)
+  const stars = Math.round(Number(req.body?.stars))
+  if (!(stars >= 1 && stars <= 5)) return fail(res, 'Elige de 1 a 5 estrellas', 400)
+  const comment = clean(req.body?.comment)?.slice(0, 300) ?? null
+  await runAsOrg(t.org_id, async () => {
+    const o = await rateableOrder(t.id)
+    if (!o) return fail(res, 'Podrás calificar cuando tengas un pedido en la mesa.', 409)
+    const { error } = await supabase.from('service_ratings').upsert({ site_id: o.site_id, table_id: t.id, order_id: o.id, waiter_id: o.waiter_id, stars, comment, updated_at: new Date().toISOString() }, { onConflict: 'order_id' })
+    if (error) throw error
+    if (stars <= 2) notify('mesas', () => callMessage({ table: t.name, kind: 'mesero', note: `Calificación de ${stars} ★${comment ? `: ${comment}` : ''}`, site: t.site?.name, siteId: t.site_id }))
+    res.status(201).send({ ok: true, message: stars >= 4 ? '¡Gracias! Nos alegra que lo disfrutes.' : 'Gracias por contarnos. Vamos a mejorar.' })
   })
 }))
 
@@ -283,31 +304,51 @@ router.post('/carta/:token/pedido', h(async (req, res) => {
   const customer = clean(b.name)?.slice(0, 60) ?? null
   const note = clean(b.note)?.slice(0, 140) ?? null
   await runAsOrg(t.org_id, async () => {
-    const { data: st } = await supabase.from('app_settings').select('qr_ordering').maybeSingle()
-    const mode = st?.qr_ordering || 'llamar'
-    if (mode === 'llamar') return fail(res, 'En este lugar los pedidos se hacen con el mesero. Toca "Llamar al mesero".', 403)
+    const { data: st } = await supabase.from('app_settings').select('qr_ordering, qr_order_confirm, qr_order_direct, qr_direct_categories').maybeSingle()
+    const o = qrOptionsOf(st)
+    const mode = orderMode(o)
+    if (mode === 'none') return fail(res, 'En este lugar los pedidos se hacen con el mesero. Toca "Llamar al mesero".', 403)
     if (!(await cashOpenAt(t.site_id))) return fail(res, 'Todavía no estamos recibiendo pedidos. Llama al mesero.', 409)
     const { buildItems } = require('./orders')
     const built = await buildItems({ user: { id: null } }, items)
     if (built.error) return fail(res, built.error, 400)
-    const summary = built.rows.map((r) => ({ productId: r.product_id, name: r.name, quantity: Number(r.quantity), price: Number(r.unit_price), note: r.note }))
-    const total = summary.reduce((a, r) => a + r.quantity * r.price, 0)
-    const msg = (extra) => notify('mesas', () => callMessage({ table: t.name, kind: 'pedido', note: [customer, note, extra].filter(Boolean).join(' · ') || null, items: summary, site: t.site?.name, siteId: t.site_id }))
-    if (mode === 'confirmar') {
-      const { error } = await supabase.from('table_calls').insert({ site_id: t.site_id, table_id: t.id, kind: 'pedido', note, items: summary.map((r) => ({ ...r })), total, customer_name: customer })
+    // Cada producto va directo o por confirmación según su categoría (con ambas formas de pedir activas).
+    const { data: pc } = await supabase.from('products').select('id, category_id').in('id', items.map((i) => i.productId))
+    const catOf = new Map((pc || []).map((x) => [x.id, x.category_id]))
+    const isDirect = (productId) => goesDirect(o, catOf.get(Number(productId)))
+    const directItems = items.filter((i) => isDirect(i.productId))
+    const confirmItems = items.filter((i) => !isDirect(i.productId))
+    const lines = (list) => built.rows.filter((r) => list.some((i) => Number(i.productId) === Number(r.product_id)))
+      .map((r) => ({ productId: r.product_id, name: r.name, quantity: Number(r.quantity), price: Number(r.unit_price), note: r.note }))
+    const sum = (rows) => rows.reduce((a, r) => a + r.quantity * r.price, 0)
+    const msg = (summary, extra) => notify('mesas', () => callMessage({ table: t.name, kind: 'pedido', note: [customer, note, extra].filter(Boolean).join(' · ') || null, items: summary, site: t.site?.name, siteId: t.site_id }))
+    const done = []
+    if (confirmItems.length) {
+      const summary = lines(confirmItems)
+      const { error } = await supabase.from('table_calls').insert({ site_id: t.site_id, table_id: t.id, kind: 'pedido', note, items: summary, total: sum(summary), customer_name: customer })
       if (error?.code === '23505') return fail(res, 'Ya enviaste un pedido. Espera a que el mesero lo confirme.', 409)
       if (error) throw error
-      msg('por confirmar')
-      return res.status(201).send({ ok: true, mode, message: 'Listo, tu pedido le llegó al mesero. Te avisamos cuando lo confirme.' })
+      msg(summary, 'por confirmar')
+      done.push('confirmar')
     }
-    const r = await addToTable({ orgId: t.org_id, table: t, items, note: customer ? `Cliente: ${customer}` : null })
-    if (r.error) return fail(res, r.error, 400)
-    // Aviso para el personal: si ya hay uno sin ver, se le suman los productos.
-    const { data: prev } = await supabase.from('table_calls').select('id, items, total').eq('table_id', t.id).eq('kind', 'pedido').eq('status', 'pendiente').maybeSingle()
-    if (prev) await supabase.from('table_calls').update({ items: [...(prev.items || []), ...summary], total: Number(prev.total || 0) + total, order_id: r.order.id, result: 'directo' }).eq('id', prev.id)
-    else await supabase.from('table_calls').insert({ site_id: t.site_id, table_id: t.id, kind: 'pedido', note, items: summary, total, customer_name: customer, order_id: r.order.id, result: 'directo' })
-    msg('directo a cocina')
-    res.status(201).send({ ok: true, mode, message: 'Listo, tu pedido ya va para la cocina y el bar.' })
+    if (directItems.length) {
+      const summary = lines(directItems)
+      const r = await addToTable({ orgId: t.org_id, table: t, items: directItems, note: customer ? `Cliente: ${customer}` : null })
+      if (r.error) return fail(res, r.error, 400)
+      // Aviso para el personal: si ya hay uno directo sin ver, se le suman los productos.
+      const { data: prev } = await supabase.from('table_calls').select('id, items, total').eq('table_id', t.id).eq('kind', 'pedido').eq('status', 'pendiente').not('order_id', 'is', null).maybeSingle()
+      if (prev) await supabase.from('table_calls').update({ items: [...(prev.items || []), ...summary], total: Number(prev.total || 0) + sum(summary), order_id: r.order.id, result: 'directo' }).eq('id', prev.id)
+      else {
+        const { error: ce } = await supabase.from('table_calls').insert({ site_id: t.site_id, table_id: t.id, kind: 'pedido', note, items: summary, total: sum(summary), customer_name: customer, order_id: r.order.id, result: 'directo' })
+        if (ce && ce.code !== '23505') throw ce
+      }
+      msg(summary, 'directo a cocina')
+      done.push('directo')
+    }
+    const message = done.length === 2
+      ? 'Listo. Una parte de tu pedido ya va para la cocina y el bar; el resto lo confirma tu mesero.'
+      : done[0] === 'directo' ? 'Listo, tu pedido ya va para la cocina y el bar.' : 'Listo, tu pedido le llegó al mesero. Te avisamos cuando lo confirme.'
+    res.status(201).send({ ok: true, mode: done.length === 2 ? 'mixto' : done[0], message })
   })
 }))
 

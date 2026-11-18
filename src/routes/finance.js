@@ -10,7 +10,7 @@
 const express = require('express')
 const supabase = require('../db')
 const { h, fail, clean, EMAIL_RE } = require('../http')
-const { auth, ADMIN } = require('../auth')
+const { auth, ADMIN, OWNER } = require('../auth')
 const { audit } = require('../audit')
 const { dbError, money, isMoney, fullName } = require('../ops')
 const { buildReport, rangeOf } = require('./reports')
@@ -43,20 +43,42 @@ const run = async (res, fn, p) => {
 }
 const inRange = (q, col, r) => q.gte(col, r.from).lte(col, r.to)
 
-// ---------------------------------------------------------------- Fondos
-router.get('/finanzas/fondos', auth(ADMIN), h(async (req, res) => {
+// ---------------------------------------------------------------- Fondos y subcuentas
+// Llave de cada cuenta: 'general', el id de la sucursal (su fondo principal) o 'v<id>' (subcuenta).
+const SUB_RE = /^v(\d+)$/
+const fundList = async (orgId) => {
   const sites = await getSites()
-  // Crea los fondos que falten (general y uno por sucursal).
-  await Promise.all([null, ...sites.map((s) => s.id)].map((id) => supabase.rpc('vault_of', { p_org: req.user.org_id, p_site: id })))
+  // Crea los fondos principales que falten (general y uno por sucursal).
+  await Promise.all([null, ...sites.map((s) => s.id)].map((id) => supabase.rpc('vault_of', { p_org: orgId, p_site: id })))
   const [{ data: vaults }, { data: regs }] = await Promise.all([
-    supabase.from('vaults').select('id, site_id, balance'),
+    supabase.from('vaults').select('id, site_id, balance, kind, name, purpose, services, active, created_at').order('created_at'),
     supabase.from('cash_registers').select('site_id, float_amount, active')
   ])
-  const funds = [null, ...sites.map((s) => s.id)].map((sid) => {
-    const v = (vaults || []).find((x) => (x.site_id ?? null) === sid)
+  const funds = []
+  for (const sid of [null, ...sites.map((s) => s.id)]) {
+    const v = (vaults || []).find((x) => x.kind === 'principal' && (x.site_id ?? null) === sid)
     const inRegisters = sid ? (regs || []).filter((r) => r.site_id === sid && r.active).reduce((a, r) => a + Number(r.float_amount || 0), 0) : 0
-    return { key: sid ? String(sid) : 'general', siteId: sid, name: siteName(sites, sid), vaultId: v?.id, balance: Number(v?.balance || 0), inRegisters }
-  })
+    const subs = (vaults || []).filter((x) => x.kind === 'subcuenta' && (x.site_id ?? null) === sid)
+    funds.push({ key: sid ? String(sid) : 'general', kind: 'principal', siteId: sid, name: siteName(sites, sid), vaultId: v?.id, balance: Number(v?.balance || 0), inRegisters, active: true, subcount: subs.length })
+    for (const x of subs) {
+      funds.push({ key: `v${x.id}`, kind: 'subcuenta', siteId: sid, parent: siteName(sites, sid), parentKey: sid ? String(sid) : 'general', name: x.name, purpose: x.purpose, services: x.services || [], vaultId: x.id, balance: Number(x.balance), active: x.active })
+    }
+  }
+  return { funds, sites }
+}
+const vaultForKey = async (orgId, key) => {
+  const m = SUB_RE.exec(String(key ?? ''))
+  if (m) {
+    const { data } = await supabase.from('vaults').select('id, site_id, active').eq('id', Number(m[1])).eq('kind', 'subcuenta').maybeSingle()
+    return data ? { id: data.id, siteId: data.site_id, active: data.active } : null
+  }
+  const site = fundSite(key)
+  const { data } = await supabase.rpc('vault_of', { p_org: orgId, p_site: site })
+  return data ? { id: data, siteId: site, active: true } : null
+}
+
+router.get('/finanzas/fondos', auth(ADMIN), h(async (req, res) => {
+  const { funds } = await fundList(req.user.org_id)
   const key = req.query.fondo || 'general'
   const fund = funds.find((f) => f.key === key) || funds[0]
   const { data: moves, error } = await supabase.from('vault_movements').select('*, user:users(name, last_name)').eq('vault_id', fund.vaultId).order('created_at', { ascending: false }).limit(100)
@@ -65,6 +87,112 @@ router.get('/finanzas/fondos', auth(ADMIN), h(async (req, res) => {
     funds, fund, total: funds.reduce((a, f) => a + f.balance, 0),
     movements: (moves || []).map((m) => ({ id: m.id, type: m.type, typeLabel: VAULT_LABELS[m.type] || m.type, amount: Number(m.amount), balanceAfter: Number(m.balance_after), ref: m.ref, note: m.note, user: fullName(m.user), createdAt: m.created_at })),
     entryKinds: ENTRY_KINDS, methods: METHODS
+  })
+}))
+
+// Subcuentas: solo el super administrador las crea, edita o desactiva.
+const subFields = (b) => {
+  const name = clean(b.name)
+  if (!name || name.length < 2) return { error: 'Escribe el nombre de la subcuenta' }
+  const services = []
+  for (const sv of Array.isArray(b.services) ? b.services : []) {
+    const n = clean(sv?.name)
+    if (!n) continue
+    if (!EXPENSE_CATEGORIES[sv.category]) return { error: `Elige la categoría del servicio "${n}"` }
+    if (!services.some((x) => x.name.toLowerCase() === n.toLowerCase())) services.push({ name: n.slice(0, 80), category: sv.category })
+  }
+  return { row: { name: name.slice(0, 60), purpose: clean(b.purpose)?.slice(0, 200) ?? null, services: services.slice(0, 40) } }
+}
+router.post('/finanzas/subcuentas', auth(OWNER), h(async (req, res) => {
+  const b = req.body || {}
+  const { row, error: e } = subFields(b)
+  if (e) return fail(res, e, 400)
+  const site = fundSite(b.siteId)
+  if (site) {
+    const { data: s } = await supabase.from('sites').select('id').eq('id', site).maybeSingle()
+    if (!s) return fail(res, 'Sucursal no encontrada', 404)
+  }
+  if (b.initialAmount && !(Number(b.initialAmount) > 0)) return fail(res, 'El valor inicial debe ser mayor que cero', 400)
+  const { data, error } = await supabase.from('vaults').insert({ ...row, kind: 'subcuenta', site_id: site }).select('id').single()
+  if (error) return fail(res, error.code === '23505' ? 'Ya existe una subcuenta con ese nombre en ese fondo' : error, error.code === '23505' ? 409 : 500)
+  await audit(req, 'crear', 'subcuenta', data.id, { name: row.name, fund: site || 'general' })
+  // Dinero inicial: se traslada desde la cuenta principal de su mismo fondo.
+  if (Number(b.initialAmount) > 0) {
+    const principal = await vaultForKey(req.user.org_id, site ? String(site) : 'general')
+    const { error: te } = await supabase.rpc('vault_transfer', { p: { org_id: req.user.org_id, user_id: req.user.id, from_vault_id: principal.id, to_vault_id: data.id, amount: money(b.initialAmount), note: `Saldo inicial de ${row.name}` } })
+    if (te) return res.status(201).send({ key: `v${data.id}`, warning: te.code === 'P0001' ? `La subcuenta se creó, pero no se trasladó el saldo inicial: ${te.message}` : 'La subcuenta se creó, pero no se trasladó el saldo inicial.' })
+  }
+  res.status(201).send({ key: `v${data.id}` })
+}))
+router.put('/finanzas/subcuentas/:id', auth(OWNER), h(async (req, res) => {
+  const b = req.body || {}
+  const { data: v } = await supabase.from('vaults').select('id, balance, name').eq('id', Number(req.params.id)).eq('kind', 'subcuenta').maybeSingle()
+  if (!v) return fail(res, 'Subcuenta no encontrada', 404)
+  const { row, error: e } = subFields(b)
+  if (e) return fail(res, e, 400)
+  const active = b.active === undefined ? true : Boolean(b.active)
+  if (!active && Number(v.balance) !== 0) return fail(res, 'Para desactivar la subcuenta, primero traslada su saldo a otra cuenta', 409)
+  const { error } = await supabase.from('vaults').update({ ...row, active }).eq('id', v.id)
+  if (error) return fail(res, error.code === '23505' ? 'Ya existe una subcuenta con ese nombre en ese fondo' : error, error.code === '23505' ? 409 : 500)
+  await audit(req, 'editar', 'subcuenta', v.id, { name: row.name, active })
+  res.send({ ok: true })
+}))
+
+// Tablero de cuentas: saldo, entradas y salidas del rango, gastos por categoría y por servicio,
+// y gastos por mes (últimos 6) de cada cuenta.
+router.get('/finanzas/cuentas', auth(ADMIN), h(async (req, res) => {
+  const r = rangeOf(req.query)
+  const { funds } = await fundList(req.user.org_id)
+  const byVault = new Map(funds.map((f) => [f.vaultId, f]))
+  const principalOf = (sid) => funds.find((f) => f.kind === 'principal' && (f.siteId ?? null) === (sid ?? null))
+  const sixAgo = new Date(`${r.to}T12:00:00`); sixAgo.setMonth(sixAgo.getMonth() - 5); sixAgo.setDate(1)
+  const from6 = sixAgo.toISOString().slice(0, 10)
+  const [{ data: moves, error: e1 }, { data: exps, error: e2 }] = await Promise.all([
+    supabase.from('vault_movements').select('vault_id, type, amount').gte('created_at', `${r.from}T00:00:00-05:00`).lte('created_at', `${r.to}T23:59:59-05:00`),
+    supabase.from('expenses').select('site_id, vault_id, category, description, amount, paid_on').eq('source', 'fondo').eq('status', 'activo').gte('paid_on', from6 < r.from ? from6 : r.from).lte('paid_on', r.to)
+  ])
+  if (e1) throw e1
+  if (e2) throw e2
+  const acc = new Map(funds.map((f) => [f.key, { key: f.key, kind: f.kind, name: f.name, parent: f.parent || null, siteId: f.siteId, balance: f.balance, active: f.active, inflow: 0, outflow: 0, spent: 0, byCategory: {}, byService: {} }]))
+  for (const m of moves || []) {
+    const f = byVault.get(m.vault_id); if (!f) continue
+    const a = acc.get(f.key); const v = Number(m.amount)
+    if (v > 0) a.inflow += v; else a.outflow += -v
+  }
+  const months = []
+  for (let d = new Date(sixAgo); d <= new Date(`${r.to}T12:00:00`); d.setMonth(d.getMonth() + 1)) months.push(d.toISOString().slice(0, 7))
+  const monthly = {}
+  for (const e of exps || []) {
+    const f = e.vault_id ? byVault.get(e.vault_id) : principalOf(e.site_id)
+    if (!f) continue
+    const amt = Number(e.amount)
+    const mk = String(e.paid_on).slice(0, 7)
+    monthly[f.key] = monthly[f.key] || {}
+    monthly[f.key][mk] = (monthly[f.key][mk] || 0) + amt
+    if (e.paid_on < r.from) continue
+    const a = acc.get(f.key)
+    a.spent += amt
+    a.byCategory[e.category] = (a.byCategory[e.category] || 0) + amt
+    a.byService[e.description] = (a.byService[e.description] || 0) + amt
+  }
+  const accounts = [...acc.values()].map((a) => ({
+    ...a,
+    byCategory: Object.entries(a.byCategory).map(([key, total]) => ({ key, label: EXPENSE_CATEGORIES[key] || key, total })).sort((x, y) => y.total - x.total),
+    byService: Object.entries(a.byService).map(([label, total]) => ({ label, total })).sort((x, y) => y.total - x.total).slice(0, 8),
+    monthly: months.map((m) => ({ month: m, total: Math.round(monthly[a.key]?.[m] || 0) }))
+  }))
+  const cat = {}
+  for (const a of accounts) for (const c of a.byCategory) cat[c.key] = (cat[c.key] || 0) + c.total
+  res.send({
+    range: r, months, accounts,
+    totals: {
+      balance: accounts.reduce((s, a) => s + a.balance, 0),
+      subaccounts: accounts.filter((a) => a.kind === 'subcuenta').reduce((s, a) => s + a.balance, 0),
+      spent: accounts.reduce((s, a) => s + a.spent, 0),
+      inflow: accounts.reduce((s, a) => s + a.inflow, 0)
+    },
+    byCategory: Object.entries(cat).map(([key, total]) => ({ key, label: EXPENSE_CATEGORIES[key] || key, total })).sort((x, y) => y.total - x.total),
+    categories: EXPENSE_CATEGORIES
   })
 }))
 
@@ -101,11 +229,14 @@ router.post('/finanzas/ingresos', auth(ADMIN), h(async (req, res) => {
 router.post('/finanzas/traslados', auth(ADMIN), h(async (req, res) => {
   const b = req.body || {}
   if (!(Number(b.amount) > 0)) return fail(res, 'Escribe un valor mayor que cero', 400)
-  const from = fundSite(b.fromSiteId); const to = fundSite(b.toSiteId)
-  if (from === to) return fail(res, 'Elige un fondo de origen y uno de destino distintos', 400)
-  const { failed, data: id } = await run(res, 'fund_transfer', { org_id: req.user.org_id, user_id: req.user.id, from_site_id: from, to_site_id: to, amount: money(b.amount), note: clean(b.note) })
+  // Acepta llaves de cuenta (from/to) o, como antes, ids de sucursal (fromSiteId/toSiteId).
+  const fromKey = b.from ?? (b.fromSiteId ?? 'general'); const toKey = b.to ?? (b.toSiteId ?? 'general')
+  const [a, z] = await Promise.all([vaultForKey(req.user.org_id, fromKey), vaultForKey(req.user.org_id, toKey)])
+  if (!a || !z) return fail(res, 'Cuenta no encontrada', 404)
+  if (a.id === z.id) return fail(res, 'Elige una cuenta de origen y una de destino distintas', 400)
+  const { failed, data: id } = await run(res, 'vault_transfer', { org_id: req.user.org_id, user_id: req.user.id, from_vault_id: a.id, to_vault_id: z.id, amount: money(b.amount), note: clean(b.note) })
   if (failed) return
-  await audit(req, 'trasladar', 'fondo', id, { from: from || 'general', to: to || 'general', amount: money(b.amount) })
+  await audit(req, 'trasladar', 'fondo', id, { from: String(fromKey), to: String(toKey), amount: money(b.amount) })
   res.status(201).send({ id })
 }))
 
@@ -113,12 +244,12 @@ router.post('/finanzas/traslados', auth(ADMIN), h(async (req, res) => {
 const expenseDTO = (sites) => (e) => ({
   id: e.id, number: e.number, siteId: e.site_id, site: siteName(sites, e.site_id), category: e.category, categoryLabel: EXPENSE_CATEGORIES[e.category],
   description: e.description, supplier: e.supplier, invoiceRef: e.invoice_ref, amount: Number(e.amount), paidOn: e.paid_on,
-  source: e.source, sourceLabel: SOURCES[e.source], session: e.session?.number ?? null, partnerId: e.partner_id, partner: e.partner?.name ?? null,
+  source: e.source, sourceLabel: e.vault?.kind === 'subcuenta' ? `Subcuenta ${e.vault.name}` : SOURCES[e.source], session: e.session?.number ?? null, partnerId: e.partner_id, partner: e.partner?.name ?? null,
   status: e.status, voidReason: e.void_reason, createdBy: fullName(e.creator), createdAt: e.created_at
 })
 router.get('/finanzas/gastos', auth(ADMIN), h(async (req, res) => {
   const r = rangeOf(req.query)
-  let q = inRange(supabase.from('expenses').select('*, partner:partners(name), session:cash_sessions(number), creator:users!expenses_created_by_fkey(name, last_name)'), 'paid_on', r).order('paid_on', { ascending: false }).order('id', { ascending: false })
+  let q = inRange(supabase.from('expenses').select('*, partner:partners(name), vault:vaults(name, kind), session:cash_sessions(number), creator:users!expenses_created_by_fkey(name, last_name)'), 'paid_on', r).order('paid_on', { ascending: false }).order('id', { ascending: false })
   if (req.siteId) q = q.eq('site_id', req.siteId)
   if (EXPENSE_CATEGORIES[req.query.categoria]) q = q.eq('category', req.query.categoria)
   const f = clean(req.query.q)
@@ -140,8 +271,12 @@ router.post('/finanzas/gastos', auth(ADMIN), h(async (req, res) => {
   if (b.source === 'caja' && !Number(b.sessionId)) return fail(res, 'Elige el turno de caja del que sale el dinero', 400)
   if (b.source === 'socio' && !Number(b.partnerId)) return fail(res, 'Elige el socio que lo pagó', 400)
   if (b.paidOn && !isDay(b.paidOn)) return fail(res, 'Fecha no válida', 400)
+  // Desde una subcuenta: el gasto queda en su sucursal y el dinero sale de esa subcuenta.
+  const sub = b.source === 'fondo' && SUB_RE.test(String(b.fund || '')) ? await vaultForKey(req.user.org_id, b.fund) : null
+  if (b.source === 'fondo' && SUB_RE.test(String(b.fund || '')) && !sub) return fail(res, 'Subcuenta no encontrada', 404)
+  if (sub && !sub.active) return fail(res, 'La subcuenta está inactiva', 409)
   const { failed, data: id } = await run(res, 'finance_expense', {
-    org_id: req.user.org_id, user_id: req.user.id, site_id: fundSite(b.siteId), category: b.category, description: description.slice(0, 200),
+    org_id: req.user.org_id, user_id: req.user.id, site_id: sub ? sub.siteId : fundSite(b.siteId), vault_id: sub ? sub.id : null, category: b.category, description: description.slice(0, 200),
     supplier: clean(b.supplier), invoice_ref: clean(b.invoiceRef), amount: money(b.amount), paid_on: b.paidOn || null, source: b.source,
     session_id: b.source === 'caja' ? Number(b.sessionId) : null, partner_id: b.source === 'socio' ? Number(b.partnerId) : null
   })

@@ -13,6 +13,26 @@ const { tableStats } = require('./reports')
 
 const router = express.Router()
 
+// Ranking del personal por las calificaciones del cliente (últimos 30 días).
+// Orden: promedio ponderado (bayesiano) para que 1 sola calificación de 5 no gane a 20 de 4,8.
+const staffRanking = async (site, since) => {
+  const { data } = await site(supabase.from('service_ratings').select('waiter_id, stars, waiter:users!service_ratings_waiter_id_fkey(name, last_name, avatar_url)').gte('created_at', since).not('waiter_id', 'is', null))
+  const rows = data || []
+  if (!rows.length) return { count: 0, avg: null, rows: [] }
+  const global = rows.reduce((a, r) => a + r.stars, 0) / rows.length
+  const m = {}
+  for (const r of rows) {
+    m[r.waiter_id] = m[r.waiter_id] || { id: r.waiter_id, name: `${r.waiter?.name || ''} ${r.waiter?.last_name || ''}`.trim(), avatarUrl: r.waiter?.avatar_url || null, sum: 0, count: 0, five: 0 }
+    m[r.waiter_id].sum += r.stars; m[r.waiter_id].count++; if (r.stars === 5) m[r.waiter_id].five++
+  }
+  const K = 3
+  return {
+    count: rows.length, avg: Math.round(global * 10) / 10,
+    rows: Object.values(m).map((x) => ({ id: x.id, name: x.name, avatarUrl: x.avatarUrl, count: x.count, five: x.five, avg: Math.round((x.sum / x.count) * 10) / 10, score: (x.sum + K * global) / (x.count + K) }))
+      .sort((a, b) => b.score - a.score || b.count - a.count).slice(0, 8)
+  }
+}
+
 // Ventas del día (pedidos cobrados desde la medianoche de Colombia) y su reparto por hora.
 const salesOf = async (from, filter) => {
   const { data } = await filter(supabase.from('orders').select('total, tip, discount_total, courtesy_total, closed_at, waiter_id').eq('status', 'cobrado').gte('closed_at', from))
@@ -82,6 +102,7 @@ router.get('/dashboard', auth(), h(async (req, res) => {
         openOrders, tables, occupiedTables: occupied, pendingCalls: (calls.data || []).length, openSessions: (sessions.data || []).length,
         receivables: (cxc.data || []).reduce((a, r) => a + Number(r.amount) - Number(r.paid), 0)
       },
+      staffRanking: await staffRanking(site, month),
       tableUsage: { days: 30, turns: usage.turns, avgMinutes: usage.avgMinutes, medianMinutes: usage.medianMinutes, perHour: usage.perHour, best: usage.rows.slice(0, 5), areas: usage.areas },
       salesByHour: sales.byHour.filter((x) => x.hour >= 6 || x.total > 0),
       calls: (calls.data || []).map((c) => ({ id: c.id, kind: c.kind, table: c.table?.name, createdAt: c.created_at })),

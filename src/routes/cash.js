@@ -60,7 +60,7 @@ router.get('/caja/cajas', auth(STAFF), h(async (req, res) => {
   let q = supabase.from('cash_registers').select('*, site:sites(name)').order('site_id').order('name')
   const site = ADMIN.includes(req.user.role) ? req.siteId : req.user.site_id
   if (site) q = q.eq('site_id', site)
-  const [{ data, error }, { data: open }, { data: vaults }] = await Promise.all([q, supabase.from('cash_sessions').select(SESSION_COLUMNS).eq('status', 'abierta'), supabase.from('vaults').select('site_id, balance').not('site_id', 'is', null)])
+  const [{ data, error }, { data: open }, { data: vaults }] = await Promise.all([q, supabase.from('cash_sessions').select(SESSION_COLUMNS).eq('status', 'abierta'), supabase.from('vaults').select('site_id, balance').eq('kind', 'principal').not('site_id', 'is', null)])
   if (error) throw error
   // siteFund: lo que hay en el fondo de la sucursal para completar la base al abrir.
   res.send(data.map((r) => {
@@ -149,17 +149,31 @@ router.post('/caja/turnos/:id/movimientos', auth(STAFF), guard('cajero'), h(asyn
 router.get('/caja/turnos/:id/propinas', auth(STAFF), guard('cajero'), h(async (req, res) => {
   const s = await loadSession(req.params.id)
   if (!s || !sameSite(req, s.site_id)) return fail(res, 'Turno no encontrado', 404)
-  const [{ data: staff }, { data: orders }] = await Promise.all([
+  const month = new Date(Date.now() - 30 * 864e5).toISOString()
+  const [{ data: staff }, { data: orders }, { data: sessOrders }, { data: monthRatings }] = await Promise.all([
     supabase.from('users').select('id, name, last_name, role, positions, site_id').eq('active', true).in('role', ['empleado', 'admin']).order('name'),
-    supabase.from('orders').select('waiter_id, tip').eq('session_id', s.id).eq('status', 'cobrado').gt('tip', 0)
+    supabase.from('orders').select('waiter_id, tip').eq('session_id', s.id).eq('status', 'cobrado').gt('tip', 0),
+    supabase.from('orders').select('id').eq('session_id', s.id),
+    supabase.from('service_ratings').select('waiter_id, stars').gte('created_at', month)
   ])
+  // Calificaciones del turno (de sus pedidos) y de los últimos 30 días, por empleado.
+  const ids = (sessOrders || []).map((o) => o.id)
+  const { data: shiftRatings } = ids.length ? await supabase.from('service_ratings').select('waiter_id, stars').in('order_id', ids) : { data: [] }
+  const avgBy = (rows) => {
+    const m = {}
+    for (const r of rows || []) if (r.waiter_id) { m[r.waiter_id] = m[r.waiter_id] || { sum: 0, n: 0 }; m[r.waiter_id].sum += r.stars; m[r.waiter_id].n++ }
+    return m
+  }
+  const shiftR = avgBy(shiftRatings); const monthR = avgBy(monthRatings)
+  const rating = (m, id) => (m[id] ? { avg: Math.round((m[id].sum / m[id].n) * 10) / 10, count: m[id].n } : null)
   const byWaiter = {}
   for (const o of orders || []) if (o.waiter_id) byWaiter[o.waiter_id] = (byWaiter[o.waiter_id] || 0) + Number(o.tip)
   const total = Object.values(byWaiter).reduce((a, x) => a + x, 0)
   res.send({
     total,
     employees: (staff || []).filter((u) => !u.site_id || u.site_id === s.site_id || byWaiter[u.id]).map((u) => ({
-      id: u.id, name: fullName(u), role: u.role, positions: u.positions || [], suggested: Math.round(byWaiter[u.id] || 0), served: Boolean(byWaiter[u.id])
+      id: u.id, name: fullName(u), role: u.role, positions: u.positions || [], suggested: Math.round(byWaiter[u.id] || 0), served: Boolean(byWaiter[u.id]),
+      rating: rating(shiftR, u.id), ratingMonth: rating(monthR, u.id)
     })).sort((a, b) => Number(b.served) - Number(a.served) || a.name.localeCompare(b.name))
   })
 }))
@@ -268,7 +282,7 @@ router.get('/caja/solicitudes', auth(ADMIN), h(async (req, res) => {
   let q = supabase.from('cash_requests').select(REQ_COLUMNS).order('created_at', { ascending: false }).limit(100)
   if (req.siteId) q = q.eq('site_id', req.siteId)
   if (REQUEST_STATUS[req.query.estado]) q = q.eq('status', req.query.estado)
-  const [{ data, error }, { data: vaults }] = await Promise.all([q, supabase.from('vaults').select('site_id, balance')])
+  const [{ data, error }, { data: vaults }] = await Promise.all([q, supabase.from('vaults').select('site_id, balance').eq('kind', 'principal')])
   if (error) throw error
   const fund = (sid) => Number((vaults || []).find((v) => (v.site_id ?? null) === sid)?.balance || 0)
   res.send({ rows: data.map((r) => ({ ...requestDTO(r), siteFund: fund(r.site_id), generalFund: fund(null) })), pending: data.filter((r) => r.status === 'pendiente').length })
@@ -303,12 +317,12 @@ router.get('/caja/boveda', auth(ADMIN), h(async (req, res) => {
   const [{ data: v }, { data: moves }, { data: all }] = await Promise.all([
     supabase.from('vaults').select('*, site:sites(name)').eq('id', vid).maybeSingle(),
     supabase.from('vault_movements').select('*, user:users(name, last_name)').eq('vault_id', vid).order('created_at', { ascending: false }).limit(80),
-    supabase.from('vaults').select('balance, site:sites(name)')
+    supabase.from('vaults').select('balance, kind, name, site:sites(name)')
   ])
   res.send({
     id: v.id, siteId: v.site_id, site: v.site?.name, balance: Number(v.balance),
     total: (all || []).reduce((a, x) => a + Number(x.balance), 0),
-    bySite: (all || []).map((x) => ({ site: x.site?.name, balance: Number(x.balance) })),
+    bySite: (all || []).map((x) => ({ site: x.kind === 'subcuenta' ? `${x.site?.name || 'General'} · ${x.name}` : x.site?.name, balance: Number(x.balance) })),
     movements: (moves || []).map((m) => ({ id: m.id, type: m.type, typeLabel: VAULT_TYPES[m.type], amount: Number(m.amount), balanceAfter: Number(m.balance_after), ref: m.ref, note: m.note, user: fullName(m.user), createdAt: m.created_at }))
   })
 }))

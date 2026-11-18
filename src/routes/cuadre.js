@@ -42,6 +42,13 @@ const buildCuadre = async ({ day, siteId }) => {
     supabase.from('sites').select('id, name').then((r) => r.data || [])
   ])
   const ids = sessions.map((s) => s.id)
+  // Gastos de los turnos del cuadre aunque se hayan registrado el día anterior (turno abierto antes de medianoche).
+  if (ids.length) {
+    const seen = new Set(expenses.map((e) => e.id))
+    const extra = await all(() => supabase.from('expenses').select('id, number, category, description, supplier, amount, source, session_id, created_at').eq('status', 'activo').in('session_id', ids).order('created_at'))
+    for (const e of extra) if (!seen.has(e.id)) expenses.push(e)
+    expenses.sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
+  }
   const [moves, payouts, credit] = ids.length ? await Promise.all([
     all(() => supabase.from('cash_movements').select('session_id, type, method, amount, created_at').in('session_id', ids)),
     all(() => supabase.from('tip_payouts').select('session_id, amount').in('session_id', ids)),

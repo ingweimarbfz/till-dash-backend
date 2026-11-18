@@ -19,7 +19,7 @@ const TENANT_TABLES = new Set([
   'notification_settings', 'notification_channels', 'notification_log',
   // Etapa 3: mesas, pedidos, caja, bóveda y cuentas por cobrar
   'dining_areas', 'dining_tables', 'cash_registers', 'cash_sessions', 'vaults', 'vault_movements', 'orders', 'order_items',
-  'order_payments', 'receivables', 'receivable_payments', 'cash_movements', 'table_calls', 'tip_payouts', 'incidents',
+  'order_payments', 'receivables', 'payables', 'receivable_payments', 'cash_movements', 'table_calls', 'tip_payouts', 'incidents',
   // Etapa 4: finanzas
   'partners', 'money_entries', 'fund_transfers', 'expenses', 'partner_withdrawals', 'cash_requests', 'menus', 'service_ratings', 'suppliers', 'cash_reopen_requests', 'courier_payouts', 'courier_floats',
   // TD-010: clientes (distribuidoras)

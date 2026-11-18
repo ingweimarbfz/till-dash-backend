@@ -17,6 +17,7 @@ const { currentOrg } = require('../tenant')
 const { notify, movementMessage, transferMessage } = require('../notify')
 const { isLow, checkLowStock, currentAlerts } = require('../stock')
 const { resolveSupplier } = require('../suppliers')
+const purchases = require('../purchases')
 
 const router = express.Router()
 
@@ -183,18 +184,40 @@ router.post('/inventario/productos', auth(ADMIN), h(async (req, res) => {
   if (b.trackStock === false && initial > 0) errors.push('Un producto sin inventario no lleva stock inicial')
   if (errors.length) return fail(res, errors.join('. '), 400)
   if (b.active !== false) await plan.checkLimit(req.user.org_id, 'products')
+  // Stock inicial: se valida de dónde se pagó antes de crear el producto.
+  const total = Math.round(initial * (Number(b.cost) || 0))
+  const sup = initial > 0 ? await resolveSupplier(b) : null
+  if (sup?.error) return fail(res, sup.error, 400)
+  const chk = initial > 0 ? await purchases.checkPay(req.user, b, { total, sup }) : null
+  if (chk?.error) return fail(res, chk.error, chk.status || 400)
   const { data, error } = await supabase.from('products').insert(productRow(b)).select('id').single()
   if (error) return error.code === '23505' ? fail(res, 'Ya existe un producto con ese código (SKU)', 409) : fail(res, error)
+  let paid = null
   if (initial > 0) {
     const warehouseId = Number(b.warehouseId) || (await mainWarehouse()).id
+    const wh = await loadPlace(warehouseId)
     const { data: ref } = await supabase.rpc('next_consecutive', { p_org: currentOrg(), p_kind: 'entrada', p_site: 0, p_prefix: 'EN-' })
-    const { error: e2 } = await supabase.from('inventory_movements').insert({ warehouse_id: warehouseId, product_id: data.id, type: 'entrada', quantity: initial, unit_cost: Number(b.cost) || 0, ref, note: 'Stock inicial', user_id: req.user.id })
-    if (e2) return p0001(res, e2)
+    const description = `Compra ${ref}: ${clean(b.name)}`
+    const invoice = clean(b.invoice)?.slice(0, 40) ?? null
+    let expense = null
+    try { ({ expense } = await purchases.charge(req.user, chk.pay, { ref, total, description, sup, invoice })) } catch (e) {
+      // Si el dinero ya no alcanzó en el último momento, el producto queda creado sin stock.
+      await audit(req, 'crear', 'producto', data.id, { name: clean(b.name) })
+      return fail(res, `Se creó el producto sin stock inicial: ${e.message}`, 400)
+    }
+    const { error: e2 } = await supabase.from('inventory_movements').insert({
+      warehouse_id: warehouseId, product_id: data.id, type: 'entrada', quantity: initial, unit_cost: Number(b.cost) || 0, ref,
+      note: chk.pay.src === 'inicial' ? 'Stock inicial' : `Stock inicial · ${purchases.PAY_SOURCES[chk.pay.src]}`, user_id: req.user.id,
+      supplier_id: sup.id, invoice_ref: invoice, pay_source: chk.pay.src, expense_id: expense?.id ?? null
+    })
+    if (e2) { await purchases.undo(req.user, expense, ref); return p0001(res, e2) }
+    const payable = await purchases.createPayable(req.user, chk.pay, { ref, total, description, sup, invoice, siteId: wh?.site_id })
+    paid = { ref, source: chk.pay.src, expense, payable }
     await checkLowStock([{ warehouseId, productId: data.id }])
   }
   await audit(req, 'crear', 'producto', data.id, { name: clean(b.name) })
   const { data: p } = await supabase.from('products').select(PRODUCT_COLUMNS).eq('id', data.id).single()
-  res.status(201).send(productDTO(p, await loadActive()))
+  res.status(201).send({ ...productDTO(p, await loadActive()), purchase: paid })
 }))
 
 router.put('/inventario/productos/:id', auth(ADMIN), h(async (req, res) => {
@@ -272,12 +295,13 @@ const moveDTO = (m) => ({
   unitCost: m.unit_cost === null || m.unit_cost === undefined ? null : Number(m.unit_cost), note: m.note, ref: m.ref, createdAt: m.created_at,
   warehouse: m.warehouse ? { id: m.warehouse.id, name: m.warehouse.name } : null,
   supplierId: m.supplier_id ?? null, supplier: m.supplier?.name ?? null, invoiceRef: m.invoice_ref ?? null,
+  paidFrom: m.pay_source ?? null, paidFromLabel: m.pay_source ? purchases.PAY_SOURCES[m.pay_source] : null,
   product: m.product || null, user: m.user ? `${m.user.name} ${m.user.last_name || ''}`.trim() : null
 })
 
 router.get('/inventario/movimientos', auth(STAFF), h(async (req, res) => {
   let q = supabase.from('inventory_movements')
-    .select('id, type, quantity, stock_after, unit_cost, note, ref, invoice_ref, supplier_id, created_at, warehouse_id, supplier:suppliers(name), warehouse:warehouses(id, name), product:products(id, name, sku, unit), user:users(name, last_name)')
+    .select('id, type, quantity, stock_after, unit_cost, note, ref, invoice_ref, supplier_id, pay_source, created_at, warehouse_id, supplier:suppliers(name), warehouse:warehouses(id, name), product:products(id, name, sku, unit), user:users(name, last_name)')
     .order('created_at', { ascending: false }).order('id', { ascending: false }).limit(Math.min(Number(req.query.limit) || 200, 500))
   if (Number(req.query.producto)) q = q.eq('product_id', Number(req.query.producto))
   if (req.query.tipo && MOVE_LABELS[req.query.tipo]) q = q.eq('type', req.query.tipo)
@@ -287,6 +311,12 @@ router.get('/inventario/movimientos', auth(STAFF), h(async (req, res) => {
   const { data, error } = await q
   if (error) throw error
   res.send(data.map(moveDTO))
+}))
+
+// De dónde se puede pagar una entrada (según el plan y el rol).
+router.get('/inventario/pago-opciones', auth(ADMIN), h(async (req, res) => {
+  const { finance, sources } = await purchases.optionsFor(req.user)
+  res.send({ finance, sources: sources.map((k) => ({ key: k, label: purchases.PAY_SOURCES[k] })) })
 }))
 
 // Entrada (compra), ajuste (+/-) o baja (daño, pérdida, vencimiento) de uno o varios productos en una bodega.
@@ -313,49 +343,39 @@ router.post('/inventario/movimientos', auth(ADMIN), h(async (req, res) => {
     if (!p.track_stock) return fail(res, `"${p.name}" no maneja inventario`, 400)
     i.name = p.name; i.unit = p.unit
   }
-  // Compra pagada con el efectivo de un turno abierto: además de la entrada queda como gasto del turno
-  // (sale de la caja). Sin esto, la entrada solo suma inventario y no toca la caja.
   const total = Math.round(items.reduce((a, i) => a + i.quantity * (i.unitCost || 0), 0))
+  const sup = b.type === 'entrada' ? await resolveSupplier(b) : { id: null, name: null }
+  if (sup.error) return fail(res, sup.error, 400)
+  // Toda entrada dice de dónde se pagó; con caja o cuenta se valida el saldo antes de registrar nada.
   let pay = null
-  if (b.type === 'entrada' && Number(b.paySessionId)) {
-    const { data: ps } = await supabase.from('cash_sessions').select('id, number, status, site_id').eq('id', Number(b.paySessionId)).maybeSingle()
-    if (!ps || ps.status !== 'abierta') return fail(res, 'El turno de caja elegido para pagar ya no está abierto', 409)
-    if (!(total > 0)) return fail(res, 'Escribe el costo de los productos para descontarlo de la caja', 400)
-    const { data: cash } = await supabase.rpc('session_cash', { p_session: ps.id })
-    if (Number(cash) < total) return fail(res, `No hay suficiente efectivo en la caja ${ps.number} (disponible: $${Math.round(Number(cash)).toLocaleString('es-CO')})`, 400)
-    pay = ps
+  if (b.type === 'entrada') {
+    const chk = await purchases.checkPay(req.user, b, { total, sup })
+    if (chk.error) return fail(res, chk.error, chk.status || 400)
+    pay = chk.pay
   }
   const { data: ref, error: e1 } = await supabase.rpc('next_consecutive', { p_org: currentOrg(), p_kind: b.type, p_site: 0, p_prefix: MOVE_PREFIX[b.type] })
   if (e1) throw e1
-  const sup = b.type === 'entrada' ? await resolveSupplier(b) : { id: null, name: null }
-  if (sup.error) return fail(res, sup.error, 400)
   const invoice = b.type === 'entrada' ? clean(b.invoice)?.slice(0, 40) ?? null : null
   const note = [sup.name && `Proveedor: ${sup.name}`, invoice && `Factura: ${invoice}`, clean(b.note)].filter(Boolean).join(' · ') || null
-  // Un solo insert: si un producto no alcanza, no se registra ninguno.
+  const description = `Compra ${ref}: ${items.map((i) => i.name).join(', ')}`
+  let expense = null
+  if (pay) {
+    try { ({ expense } = await purchases.charge(req.user, pay, { ref, total, description, sup, invoice })) } catch (e) { return p0001(res, e) }
+  }
+  // Un solo insert: si un producto no alcanza, no se registra ninguno (y el gasto se anula).
   const { error } = await supabase.from('inventory_movements').insert(items.map((i) => ({
     warehouse_id: warehouseId, product_id: i.productId, type: b.type, quantity: b.type === 'baja' ? -i.quantity : i.quantity,
-    unit_cost: b.type === 'entrada' ? i.unitCost : null, ref, note, user_id: req.user.id, supplier_id: sup.id, invoice_ref: invoice
+    unit_cost: b.type === 'entrada' ? i.unitCost : null, ref, note, user_id: req.user.id, supplier_id: sup.id, invoice_ref: invoice,
+    pay_source: pay?.src ?? null, expense_id: expense?.id ?? null
   })))
-  if (error) return p0001(res, error)
+  if (error) { await purchases.undo(req.user, expense, ref); return p0001(res, error) }
+  let payable = null; let payError = null
+  try { payable = pay ? await purchases.createPayable(req.user, pay, { ref, total, description, sup, invoice, siteId: wh.site_id }) : null } catch (e) { payError = e.message }
   const signed = items.map((i) => ({ ...i, quantity: b.type === 'baja' ? -i.quantity : i.quantity }))
-  await audit(req, 'crear', 'movimiento_inventario', ref, { type: b.type, warehouse: wh.name, items: signed.map((i) => ({ product: i.name, quantity: i.quantity })) })
+  await audit(req, 'crear', 'movimiento_inventario', ref, { type: b.type, warehouse: wh.name, paidFrom: pay?.src, expense: expense?.number, items: signed.map((i) => ({ product: i.name, quantity: i.quantity })) })
   notify('inventario', async () => movementMessage({ type: b.type, ref, warehouse: placeOf(wh), items: signed, note, user: req.user }))
   const alerts = await checkLowStock(items.map((i) => ({ warehouseId, productId: i.productId })))
-  let expense = null; let payError = null
-  if (pay) {
-    const { data: eid, error: e3 } = await supabase.rpc('finance_expense', { p: {
-      org_id: currentOrg(), user_id: req.user.id, category: 'insumos', description: `Compra ${ref}: ${items.map((i) => i.name).join(', ')}`.slice(0, 200),
-      supplier: sup.name, invoice_ref: invoice, amount: total, source: 'caja', session_id: pay.id
-    } })
-    if (e3) payError = e3.message
-    else {
-      if (sup.id) await supabase.from('expenses').update({ supplier_id: sup.id }).eq('id', eid)
-      const { data: ex } = await supabase.from('expenses').select('number').eq('id', eid).single()
-      expense = { id: eid, number: ex?.number, amount: total, session: pay.number }
-      await audit(req, 'gasto', 'turno_caja', pay.id, { number: ex?.number, session: pay.number, amount: total, description: `Compra ${ref}` })
-    }
-  }
-  res.status(201).send({ ref, items: items.length, alerts, expense, payError })
+  res.status(201).send({ ref, items: items.length, alerts, paidFrom: pay?.src ?? null, expense, payable, payError })
 }))
 
 // ---------------------------------------------------------------- Traslados entre bodegas

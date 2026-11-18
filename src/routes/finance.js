@@ -278,16 +278,69 @@ router.post('/finanzas/gastos', auth(ADMIN), h(async (req, res) => {
   if (sub && !sub.active) return fail(res, 'La subcuenta está inactiva', 409)
   const sup = await resolveSupplier(b)
   if (sup.error) return fail(res, sup.error, 400)
+  // Abono a una cuenta por pagar (compra a crédito): no puede pasar del saldo y cuenta como compra de inventario.
+  let payable = null
+  if (Number(b.payableId)) {
+    const [row] = await loadPayables({ id: Number(b.payableId) })
+    if (!row || row.status === 'anulada') return fail(res, 'La cuenta por pagar no existe o está anulada', 404)
+    if (money(b.amount) > row.balance) return fail(res, `El abono pasa del saldo de la cuenta por pagar (${row.balance.toLocaleString('es-CO')})`, 400)
+    if (b.category !== 'compras') return fail(res, 'El pago a un proveedor por una compra va en la categoría Compras de inventario', 400)
+    payable = row
+  }
   const { failed, data: id } = await run(res, 'finance_expense', {
     org_id: req.user.org_id, user_id: req.user.id, site_id: sub ? sub.siteId : fundSite(b.siteId), vault_id: sub ? sub.id : null, category: b.category, description: description.slice(0, 200),
     supplier: sup.name, invoice_ref: clean(b.invoiceRef), amount: money(b.amount), paid_on: b.paidOn || null, source: b.source,
     session_id: b.source === 'caja' ? Number(b.sessionId) : null, partner_id: b.source === 'socio' ? Number(b.partnerId) : null
   })
   if (failed) return
-  if (sup.id) await supabase.from('expenses').update({ supplier_id: sup.id }).eq('id', id)
+  if (sup.id || payable) await supabase.from('expenses').update({ ...(sup.id ? { supplier_id: sup.id } : {}), ...(payable ? { payable_id: payable.id } : {}) }).eq('id', id)
   const { data } = await supabase.from('expenses').select('number, amount').eq('id', id).single()
-  await audit(req, 'crear', 'gasto', id, { number: data.number, amount: Number(data.amount), category: b.category, source: b.source })
+  await audit(req, 'crear', 'gasto', id, { number: data.number, amount: Number(data.amount), category: b.category, source: b.source, payable: payable?.ref })
   res.status(201).send({ id, number: data.number })
+}))
+
+// ---------------------------------------------------------------- Cuentas por pagar (compras a crédito)
+// Lo pagado es la suma de los gastos activos que llevan su payable_id: anular un abono lo devuelve al saldo.
+const payableDTO = (sites, today) => (p) => {
+  const amount = Number(p.amount)
+  const paid = round((p.payments || []).filter((e) => e.status === 'activo').reduce((a, e) => a + Number(e.amount), 0))
+  const balance = Math.max(0, round(amount - paid))
+  const status = p.status === 'anulada' ? 'anulada' : balance <= 0 ? 'pagada' : 'pendiente'
+  return {
+    id: p.id, ref: p.ref, invoiceRef: p.invoice_ref, description: p.description, supplierId: p.supplier_id, supplier: p.supplier,
+    siteId: p.site_id, site: siteName(sites, p.site_id), amount, paid, balance, dueDate: p.due_date, status,
+    overdue: status === 'pendiente' && Boolean(p.due_date) && p.due_date < today, createdAt: p.created_at, voidReason: p.void_reason,
+    payments: (p.payments || []).map((e) => ({ id: e.id, number: e.number, amount: Number(e.amount), paidOn: e.paid_on, status: e.status }))
+  }
+}
+const todayBogota = () => new Date(Date.now() - 5 * 3600e3).toISOString().slice(0, 10)
+const loadPayables = async ({ id, supplierId } = {}) => {
+  let q = supabase.from('payables').select('*, payments:expenses(id, number, amount, paid_on, status)').order('due_date', { ascending: true }).order('id', { ascending: true })
+  if (id) q = q.eq('id', id)
+  if (supplierId) q = q.eq('supplier_id', supplierId)
+  const [{ data, error }, sites] = await Promise.all([q, getSites()])
+  if (error) throw error
+  return (data || []).map(payableDTO(sites, todayBogota()))
+}
+router.get('/finanzas/por-pagar', auth(ADMIN), h(async (req, res) => {
+  let rows = await loadPayables({ supplierId: Number(req.query.proveedor) || null })
+  if (req.siteId) rows = rows.filter((r) => r.siteId === req.siteId)
+  const estado = req.query.estado || 'pendiente'
+  const pending = rows.filter((r) => r.status === 'pendiente')
+  res.send({
+    rows: estado === 'todas' ? rows : rows.filter((r) => r.status === estado),
+    totals: { pending: pending.reduce((a, r) => a + r.balance, 0), overdue: pending.filter((r) => r.overdue).reduce((a, r) => a + r.balance, 0), count: pending.length }
+  })
+}))
+router.post('/finanzas/por-pagar/:id/anular', auth(OWNER), h(async (req, res) => {
+  const reason = clean(req.body?.reason)
+  if (!reason) return fail(res, 'Escribe el motivo de la anulación', 400)
+  const [row] = await loadPayables({ id: Number(req.params.id) })
+  if (!row || row.status === 'anulada') return fail(res, 'La cuenta por pagar no existe o ya está anulada', 404)
+  if (row.paid > 0) return fail(res, 'Tiene abonos: anúlalos primero en Gastos', 409)
+  await supabase.from('payables').update({ status: 'anulada', void_reason: reason.slice(0, 200) }).eq('id', row.id)
+  await audit(req, 'anular', 'cuenta_por_pagar', row.id, { ref: row.ref, reason })
+  res.send({ ok: true })
 }))
 
 // ---------------------------------------------------------------- Socios

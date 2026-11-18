@@ -70,7 +70,7 @@ const buildCuadre = async ({ day, siteId }) => {
       byMethod: Object.entries(byMethod).map(([method, amount]) => ({ method, label: PAY_METHODS[method] || method, amount: round(amount) })).sort((a, b) => b.amount - a.amount),
       cashSales: round(byMethod.efectivo || 0), income: round(sum('ingreso')), expenses: round(-sum('egreso')),
       tips: round(os.reduce((a, o) => a + Number(o.tip), 0)), tipsPaid: round(payouts.filter((t) => t.session_id === s.id).reduce((a, t) => a + Number(t.amount), 0)),
-      orders: os.length,
+      couriersPaid: round(-sum('domicilio_pagado')), orders: os.length,
       expected: open ? round(cashNow) : round(s.expected_cash), counted: open ? null : round(s.counted_cash), difference: open ? null : round(s.difference),
       toVault: round(s.to_vault), nextFloat: round(s.next_float), reopened: Number(s.reopen_count || 0), closeNote: s.close_note
     }

@@ -26,7 +26,8 @@ const AREA_OF_POSITION = { cocina: 'cocina', bartender: 'bar', barista: 'barista
 const SELLERS = ['mesero', 'cajero', 'host', 'bartender', 'barista']
 
 const ORDER_COLUMNS = `*, site:sites(name), table:dining_tables!orders_table_id_fkey(id, name),
-  waiter:users!orders_waiter_id_fkey(id, name, last_name), cashier:users!orders_cashier_id_fkey(id, name, last_name)`
+  waiter:users!orders_waiter_id_fkey(id, name, last_name), cashier:users!orders_cashier_id_fkey(id, name, last_name),
+  courier:users!orders_courier_id_fkey(id, name, last_name)`
 
 const itemDTO = (i) => ({
   id: i.id, productId: i.product_id, name: i.name, area: i.area, quantity: Number(i.quantity), listPrice: Number(i.list_price), unitPrice: Number(i.unit_price),
@@ -41,7 +42,8 @@ const orderDTO = (o) => ({
   cashier: o.cashier ? { id: o.cashier.id, name: fullName(o.cashier) } : null,
   gross: Number(o.gross), courtesyTotal: Number(o.courtesy_total), subtotal: Number(o.subtotal),
   discount: o.discount_type ? { id: o.discount_id, name: o.discount_name, type: o.discount_type, value: Number(o.discount_value), reason: o.discount_reason } : null,
-  discountTotal: Number(o.discount_total), tip: Number(o.tip), total: Number(o.total), paid: Number(o.paid),
+  discountTotal: Number(o.discount_total), tip: Number(o.tip), deliveryFee: Number(o.delivery_fee || 0), total: Number(o.total), paid: Number(o.paid),
+  courier: o.courier ? { id: o.courier.id, name: fullName(o.courier) } : null, deliveryStatus: o.delivery_status || null, dispatchedAt: o.dispatched_at || null, arrivedAt: o.arrived_at || null,
   billRequestedAt: o.bill_requested_at, voidReason: o.void_reason, openedAt: o.opened_at, closedAt: o.closed_at,
   items: o.items ? o.items.sort((a, b) => a.id - b.id).map(itemDTO) : undefined
 })
@@ -164,6 +166,7 @@ router.post('/pedidos', auth(STAFF), guard(...SELLERS), h(async (req, res) => {
     table = data
   }
   if (type === 'domicilio' && !clean(b.customerAddress)) return fail(res, 'Escribe la dirección del domicilio', 400)
+  if (b.deliveryFee !== undefined && b.deliveryFee !== null && b.deliveryFee !== '' && !isMoney(b.deliveryFee)) return fail(res, 'El valor del domicilio no es válido', 400)
   if (!(await cashOpenAt(site))) return fail(res, NO_CASH, 409)
   let built = null
   if (Array.isArray(b.items) && b.items.length) {
@@ -175,7 +178,7 @@ router.post('/pedidos', auth(STAFF), guard(...SELLERS), h(async (req, res) => {
   if (e1) throw e1
   const { data: order, error } = await supabase.from('orders').insert({
     site_id: site, number, type, table_id: table?.id ?? null, guests: Number(b.guests) > 0 ? Math.min(100, Number(b.guests)) : null,
-    alias: aliasOf(b.alias), customer_name: clean(b.customerName), customer_phone: clean(b.customerPhone), customer_address: clean(b.customerAddress), note: clean(b.note),
+    alias: aliasOf(b.alias), ...(type === 'domicilio' ? { delivery_status: 'por_despachar', courier_id: Number(b.courierId) || null, ...(money(b.deliveryFee) > 0 ? { delivery_fee: money(b.deliveryFee) } : {}) } : {}), customer_name: clean(b.customerName), customer_phone: clean(b.customerPhone), customer_address: clean(b.customerAddress), note: clean(b.note),
     waiter_id: waiterId, opened_by: req.user.id
   }).select('id, number').single()
   if (error) return error.code === '23505' ? fail(res, `${table?.name || 'La mesa'} ya tiene un pedido abierto`, 409) : fail(res, error)
@@ -213,6 +216,11 @@ router.put('/pedidos/:id', auth(STAFF), guard(...SELLERS), h(async (req, res) =>
   if ('guests' in b) patch.guests = Number(b.guests) > 0 ? Math.min(100, Number(b.guests)) : null
   for (const [k, c] of [['customerName', 'customer_name'], ['customerPhone', 'customer_phone'], ['customerAddress', 'customer_address'], ['note', 'note']]) if (k in b) patch[c] = clean(b[k])
   if ('alias' in b) patch.alias = aliasOf(b.alias)
+  if ('deliveryFee' in b) {
+    if (o.type !== 'domicilio') return fail(res, 'Solo los pedidos a domicilio llevan valor de domicilio', 400)
+    if (b.deliveryFee !== null && b.deliveryFee !== '' && !isMoney(b.deliveryFee)) return fail(res, 'El valor del domicilio no es válido', 400)
+    patch.delivery_fee = money(b.deliveryFee)
+  }
   if (Number(b.waiterId)) patch.waiter_id = Number(b.waiterId)
   if (Number(b.tableId) && Number(b.tableId) !== o.table_id) {
     const { data: t } = await supabase.from('dining_tables').select('id, name, site_id, active').eq('id', Number(b.tableId)).maybeSingle()
@@ -222,6 +230,10 @@ router.put('/pedidos/:id', auth(STAFF), guard(...SELLERS), h(async (req, res) =>
   if (!Object.keys(patch).length) return fail(res, 'No hay cambios', 400)
   const { error } = await supabase.from('orders').update(patch).eq('id', o.id)
   if (error) return error.code === '23505' ? fail(res, 'Esa mesa ya tiene un pedido abierto', 409) : fail(res, error)
+  if ('delivery_fee' in patch) {
+    await supabase.rpc('recalc_order', { p_order: o.id })
+    if (patch.delivery_fee !== Number(o.delivery_fee || 0)) await audit(req, 'domicilio', 'pedido', o.id, { number: o.number, from: Number(o.delivery_fee || 0), to: patch.delivery_fee })
+  }
   if (patch.table_id) await audit(req, 'mover', 'pedido', o.id, { number: o.number, from: o.table?.name ?? null, to: patch.table_id })
   res.send(orderDTO(await loadOrder(o.id)))
 }))
@@ -311,6 +323,7 @@ router.post('/pedidos/:id/cobrar', auth(STAFF), guard('cajero'), h(async (req, r
   const err = validatePayments(b.payments)
   if (err) return fail(res, err, 400)
   if (b.tip !== undefined && !isMoney(b.tip)) return fail(res, 'La propina no es válida', 400)
+  if (b.deliveryFee !== undefined && b.deliveryFee !== null && b.deliveryFee !== '' && !isMoney(b.deliveryFee)) return fail(res, 'El valor del domicilio no es válido', 400)
   let discount = null
   if (Number(b.discountId)) {
     const { data: d } = await supabase.from('discounts').select('*').eq('id', Number(b.discountId)).maybeSingle()
@@ -323,11 +336,12 @@ router.post('/pedidos/:id/cobrar', auth(STAFF), guard('cajero'), h(async (req, r
   const { data, error } = await supabase.rpc('charge_order', {
     p: {
       org_id: req.user.org_id, order_id: o.id, session_id: session?.id ?? null, user_id: req.user.id, tip: money(b.tip), discount, payments,
+      ...(o.type === 'domicilio' && b.deliveryFee !== undefined ? { delivery_fee: money(b.deliveryFee) } : {}),
       receivable: b.receivable ? { customer_name: clean(b.receivable.customerName), customer_doc: clean(b.receivable.customerDoc), customer_phone: clean(b.receivable.customerPhone), due_date: clean(b.receivable.dueDate), note: clean(b.receivable.note) } : null
     }
   })
   if (error) return dbError(res, error)
-  await audit(req, 'cobrar', 'pedido', o.id, { number: o.number, total: Number(data.total), tip: money(b.tip), discount: discount?.name ?? null, methods: payments.map((p) => p.method), session: session?.id ?? null })
+  await audit(req, 'cobrar', 'pedido', o.id, { number: o.number, total: Number(data.total), tip: money(b.tip), discount: discount?.name ?? null, methods: payments.map((p) => p.method), session: session?.id ?? null, deliveryFee: Number(data.deliveryFee || 0) })
   res.send({ ...orderDTO(await loadOrder(o.id)), change: Number(data.change || 0), receivable: data.receivable })
 }))
 

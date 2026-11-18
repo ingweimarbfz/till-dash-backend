@@ -214,7 +214,7 @@ const publicTable = async (token) => {
   const { data } = await supabase.from('dining_tables').select('id, org_id, site_id, name, seats, active, area:dining_areas(name), site:sites(name, active), org:organizations(status)').eq('qr_token', token).maybeSingle()
   if (!data || !data.active || !data.site?.active || ['suspendida', 'cancelada'].includes(data.org?.status)) return null
   // La carta por QR es un módulo del plan.
-  if (!(await plan.orgHas(data.org_id, 'carta_qr'))) return null
+  if (!(await plan.orgHas(data.org_id, 'carta_qr')) || !(await plan.orgHas(data.org_id, 'mesas'))) return null
   return data
 }
 

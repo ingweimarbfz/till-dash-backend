@@ -16,6 +16,8 @@ const { checkLowStock } = require('../stock')
 const { notify, courtesyMessage, voidMessage } = require('../notify')
 const { cashOpenAt, NO_CASH, can, guard, workSite, sameSite, dbError, money, isMoney, PAY_METHODS, fullName } = require('../ops')
 const { qty } = require('./inventory')
+const plan = require('../plan')
+const { customerFromBody, createCustomer } = require('./customers')
 
 const router = express.Router()
 
@@ -29,7 +31,7 @@ const SELLERS = ['mesero', 'cajero', 'host', 'bartender', 'barista']
 const DELIVERY_PAY = ['efectivo', 'tarjeta', 'transferencia', 'nequi', 'daviplata', 'otro']
 const ORDER_COLUMNS = `*, site:sites(name), table:dining_tables!orders_table_id_fkey(id, name),
   waiter:users!orders_waiter_id_fkey(id, name, last_name), cashier:users!orders_cashier_id_fkey(id, name, last_name),
-  courier:users!orders_courier_id_fkey(id, name, last_name)`
+  courier:users!orders_courier_id_fkey(id, name, last_name), customer:customers(id, name, zone, kind)`
 
 const itemDTO = (i) => ({
   id: i.id, productId: i.product_id, name: i.name, area: i.area, quantity: Number(i.quantity), listPrice: Number(i.list_price), unitPrice: Number(i.unit_price),
@@ -39,7 +41,8 @@ const itemDTO = (i) => ({
 })
 const orderDTO = (o) => ({
   id: o.id, number: o.number, siteId: o.site_id, site: o.site?.name ?? null, type: o.type, typeLabel: TYPES[o.type], status: o.status,
-  tableId: o.table_id, table: o.table?.name ?? null, alias: o.alias ?? null, guests: o.guests, customerName: o.customer_name, customerPhone: o.customer_phone,
+  tableId: o.table_id, table: o.table?.name ?? null, alias: o.alias ?? null, guests: o.guests,
+  customerId: o.customer_id ?? null, customer: o.customer ? { id: o.customer.id, name: o.customer.name, zone: o.customer.zone, kind: o.customer.kind } : null, customerName: o.customer_name, customerPhone: o.customer_phone,
   customerAddress: o.customer_address, note: o.note, waiter: o.waiter ? { id: o.waiter.id, name: fullName(o.waiter) } : null,
   cashier: o.cashier ? { id: o.cashier.id, name: fullName(o.cashier) } : null,
   gross: Number(o.gross), courtesyTotal: Number(o.courtesy_total), subtotal: Number(o.subtotal),
@@ -77,6 +80,7 @@ router.get('/pedidos', auth(STAFF), h(async (req, res) => {
   }
   if (clean(req.query.q)) q = q.or(`number.ilike.%${clean(req.query.q).replace(/[%,()]/g, '')}%,customer_name.ilike.%${clean(req.query.q).replace(/[%,()]/g, '')}%`)
   if (req.query.mios === '1') q = q.eq('waiter_id', req.user.id)
+  if (Number(req.query.cliente)) q = q.eq('customer_id', Number(req.query.cliente))
   const { data, error } = await q
   if (error) throw error
   res.send(data.map((o) => ({ ...orderDTO({ ...o, items: undefined }), itemCount: (o.items || []).filter((i) => i.status !== 'anulado').length })))
@@ -160,6 +164,19 @@ router.post('/pedidos', auth(STAFF), guard(...SELLERS), h(async (req, res) => {
   const b = req.body || {}
   const type = TYPES[b.type] ? b.type : (b.tableId ? 'mesa' : 'llevar')
   const site = await workSite(req, b.siteId)
+  // Plan sin mesas (distribuidora): solo domicilio y para recoger. Sin domicilios: no hay pedidos a domicilio.
+  if ((type === 'mesa' || type === 'barra') && !(await plan.orgHas(req.user.org_id, 'mesas'))) return fail(res, 'Tu plan no incluye mesas: abre el pedido a domicilio o como venta en mostrador.', 403)
+  if (type === 'domicilio' && !(await plan.orgHas(req.user.org_id, 'domicilios'))) return fail(res, 'Tu plan no incluye domicilios. Pide un cambio en "Mi plan".', 403)
+  // Cliente del directorio: completa nombre, celular y dirección; o se guarda como cliente nuevo.
+  const cust = await customerFromBody(req, b, site)
+  if (cust.error) return fail(res, cust.error, cust.status || 400)
+  if (cust.customer) {
+    const c = cust.customer
+    b.customerName = clean(b.customerName) || c.name
+    b.customerPhone = clean(b.customerPhone) || c.phone
+    b.customerAddress = clean(b.customerAddress) || [c.address, c.neighborhood].filter(Boolean).join(', ') || null
+    if ((b.deliveryFee === undefined || b.deliveryFee === null || b.deliveryFee === '') && c.delivery_fee !== null && c.delivery_fee !== undefined) b.deliveryFee = Number(c.delivery_fee)
+  }
   let table = null
   if (type === 'mesa') {
     if (!Number(b.tableId)) return fail(res, 'Elige la mesa', 400)
@@ -171,6 +188,12 @@ router.post('/pedidos', auth(STAFF), guard(...SELLERS), h(async (req, res) => {
   if (b.deliveryFee !== undefined && b.deliveryFee !== null && b.deliveryFee !== '' && !isMoney(b.deliveryFee)) return fail(res, 'El valor del domicilio no es válido', 400)
   if (type === 'domicilio' && !DELIVERY_PAY.includes(b.deliveryPayMethod)) return fail(res, 'Elige cómo paga el cliente el domicilio', 400)
   if (!(await cashOpenAt(site))) return fail(res, NO_CASH, 409)
+  // "Guardar como cliente": el cliente nuevo entra al directorio con los datos del pedido.
+  if (!cust.customer && b.saveCustomer && clean(b.customerName)) {
+    const made = await createCustomer(req, { name: b.customerName, phone: b.customerPhone, address: b.customerAddress, zone: b.customerZone, siteId: site })
+    if (made.error) return fail(res, made.error, made.status || 400)
+    cust.customer = made.customer
+  }
   let built = null
   if (Array.isArray(b.items) && b.items.length) {
     built = await buildItems(req, b.items)
@@ -181,7 +204,7 @@ router.post('/pedidos', auth(STAFF), guard(...SELLERS), h(async (req, res) => {
   if (e1) throw e1
   const { data: order, error } = await supabase.from('orders').insert({
     site_id: site, number, type, table_id: table?.id ?? null, guests: Number(b.guests) > 0 ? Math.min(100, Number(b.guests)) : null,
-    alias: aliasOf(b.alias), ...(type === 'domicilio' ? { delivery_status: 'por_despachar', courier_id: Number(b.courierId) || null, delivery_pay_method: b.deliveryPayMethod, delivery_cash_with: b.deliveryPayMethod === 'efectivo' && money(b.deliveryCashWith) > 0 ? money(b.deliveryCashWith) : null, ...(money(b.deliveryFee) > 0 ? { delivery_fee: money(b.deliveryFee) } : {}) } : {}), customer_name: clean(b.customerName), customer_phone: clean(b.customerPhone), customer_address: clean(b.customerAddress), note: clean(b.note),
+    alias: aliasOf(b.alias), customer_id: cust.customer?.id ?? null, ...(type === 'domicilio' ? { delivery_status: 'por_despachar', courier_id: Number(b.courierId) || null, delivery_pay_method: b.deliveryPayMethod, delivery_cash_with: b.deliveryPayMethod === 'efectivo' && money(b.deliveryCashWith) > 0 ? money(b.deliveryCashWith) : null, ...(money(b.deliveryFee) > 0 ? { delivery_fee: money(b.deliveryFee) } : {}) } : {}), customer_name: clean(b.customerName), customer_phone: clean(b.customerPhone), customer_address: clean(b.customerAddress), note: clean(b.note),
     waiter_id: waiterId, opened_by: req.user.id
   }).select('id, number').single()
   if (error) return error.code === '23505' ? fail(res, `${table?.name || 'La mesa'} ya tiene un pedido abierto`, 409) : fail(res, error)
@@ -232,7 +255,19 @@ router.put('/pedidos/:id', auth(STAFF), guard(...SELLERS), h(async (req, res) =>
     patch.delivery_fee = money(b.deliveryFee)
   }
   if (Number(b.waiterId)) patch.waiter_id = Number(b.waiterId)
+  if ('customerId' in b) {
+    if (b.customerId === null || b.customerId === '') patch.customer_id = null
+    else {
+      const { data: c } = await supabase.from('customers').select('id, name, phone, address, neighborhood').eq('id', Number(b.customerId)).eq('active', true).maybeSingle()
+      if (!c) return fail(res, 'Cliente no encontrado', 404)
+      patch.customer_id = c.id
+      if (!('customerName' in b)) patch.customer_name = c.name
+      if (!('customerPhone' in b) && c.phone) patch.customer_phone = c.phone
+      if (!('customerAddress' in b) && c.address) patch.customer_address = [c.address, c.neighborhood].filter(Boolean).join(', ')
+    }
+  }
   if (Number(b.tableId) && Number(b.tableId) !== o.table_id) {
+    if (!(await plan.orgHas(req.user.org_id, 'mesas'))) return fail(res, 'Tu plan no incluye mesas', 403)
     const { data: t } = await supabase.from('dining_tables').select('id, name, site_id, active').eq('id', Number(b.tableId)).maybeSingle()
     if (!t || !t.active || t.site_id !== o.site_id) return fail(res, 'La mesa no existe en esta sucursal', 400)
     patch.table_id = t.id; patch.type = 'mesa'
@@ -342,6 +377,14 @@ router.post('/pedidos/:id/cobrar', auth(STAFF), guard('cajero'), h(async (req, r
     discount = { id: d.id, name: d.name, type: d.type, value: Number(d.value), reason: clean(b.discountReason) }
   }
   const session = await pickSession(req, o.site_id, b.sessionId)
+  // Venta a crédito de un cliente del directorio: sus datos y su plazo completan la cuenta por cobrar.
+  if (b.receivable && o.customer_id) {
+    const { data: c } = await supabase.from('customers').select('name, doc, phone, credit_days').eq('id', o.customer_id).maybeSingle()
+    if (c) {
+      b.receivable = { ...b.receivable, customerName: clean(b.receivable.customerName) || c.name, customerDoc: clean(b.receivable.customerDoc) || c.doc, customerPhone: clean(b.receivable.customerPhone) || c.phone }
+      if (!clean(b.receivable.dueDate) && c.credit_days) b.receivable.dueDate = new Date(Date.now() + c.credit_days * 864e5).toISOString().slice(0, 10)
+    }
+  }
   const payments = b.payments.map((p) => ({ method: p.method, amount: money(p.amount), received: p.method === 'efectivo' && isMoney(p.received) && p.received !== '' ? money(p.received) : null, reference: clean(p.reference) }))
   const { data, error } = await supabase.rpc('charge_order', {
     p: {

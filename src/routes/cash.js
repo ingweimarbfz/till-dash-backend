@@ -421,9 +421,9 @@ router.get('/caja/boveda', auth(ADMIN), h(async (req, res) => {
     supabase.from('vaults').select('balance, kind, name, site:sites(name)')
   ])
   res.send({
-    id: v.id, siteId: v.site_id, site: v.site?.name, balance: Number(v.balance),
+    id: v.id, siteId: v.site_id, site: v.site?.name || 'Fondo general', balance: Number(v.balance),
     total: (all || []).reduce((a, x) => a + Number(x.balance), 0),
-    bySite: (all || []).map((x) => ({ site: x.kind === 'subcuenta' ? `${x.site?.name || 'General'} · ${x.name}` : x.site?.name, balance: Number(x.balance) })),
+    bySite: (all || []).map((x) => ({ site: x.kind === 'subcuenta' ? `${x.site?.name || 'Fondo general'} · ${x.name}` : x.site?.name || 'Fondo general', balance: Number(x.balance) })),
     movements: (moves || []).map((m) => ({ id: m.id, type: m.type, typeLabel: VAULT_TYPES[m.type], amount: Number(m.amount), balanceAfter: Number(m.balance_after), ref: m.ref, note: m.note, user: fullName(m.user), createdAt: m.created_at }))
   })
 }))

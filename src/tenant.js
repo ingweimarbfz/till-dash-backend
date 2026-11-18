@@ -21,7 +21,7 @@ const TENANT_TABLES = new Set([
   'dining_areas', 'dining_tables', 'cash_registers', 'cash_sessions', 'vaults', 'vault_movements', 'orders', 'order_items',
   'order_payments', 'receivables', 'receivable_payments', 'cash_movements', 'table_calls', 'tip_payouts', 'incidents',
   // Etapa 4: finanzas
-  'partners', 'money_entries', 'fund_transfers', 'expenses', 'partner_withdrawals', 'cash_requests', 'menus', 'service_ratings'
+  'partners', 'money_entries', 'fund_transfers', 'expenses', 'partner_withdrawals', 'cash_requests', 'menus', 'service_ratings', 'suppliers'
 ])
 
 const withOrg = (rows, org) => (Array.isArray(rows) ? rows.map((r) => ({ ...r, org_id: org })) : { ...rows, org_id: org })

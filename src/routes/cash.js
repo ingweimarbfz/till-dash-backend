@@ -8,6 +8,7 @@
 // =====================================================================
 const express = require('express')
 const supabase = require('../db')
+const { resolveSupplier } = require('../suppliers')
 const { h, fail, clean } = require('../http')
 const { auth, ADMIN, STAFF } = require('../auth')
 const { audit } = require('../audit')
@@ -251,11 +252,14 @@ router.post('/caja/turnos/:id/gastos', auth(STAFF), guard('cajero'), h(async (re
   if (!ADMIN.includes(req.user.role) && limit > 0 && amount > limit) {
     return fail(res, `El gasto supera el tope de $${Math.round(limit).toLocaleString('es-CO')} por gasto. Pide los recursos al administrador.`, 403)
   }
+  const sup = await resolveSupplier(b)
+  if (sup.error) return fail(res, sup.error, 400)
   const { data: id, error } = await supabase.rpc('finance_expense', { p: {
-    org_id: req.user.org_id, user_id: req.user.id, category: b.category, description: description.slice(0, 200), supplier: clean(b.supplier), invoice_ref: clean(b.invoiceRef),
+    org_id: req.user.org_id, user_id: req.user.id, category: b.category, description: description.slice(0, 200), supplier: sup.name, invoice_ref: clean(b.invoiceRef),
     amount, source: 'caja', session_id: s.id
   } })
   if (error) return dbError(res, error)
+  if (sup.id) await supabase.from('expenses').update({ supplier_id: sup.id }).eq('id', id)
   const { data: e } = await supabase.from('expenses').select('number').eq('id', id).single()
   await audit(req, 'gasto', 'turno_caja', s.id, { number: e.number, session: s.number, amount, description })
   res.status(201).send({ id, number: e.number })

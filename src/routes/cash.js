@@ -24,14 +24,18 @@ const registerDTO = (r) => ({ id: r.id, siteId: r.site_id, site: r.site?.name ??
 
 // Resumen de un turno: ventas por forma de pago, propinas, abonos, ingresos, egresos y efectivo esperado.
 const sessionSummary = async (s) => {
-  const [{ data: moves }, { data: orders }, { data: payouts }] = await Promise.all([
+  const [{ data: moves }, { data: orders }, { data: payouts }, { data: credit }] = await Promise.all([
     supabase.from('cash_movements').select('*, user:users(name, last_name)').eq('session_id', s.id).order('created_at'),
     supabase.from('orders').select('id, number, total, tip, discount_total, courtesy_total, table:dining_tables!orders_table_id_fkey(name), closed_at').eq('session_id', s.id).eq('status', 'cobrado').order('closed_at'),
-    supabase.from('tip_payouts').select('id, amount, user_id, user:users!tip_payouts_user_id_fkey(name, last_name)').eq('session_id', s.id).order('id')
+    supabase.from('tip_payouts').select('id, amount, user_id, user:users!tip_payouts_user_id_fkey(name, last_name)').eq('session_id', s.id).order('id'),
+    // Cobrado a cuenta por cobrar: no entra dinero a la caja, pero se vendió en el turno.
+    supabase.from('order_payments').select('amount').eq('session_id', s.id).eq('method', 'cuenta_por_cobrar')
   ])
   const m = moves || []
   const byMethod = {}
   for (const x of m.filter((y) => y.type === 'venta' || y.type === 'abono')) byMethod[x.method] = (byMethod[x.method] || 0) + Number(x.amount)
+  const cxc = (credit || []).reduce((a, x) => a + Number(x.amount), 0)
+  if (cxc) byMethod.cuenta_por_cobrar = (byMethod.cuenta_por_cobrar || 0) + cxc
   const sum = (t) => m.filter((x) => x.type === t).reduce((a, x) => a + Number(x.amount), 0)
   const expected = m.filter((x) => x.method === 'efectivo').reduce((a, x) => a + Number(x.amount), 0)
   const os = orders || []

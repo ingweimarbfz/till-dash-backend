@@ -42,10 +42,12 @@ const buildCuadre = async ({ day, siteId }) => {
     supabase.from('sites').select('id, name').then((r) => r.data || [])
   ])
   const ids = sessions.map((s) => s.id)
-  const [moves, payouts] = ids.length ? await Promise.all([
+  const [moves, payouts, credit] = ids.length ? await Promise.all([
     all(() => supabase.from('cash_movements').select('session_id, type, method, amount, created_at').in('session_id', ids)),
-    all(() => supabase.from('tip_payouts').select('session_id, amount').in('session_id', ids))
-  ]) : [[], []]
+    all(() => supabase.from('tip_payouts').select('session_id, amount').in('session_id', ids)),
+    // Lo cobrado "a cuenta por cobrar" no mueve dinero en la caja, pero es parte de lo vendido en el turno.
+    all(() => supabase.from('order_payments').select('session_id, amount').in('session_id', ids).eq('method', 'cuenta_por_cobrar'))
+  ]) : [[], [], []]
   const siteName = (id) => (id ? sites.find((x) => x.id === id)?.name ?? null : 'General')
 
   // ---------- Turnos
@@ -55,6 +57,8 @@ const buildCuadre = async ({ day, siteId }) => {
     const sum = (t) => m.filter((x) => x.type === t).reduce((a, x) => a + Number(x.amount), 0)
     const byMethod = {}
     for (const x of m.filter((y) => y.type === 'venta' || y.type === 'abono')) byMethod[x.method] = (byMethod[x.method] || 0) + Number(x.amount)
+    const cxc = credit.filter((x) => x.session_id === s.id).reduce((a, x) => a + Number(x.amount), 0)
+    if (cxc) byMethod.cuenta_por_cobrar = (byMethod.cuenta_por_cobrar || 0) + cxc
     for (const [k, v] of Object.entries(byMethod)) methodTotals[k] = (methodTotals[k] || 0) + v
     const os = orders.filter((o) => o.session_id === s.id)
     const open = s.status === 'abierta'
@@ -62,7 +66,7 @@ const buildCuadre = async ({ day, siteId }) => {
     return {
       id: s.id, number: s.number, status: s.status, register: s.register?.name ?? null, site: s.site?.name ?? null,
       openedAt: s.opened_at, closedAt: s.closed_at, openedBy: fullName(s.opener), closedBy: fullName(s.closer), minutes: minutes(s.opened_at, s.closed_at),
-      opening: round(s.opening_amount), sales: round(sum('venta')), receivablePayments: round(sum('abono')),
+      opening: round(s.opening_amount), sales: round(sum('venta') + cxc), credit: round(cxc), receivablePayments: round(sum('abono')),
       byMethod: Object.entries(byMethod).map(([method, amount]) => ({ method, label: PAY_METHODS[method] || method, amount: round(amount) })).sort((a, b) => b.amount - a.amount),
       cashSales: round(byMethod.efectivo || 0), income: round(sum('ingreso')), expenses: round(-sum('egreso')),
       tips: round(os.reduce((a, o) => a + Number(o.tip), 0)), tipsPaid: round(payouts.filter((t) => t.session_id === s.id).reduce((a, t) => a + Number(t.amount), 0)),

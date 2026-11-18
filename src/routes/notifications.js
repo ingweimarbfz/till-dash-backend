@@ -80,13 +80,29 @@ router.post('/notificaciones/buscar-grupos', auth(ADMIN), h(async (req, res) => 
   const st = await needBot()
   const updates = await tg(st.bot_token, 'getUpdates', { limit: 100, allowed_updates: ['message', 'my_chat_member', 'channel_post'] })
   const found = new Map()
+  // Cuando Telegram convierte un grupo en supergrupo, el grupo cambia de id y el viejo sigue en el historial:
+  // por eso aparecía dos veces. Se descarta el id viejo y se actualizan los grupos ya conectados.
+  const migrated = new Map()
+  for (const u of updates || []) {
+    const m = u.message
+    if (m?.migrate_to_chat_id) migrated.set(String(m.chat.id), String(m.migrate_to_chat_id))
+    if (m?.migrate_from_chat_id) migrated.set(String(m.migrate_from_chat_id), String(m.chat.id))
+  }
   for (const u of updates || []) {
     const chat = u.message?.chat || u.my_chat_member?.chat || u.channel_post?.chat
     if (!chat || chat.type === 'private') continue
-    if (u.my_chat_member && ['left', 'kicked'].includes(u.my_chat_member.new_chat_member?.status)) { found.delete(String(chat.id)); continue }
-    found.set(String(chat.id), { chatId: String(chat.id), title: chat.title || 'Grupo', type: chat.type })
+    const id = String(chat.id)
+    if (migrated.has(id)) continue
+    if (u.my_chat_member && ['left', 'kicked'].includes(u.my_chat_member.new_chat_member?.status)) { found.delete(id); continue }
+    found.set(id, { chatId: id, title: chat.title || 'Grupo', type: chat.type })
   }
-  res.send([...found.values()])
+  for (const [from, to] of migrated) await supabase.from('notification_channels').update({ chat_id: to }).eq('chat_id', from)
+  // Qué secciones recibe ya cada grupo, para no confundirlos.
+  const { data: chans } = await supabase.from('notification_channels').select('chat_id, section')
+  const rows = [...found.values()].map((g) => ({ ...g, sections: (chans || []).filter((c) => c.chat_id === g.chatId).map((c) => SECTIONS[c.section]?.label || c.section) }))
+  // Si dos grupos distintos se llaman igual, se distinguen por el final de su id.
+  const names = rows.reduce((m, g) => { m[g.title] = (m[g.title] || 0) + 1; return m }, {})
+  res.send(rows.map((g) => ({ ...g, sameName: names[g.title] > 1 })))
 }))
 
 router.post('/notificaciones/canales', auth(ADMIN), h(async (req, res) => {
@@ -99,7 +115,11 @@ router.post('/notificaciones/canales', auth(ADMIN), h(async (req, res) => {
   const { data: dup } = await supabase.from('notification_channels').select('site_id').eq('section', b.section).eq('chat_id', chatId)
   if ((dup || []).some((d) => (d.site_id ?? null) === siteId)) return fail(res, 'Ese grupo ya recibe esa sección para esa sucursal', 400)
   const { data, error } = await supabase.from('notification_channels').insert({ section: b.section, chat_id: chatId, site_id: siteId, title: clean(b.title) || 'Grupo', enabled: true }).select('*').single()
-  if (error) throw error
+  if (error) {
+    if (error.code === '23514') return fail(res, 'Esa sección todavía no está habilitada en la base de datos. Ejecuta la migración td005-telegram-incidentes.sql.', 400)
+    if (error.code === '23505') return fail(res, 'Ese grupo ya recibe esa sección para esa sucursal', 400)
+    throw error
+  }
   await audit(req, 'crear', 'grupo_telegram', data.id, { section: data.section, title: data.title, site: siteId })
   res.status(201).send(channelDTO(data, await sitesList()))
 }))

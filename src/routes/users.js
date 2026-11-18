@@ -12,6 +12,7 @@ const supabase = require('../db')
 const { h, fail, clean, EMAIL_RE, PHONE_RE, DOC_RE, NAME_RE, imageError, HttpError } = require('../http')
 const { auth, ADMIN, ROLES, POSITIONS, PROFILE_ORDER, USER_COLUMNS, toUserDTO } = require('../auth')
 const { audit } = require('../audit')
+const plan = require('../plan')
 
 const router = express.Router()
 
@@ -78,6 +79,7 @@ router.post('/usuarios', auth(ADMIN), h(async (req, res) => {
   const positions = positionsFrom(b, role, extra)
   const errors = validate(b)
   if (errors.length) return fail(res, errors.join('. '), 400)
+  if (plan.roleLimit[role] && b.active !== false) await plan.checkLimit(req.user.org_id, plan.roleLimit[role])
   const { data, error } = await supabase.from('users').insert({
     identification: clean(b.identification),
     name: clean(b.name),
@@ -110,6 +112,9 @@ router.put('/usuarios/:id', auth(ADMIN), h(async (req, res) => {
   if ((current.role === 'superadmin' || role === 'superadmin') && req.user.role !== 'superadmin') return fail(res, 'Solo un super administrador puede editar a otro', 403)
   const losesOwner = current.role === 'superadmin' && current.active && (role !== 'superadmin' || b.active === false)
   if (losesOwner && (await activeOwners(id)) === 0) return fail(res, 'Debe quedar al menos un super administrador activo', 400)
+  // Reactivar o pasar a otro grupo de roles cuenta contra el límite del plan.
+  const kind = plan.roleLimit[role]
+  if (kind && b.active !== false && (!current.active || plan.roleLimit[current.role] !== kind)) await plan.checkLimit(req.user.org_id, kind)
   const patch = {
     identification: clean(b.identification),
     name: clean(b.name),

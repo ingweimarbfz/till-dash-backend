@@ -2,13 +2,14 @@
 // Sucursales y bodegas
 // · Cada establecimiento nace con una "Sede principal" y una "Bodega principal" (trigger en la base).
 // · Las bodegas de sucursal pertenecen a una sucursal; la principal es de todo el establecimiento.
-// · El stock por bodega, los traslados y las alertas de stock bajo llegan en la etapa 2.
+// · El stock por bodega, los traslados y las alertas de stock bajo están en routes/inventory.js.
 // =====================================================================
 const express = require('express')
 const supabase = require('../db')
 const { h, fail, clean, PHONE_RE } = require('../http')
 const { auth, ADMIN, STAFF } = require('../auth')
 const { audit } = require('../audit')
+const plan = require('../plan')
 
 const router = express.Router()
 
@@ -37,6 +38,7 @@ const siteRow = (b) => {
 router.post('/sedes', auth(ADMIN), h(async (req, res) => {
   const { errors, row } = siteRow(req.body || {})
   if (errors.length) return fail(res, errors.join('. '), 400)
+  if (row.active) await plan.checkLimit(req.user.org_id, 'sites')
   const { data, error } = await supabase.from('sites').insert(row).select('*, warehouses(*)').single()
   if (error) return dup(error, 'una sucursal') ? fail(res, dup(error, 'una sucursal'), 409) : fail(res, error)
   // Cada sucursal nueva arranca con su propia bodega.
@@ -52,8 +54,9 @@ router.put('/sedes/:id', auth(ADMIN), h(async (req, res) => {
   const id = Number(req.params.id)
   const { errors, row } = siteRow(req.body || {})
   if (errors.length) return fail(res, errors.join('. '), 400)
-  const { data: cur } = await supabase.from('sites').select('id, is_main').eq('id', id).maybeSingle()
+  const { data: cur } = await supabase.from('sites').select('id, is_main, active').eq('id', id).maybeSingle()
   if (!cur) return fail(res, 'Sucursal no encontrada', 404)
+  if (row.active && !cur.active) await plan.checkLimit(req.user.org_id, 'sites')
   if (cur.is_main && !row.active) return fail(res, 'La sede principal no se puede desactivar', 400)
   const { data, error } = await supabase.from('sites').update(row).eq('id', id).select('*, warehouses(*)').single()
   if (error) return dup(error, 'una sucursal') ? fail(res, dup(error, 'una sucursal'), 409) : fail(res, error)
@@ -96,6 +99,10 @@ router.put('/bodegas/:id', auth(ADMIN), h(async (req, res) => {
   if (!cur) return fail(res, 'Bodega no encontrada', 404)
   const { errors, row } = await whRow(req.body || {})
   if (cur.is_main) { row.site_id = null; if (!row.active) errors.push('La bodega principal no se puede desactivar') } else if (!row.site_id) errors.push('Elige la sucursal de la bodega')
+  if (!row.active && !cur.is_main) {
+    const { count } = await supabase.from('warehouse_stock').select('product_id', { count: 'exact', head: true }).eq('warehouse_id', id).gt('stock', 0)
+    if (count) errors.push('La bodega tiene existencias: trasládalas antes de desactivarla')
+  }
   if (errors.length) return fail(res, errors.join('. '), 400)
   const { data, error } = await supabase.from('warehouses').update(row).eq('id', id).select('*').single()
   if (error) return dup(error, 'una bodega') ? fail(res, dup(error, 'una bodega'), 409) : fail(res, error)

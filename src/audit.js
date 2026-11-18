@@ -1,7 +1,7 @@
 const supabase = require('./db')
 
 // Registra una acción en la bitácora. Nunca rompe la petición si falla.
-// Los avisos por Telegram (etapa 2) se engancharán aquí, como en QuontUp360.
+// Los avisos por Telegram los arma cada ruta con src/notify.js.
 const audit = async (req, action, entity, entityId = null, detail = null) => {
   try {
     await supabase.from('audit_log').insert({

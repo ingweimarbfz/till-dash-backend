@@ -80,6 +80,9 @@ const auth = (roles = ALL) => async (req, res, next) => {
     user.primary_role = user.role
     if (payload.role && payload.role !== user.role && profilesOf(user).includes(payload.role)) user.role = payload.role
     if (!roles.includes(user.role)) return fail(res, 'No tienes permiso para esta acción', 403)
+    // El módulo de la ruta debe estar incluido en el plan del establecimiento.
+    const blocked = await require('./plan').blockedFor(user.org_id, req.originalUrl.split('?')[0])
+    if (blocked) return fail(res, blocked, 403)
     req.user = user
     return tenant.runAsOrg(user.org_id, () => { loadSite(req); return next() })
   } catch (e) {

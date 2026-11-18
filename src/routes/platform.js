@@ -300,18 +300,33 @@ const orgRow = (b, countries, plans) => {
   }
 }
 
-// Crea el establecimiento (el trigger crea su configuración, sede y bodega principal) y su super administrador (contraseña = documento).
-router.post('/plataforma/organizaciones', pauth, h(async (req, res) => {
-  const b = req.body || {}
-  const c = await catalog()
-  const { row, country, plan: p } = orgRow(b, c.countries, c.plans)
-  const a = b.admin || {}
+// Datos del super administrador (crear o editar). Devuelve la lista de errores.
+const adminErrors = (a) => {
   const errs = []
   if (!DOC_RE.test(String(clean(a.identification) || ''))) errs.push('Documento del administrador no válido')
   if (!clean(a.name)) errs.push('Nombre del administrador requerido')
   if (!/^[a-z0-9._-]{3,30}$/.test(String(clean(a.username) || '').toLowerCase())) errs.push('Usuario del administrador: 3 a 30 letras, números, punto o guion')
   if (clean(a.email) && !EMAIL_RE.test(clean(a.email))) errs.push('Correo del administrador no válido')
   if (clean(a.phone) && !PHONE_RE.test(clean(a.phone))) errs.push('Teléfono del administrador no válido (7 a 10 dígitos)')
+  if (a.newPassword && String(a.newPassword).length < 6) errs.push('La nueva contraseña debe tener al menos 6 caracteres')
+  return errs
+}
+// Super administrador principal del establecimiento: el primero que se creó.
+const mainAdmin = async (orgId) => must(await supabase.from('users').select('id, identification, name, last_name, username, email, phone, active, last_login_at, created_at')
+  .eq('org_id', orgId).eq('role', 'superadmin').order('id').limit(1).maybeSingle())
+const adminDTO = (u) => (u ? { id: u.id, identification: u.identification, name: u.name, lastName: u.last_name || '', username: u.username, email: u.email || '', phone: u.phone || '', active: u.active, lastLoginAt: u.last_login_at, createdAt: u.created_at } : null)
+
+router.get('/plataforma/organizaciones/:id/admin', pauth, h(async (req, res) => {
+  res.send({ admin: adminDTO(await mainAdmin(Number(req.params.id))) })
+}))
+
+// Crea el establecimiento (el trigger crea su configuración, sede y bodega principal) y su super administrador (contraseña = documento).
+router.post('/plataforma/organizaciones', pauth, h(async (req, res) => {
+  const b = req.body || {}
+  const c = await catalog()
+  const { row, country, plan: p } = orgRow(b, c.countries, c.plans)
+  const a = b.admin || {}
+  const errs = adminErrors(a)
   if (errs.length) return fail(res, errs.join('. '), 400)
   const username = clean(a.username).toLowerCase()
   const { data: taken } = await supabase.from('users').select('id').eq('username', username).maybeSingle()
@@ -351,13 +366,40 @@ router.put('/plataforma/organizaciones/:id', pauth, h(async (req, res) => {
   const id = Number(req.params.id)
   const c = await catalog()
   const { row, country } = orgRow(req.body || {}, c.countries, c.plans)
+  // Super administrador: se validan sus datos antes de tocar el establecimiento.
+  const a = req.body?.admin
+  let cur = null
+  if (a) {
+    const errs = adminErrors(a)
+    if (errs.length) return fail(res, errs.join('. '), 400)
+    cur = await mainAdmin(id)
+    const username = clean(a.username).toLowerCase()
+    const { data: taken } = await supabase.from('users').select('id').eq('username', username).maybeSingle()
+    if (taken && taken.id !== cur?.id) return fail(res, 'Ese usuario ya existe en TillDash+; elige otro', 409)
+  }
   const data = must(await supabase.from('organizations').update(row).eq('id', id).select(ORG_COLS).maybeSingle())
   if (!data) return fail(res, 'Negocio no encontrado', 404)
   // La moneda y la zona horaria de la app siguen al país del establecimiento.
   must(await supabase.from('app_settings').update({ currency: country.currency, timezone: country.timezone }).eq('org_id', id))
+  let adminInfo = null
+  if (a) {
+    const fields = { identification: clean(a.identification), name: clean(a.name), last_name: clean(a.lastName) || '', username: clean(a.username).toLowerCase(), email: clean(a.email), phone: clean(a.phone) }
+    // Contraseña: una nueva, o volver a dejar el documento.
+    const password = a.newPassword ? String(a.newPassword) : a.resetPassword ? String(fields.identification) : null
+    if (password) fields.password_hash = await bcrypt.hash(password, 10)
+    if (cur) {
+      if (a.active !== undefined) fields.active = a.active !== false
+      must(await supabase.from('users').update(fields).eq('id', cur.id).eq('org_id', id))
+    } else {
+      if (!fields.password_hash) fields.password_hash = await bcrypt.hash(String(fields.identification), 10)
+      must(await supabase.from('users').insert({ ...fields, org_id: id, role: 'superadmin', active: true }))
+    }
+    await paudit(req, cur ? 'editar_admin' : 'crear_admin', 'establecimiento', id, { username: fields.username, password: password ? (a.newPassword ? 'nueva' : 'documento') : null })
+    adminInfo = { ...adminDTO(await mainAdmin(id)), passwordChanged: Boolean(password) || !cur, password: a.newPassword ? 'La nueva que escribiste' : (a.resetPassword || !cur) ? 'Su número de documento' : null }
+  }
   await paudit(req, 'editar', 'establecimiento', id, { status: data.status, plan: data.plan_id, country: data.country_code })
   await plan.refresh(id)
-  res.send(orgDTO(data, c.plans, c.countries))
+  res.send({ ...orgDTO(data, c.plans, c.countries), admin: adminInfo })
 }))
 
 // ---------- resumen ----------

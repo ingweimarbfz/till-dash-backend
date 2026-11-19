@@ -148,7 +148,7 @@ const buildReport = async (req) => {
     if (i.courtesy) {
       p.courtesyQty += qty
       const o = orders.find((x) => x.id === i.order_id)
-      courtesies.push({ id: i.id, order: o?.number, orderId: i.order_id, name: i.name, quantity: qty, value: qty * Number(i.list_price), reason: i.courtesy_reason, by: fullName(i.courtesier), at: o?.closed_at })
+      courtesies.push({ id: i.id, order: o?.number, orderId: i.order_id, name: i.name, quantity: qty, value: qty * Number(i.list_price), cost: c, reason: i.courtesy_reason, by: fullName(i.courtesier), at: o?.closed_at })
     }
     const ck = p.category
     categories[ck] = categories[ck] || { name: ck, emoji: p.emoji, qty: 0, revenue: 0, cost: 0 }

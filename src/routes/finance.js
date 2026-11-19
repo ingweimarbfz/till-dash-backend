@@ -139,6 +139,18 @@ router.put('/finanzas/subcuentas/:id', auth(OWNER), h(async (req, res) => {
   res.send({ ok: true })
 }))
 
+// Gastos por categoría de todas las fuentes, con lo que salió de cada una (fondo, caja, banco, socio).
+const allExpensesByCategory = (rows) => {
+  const cat = {}
+  for (const e of rows) {
+    const c = (cat[e.category] = cat[e.category] || { key: e.category, label: EXPENSE_CATEGORIES[e.category] || e.category, total: 0, bySource: {} })
+    const v = Number(e.amount)
+    c.total += v
+    c.bySource[e.source] = (c.bySource[e.source] || 0) + v
+  }
+  return Object.values(cat).map((c) => ({ ...c, total: Math.round(c.total) })).sort((x, y) => y.total - x.total)
+}
+
 // Tablero de cuentas: saldo, entradas y salidas del rango, gastos por categoría y por servicio,
 // y gastos por mes (últimos 6) de cada cuenta.
 router.get('/finanzas/cuentas', auth(ADMIN), h(async (req, res) => {
@@ -148,12 +160,16 @@ router.get('/finanzas/cuentas', auth(ADMIN), h(async (req, res) => {
   const principalOf = (sid) => funds.find((f) => f.kind === 'principal' && (f.siteId ?? null) === (sid ?? null))
   const sixAgo = new Date(`${r.to}T12:00:00`); sixAgo.setMonth(sixAgo.getMonth() - 5); sixAgo.setDate(1)
   const from6 = sixAgo.toISOString().slice(0, 10)
-  const [{ data: moves, error: e1 }, { data: exps, error: e2 }] = await Promise.all([
+  const [{ data: moves, error: e1 }, { data: exps, error: e2 }, { data: allExps, error: e3 }] = await Promise.all([
     supabase.from('vault_movements').select('vault_id, type, amount').gte('created_at', `${r.from}T00:00:00-05:00`).lte('created_at', `${r.to}T23:59:59-05:00`),
-    supabase.from('expenses').select('site_id, vault_id, category, description, amount, paid_on').eq('source', 'fondo').eq('status', 'activo').gte('paid_on', from6 < r.from ? from6 : r.from).lte('paid_on', r.to)
+    supabase.from('expenses').select('site_id, vault_id, category, description, amount, paid_on').eq('source', 'fondo').eq('status', 'activo').gte('paid_on', from6 < r.from ? from6 : r.from).lte('paid_on', r.to),
+    // TD-037: "¿En qué se va el dinero?" cuenta todos los gastos del rango, no solo los pagados desde cuentas:
+    // también los de la caja (como los turnos pagados al cerrar), el banco y los socios.
+    supabase.from('expenses').select('category, source, amount').eq('status', 'activo').gte('paid_on', r.from).lte('paid_on', r.to)
   ])
   if (e1) throw e1
   if (e2) throw e2
+  if (e3) throw e3
   const acc = new Map(funds.map((f) => [f.key, { key: f.key, kind: f.kind, name: f.name, parent: f.parent || null, siteId: f.siteId, balance: f.balance, active: f.active, inflow: 0, outflow: 0, spent: 0, byCategory: {}, byService: {} }]))
   for (const m of moves || []) {
     const f = byVault.get(m.vault_id); if (!f) continue
@@ -193,6 +209,7 @@ router.get('/finanzas/cuentas', auth(ADMIN), h(async (req, res) => {
       inflow: accounts.reduce((s, a) => s + a.inflow, 0)
     },
     byCategory: Object.entries(cat).map(([key, total]) => ({ key, label: EXPENSE_CATEGORIES[key] || key, total })).sort((x, y) => y.total - x.total),
+    allByCategory: allExpensesByCategory(allExps || []),
     categories: EXPENSE_CATEGORIES
   })
 }))
@@ -501,5 +518,6 @@ router.get('/finanzas/resumen', auth(ADMIN), h(async (req, res) => {
 }))
 
 module.exports = router
+module.exports.allExpensesByCategory = allExpensesByCategory
 module.exports.summarize = summarize
 module.exports.fundSite = fundSite

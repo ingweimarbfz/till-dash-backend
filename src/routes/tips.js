@@ -31,16 +31,21 @@ const TRANSFER_METHODS = { transferencia: 'Transferencia', nequi: 'Nequi', davip
 router.get('/propinas', auth(STAFF), guard('cajero'), h(async (req, res) => {
   const site = await workSite(req, req.query.sede)
   const admin = ADMIN.includes(req.user.role)
-  const [orders, payouts, courierTips, { data: staff }, { data: sessions }, fund] = await Promise.all([
+  const month = new Date(Date.now() - 30 * 864e5).toISOString()
+  const [orders, payouts, courierTips, { data: staff }, { data: sessions }, fund, { data: ratings }] = await Promise.all([
     all(() => supabase.from('orders').select('id, waiter_id, tip, type, courier_id, waiter:users!orders_waiter_id_fkey(name, last_name), courier:users!orders_courier_id_fkey(name, last_name)').eq('site_id', site).eq('status', 'cobrado').gt('tip', 0).order('id')),
     all(() => supabase.from('tip_payouts').select(PAYOUT_COLUMNS).eq('site_id', site).order('created_at', { ascending: false })),
     // Propinas que se pagaron a los domiciliarios en cierres anteriores (junto con su parte del domicilio).
     all(() => supabase.from('courier_payouts').select('id, user_id, tips, created_at, user:users!courier_payouts_user_id_fkey(name, last_name), session:cash_sessions!inner(site_id)').eq('session.site_id', site).gt('tips', 0).order('id')).catch(() => []),
     supabase.from('users').select('id, name, last_name, role, positions, site_id').eq('active', true).in('role', ['empleado', 'admin']).order('name'),
     supabase.from('cash_sessions').select('id, number, register:cash_registers(name)').eq('site_id', site).eq('status', 'abierta').order('opened_at'),
-    admin ? supabase.rpc('vault_of', { p_org: req.user.org_id, p_site: site }).then(async ({ data: vid }) => (vid ? (await supabase.from('vaults').select('balance').eq('id', vid).maybeSingle()).data : null)) : null
+    admin ? supabase.rpc('vault_of', { p_org: req.user.org_id, p_site: site }).then(async ({ data: vid }) => (vid ? (await supabase.from('vaults').select('balance').eq('id', vid).maybeSingle()).data : null)) : null,
+    // Calificaciones de los últimos 30 días: para dar más al mejor calificado al repartir en partes iguales.
+    supabase.from('service_ratings').select('waiter_id, stars').gte('created_at', month).then((r) => (r.error ? { data: [] } : r))
   ])
   const team = (staff || []).filter((u) => !u.site_id || u.site_id === site)
+  const stars = {}
+  for (const r of ratings || []) if (r.waiter_id) { stars[r.waiter_id] = stars[r.waiter_id] || { sum: 0, n: 0 }; stars[r.waiter_id].sum += r.stars; stars[r.waiter_id].n++ }
   const balance = tipBalance(orders, [...payouts, ...courierTips.map((c) => ({ user_id: c.user_id, user: c.user, amount: c.tips, created_at: c.created_at }))], team)
   const open = await Promise.all((sessions || []).map(async (s) => {
     const { data: cash } = await supabase.rpc('session_cash', { p_session: s.id })
@@ -48,6 +53,7 @@ router.get('/propinas', auth(STAFF), guard('cajero'), h(async (req, res) => {
   }))
   res.send({
     siteId: site, ...balance,
+    people: balance.people.map((x) => ({ ...x, rating: stars[x.userId] ? { avg: Math.round((stars[x.userId].sum / stars[x.userId].n) * 10) / 10, count: stars[x.userId].n } : null })),
     sessions: open, fund: fund ? Math.round(Number(fund.balance) || 0) : null, canUseFund: admin,
     sources: TIP_SOURCES, transferMethods: TRANSFER_METHODS,
     payouts: payouts.slice(0, 200).map(payoutDTO)

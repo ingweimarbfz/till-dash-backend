@@ -1,5 +1,8 @@
 // =====================================================================
-// Cuadre del día (TD-006): todo lo que pasó con el dinero en un día de Colombia, para ver si las cuentas cuadran.
+// Cuadre del día (TD-006): todo lo que pasó con el dinero en una jornada, para ver si las cuentas cuadran.
+// Jornada (TD-019): un turno pertenece a la jornada del día en que se abrió, y la jornada empieza a la hora de
+// corte configurada (por defecto 6 a. m.). Así un turno de 4 p. m. a 2 a. m. y otro abierto a las 3 a. m. son de
+// la misma jornada. Lo vendido, las propinas y los gastos se toman de esos mismos turnos, para que cuadren.
 // · Turnos de caja del día: base, ventas por forma de pago, gastos, propinas, esperado vs. contado y lo que pasó a la bóveda.
 // · Lo vendido: pedidos cobrados, descuentos, cortesías y propinas.
 // · Caja general (fondos): saldo al iniciar y al terminar el día, y sus movimientos.
@@ -7,9 +10,8 @@
 // =====================================================================
 const express = require('express')
 const supabase = require('../db')
-const { h, fail, todayBogota } = require('../http')
+const { h, fail } = require('../http')
 const { auth, ADMIN } = require('../auth')
-const { dayStart, nextDay } = require('./logbook')
 const { PAY_METHODS, fullName } = require('../ops')
 
 const router = express.Router()
@@ -17,6 +19,17 @@ const round = (v) => Math.round(Number(v) || 0)
 const isDay = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || '')
 const minutes = (a, b) => Math.max(0, Math.round((new Date(b || Date.now()) - new Date(a)) / 60000))
 const VAULT_TYPES = { deposito: 'Depósitos', retiro: 'Retiros', cierre_caja: 'Cierres de caja', base_caja: 'Bases de caja', consignacion: 'Consignaciones al banco', ajuste: 'Ajustes', ingreso: 'Ingresos de dinero', gasto: 'Gastos pagados con fondos', traslado: 'Traslados', retiro_socio: 'Retiros de socios', anulacion: 'Anulaciones' }
+
+// Hora (0-12) en que empieza la jornada. Si la columna aún no existe, 6 a. m.
+const cutoffHour = async () => {
+  const { data } = await supabase.from('app_settings').select('*').maybeSingle()
+  const hour = Number(data?.day_cutoff_hour ?? 6)
+  return Number.isInteger(hour) && hour >= 0 && hour <= 12 ? hour : 6
+}
+// Inicio de la jornada `day` (YYYY-MM-DD) en Colombia (UTC-5, sin horario de verano).
+const jornadaStart = (day, hour) => new Date(new Date(`${day}T00:00:00-05:00`).getTime() + hour * 3600000).toISOString()
+// La jornada en curso: la fecha de Colombia de hace `hour` horas.
+const jornadaToday = (hour) => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Bogota' }).format(new Date(Date.now() - hour * 3600000))
 
 const all = async (build) => {
   const out = []
@@ -28,27 +41,28 @@ const all = async (build) => {
   }
 }
 
-const buildCuadre = async ({ day, siteId }) => {
-  const start = dayStart(day)
-  const end = nextDay(day)
+const buildCuadre = async ({ day, siteId, hour }) => {
+  if (hour === undefined) hour = await cutoffHour()
+  const start = jornadaStart(day, hour)
+  const end = new Date(new Date(start).getTime() + 86400000).toISOString()
   const bySite = (q) => (siteId ? q.eq('site_id', siteId) : q)
-  const [sessions, orders, expenses, vaults, sites] = await Promise.all([
-    // Turnos que estuvieron abiertos en algún momento del día.
+  const EXP_COLS = 'id, number, category, description, supplier, amount, source, session_id, created_at'
+  const [sessions, looseExpenses, vaults, sites] = await Promise.all([
+    // Turnos de la jornada: los que se abrieron entre el inicio de la jornada y el inicio de la siguiente.
     all(() => bySite(supabase.from('cash_sessions').select('*, register:cash_registers(name), site:sites(name), opener:users!cash_sessions_opened_by_fkey(name, last_name), closer:users!cash_sessions_closed_by_fkey(name, last_name)')
-      .lt('opened_at', end).or(`closed_at.is.null,closed_at.gte."${start}"`)).order('opened_at')),
-    all(() => bySite(supabase.from('orders').select('id, number, gross, courtesy_total, subtotal, discount_total, tip, total, session_id, closed_at').eq('status', 'cobrado').gte('closed_at', start).lt('closed_at', end)).order('closed_at')),
-    all(() => bySite(supabase.from('expenses').select('id, number, category, description, supplier, amount, source, session_id, created_at').eq('status', 'activo').gte('created_at', start).lt('created_at', end)).order('created_at')),
+      .gte('opened_at', start).lt('opened_at', end)).order('opened_at')),
+    // Gastos que no son de un turno (pagados con fondos u otros) registrados durante la jornada.
+    all(() => bySite(supabase.from('expenses').select(EXP_COLS).eq('status', 'activo').is('session_id', null).gte('created_at', start).lt('created_at', end)).order('created_at')),
     supabase.from('vaults').select('id, site_id, kind, name, balance').then((r) => r.data || []),
     supabase.from('sites').select('id, name').then((r) => r.data || [])
   ])
   const ids = sessions.map((s) => s.id)
-  // Gastos de los turnos del cuadre aunque se hayan registrado el día anterior (turno abierto antes de medianoche).
-  if (ids.length) {
-    const seen = new Set(expenses.map((e) => e.id))
-    const extra = await all(() => supabase.from('expenses').select('id, number, category, description, supplier, amount, source, session_id, created_at').eq('status', 'activo').in('session_id', ids).order('created_at'))
-    for (const e of extra) if (!seen.has(e.id)) expenses.push(e)
-    expenses.sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
-  }
+  // Pedidos cobrados y gastos de los turnos de la jornada, sin importar a qué hora pasaron.
+  const [orders, sessionExpenses] = ids.length ? await Promise.all([
+    all(() => supabase.from('orders').select('id, number, gross, courtesy_total, subtotal, discount_total, tip, total, session_id, closed_at').eq('status', 'cobrado').in('session_id', ids).order('closed_at')),
+    all(() => supabase.from('expenses').select(EXP_COLS).eq('status', 'activo').in('session_id', ids).order('created_at'))
+  ]) : [[], []]
+  const expenses = [...looseExpenses, ...sessionExpenses].sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
   const [moves, payouts, credit] = ids.length ? await Promise.all([
     all(() => supabase.from('cash_movements').select('session_id, type, method, amount, created_at').in('session_id', ids)),
     all(() => supabase.from('tip_payouts').select('session_id, amount').in('session_id', ids)),
@@ -84,7 +98,7 @@ const buildCuadre = async ({ day, siteId }) => {
   })
   const tot = (k) => shiftRows.reduce((a, r) => a + (Number(r[k]) || 0), 0)
 
-  // ---------- Lo vendido (pedidos cobrados en el día)
+  // ---------- Lo vendido (pedidos cobrados en los turnos de la jornada)
   const o = (k) => round(orders.reduce((a, x) => a + Number(x[k]), 0))
   const sold = { orders: orders.length, gross: o('gross'), courtesies: o('courtesy_total'), discounts: o('discount_total'), net: o('total') - o('tip'), tips: o('tip'), charged: o('total') }
 
@@ -108,18 +122,19 @@ const buildCuadre = async ({ day, siteId }) => {
       movements: Object.entries(byType).map(([type, amount]) => ({ type, label: VAULT_TYPES[type] || type, amount: round(amount) })).sort((a, b) => Math.abs(b.amount) - Math.abs(a.amount))
     }
   }).filter((f) => f.start || f.end || f.movements.length)
-  const vaultClosings = round(vmoves.filter((x) => x.type === 'cierre_caja' && new Date(x.created_at) < new Date(end) && ids.includes(x.session_id)).reduce((a, x) => a + Number(x.amount), 0))
+  // Cierres de los turnos de la jornada, aunque el turno haya cerrado después de que empezó la jornada siguiente.
+  const vaultClosings = round(vmoves.filter((x) => x.type === 'cierre_caja' && ids.includes(x.session_id)).reduce((a, x) => a + Number(x.amount), 0))
 
   // ---------- Verificaciones
   const shiftSales = tot('sales')
   const closed = shiftRows.filter((r) => r.status === 'cerrada')
   const diff = closed.reduce((a, r) => a + r.difference, 0)
-  const toVault = closed.filter((r) => r.closedAt && new Date(r.closedAt) < new Date(end)).reduce((a, r) => a + r.toVault, 0)
+  const toVault = closed.reduce((a, r) => a + r.toVault, 0)
   const checks = [
     {
       key: 'ventas', ok: Math.abs(shiftSales - sold.charged) < 1, title: 'Cobros en caja vs. pedidos cobrados',
-      detail: `Las cajas registran ${round(shiftSales)} en cobros y los pedidos cobrados del día suman ${sold.charged}.`,
-      hint: Math.abs(shiftSales - sold.charged) < 1 ? null : 'La diferencia suele venir de turnos que empezaron el día anterior o que siguen abiertos, o de pedidos cobrados en un turno de otro día.',
+      detail: `Las cajas registran ${round(shiftSales)} en cobros y los pedidos cobrados en esos turnos suman ${sold.charged}.`,
+      hint: Math.abs(shiftSales - sold.charged) < 1 ? null : 'Revisa los pedidos cobrados a cuenta por cobrar o divididos entre varias personas, y los cobros que se hicieron en un turno distinto al del pedido.',
       a: round(shiftSales), b: sold.charged
     },
     {
@@ -132,13 +147,14 @@ const buildCuadre = async ({ day, siteId }) => {
       detail: `Los cierres enviaron ${toVault} a la bóveda y la bóveda recibió ${vaultClosings}.`, a: toVault, b: vaultClosings
     },
     {
-      key: 'propinas', ok: tot('tipsPaid') <= tot('tips') + 1, title: 'Propinas pagadas vs. propinas del día',
-      detail: `Los clientes dejaron ${tot('tips')} de propina y se pagaron ${tot('tipsPaid')} al personal.`, a: tot('tipsPaid'), b: tot('tips')
+      key: 'propinas', ok: tot('tipsPaid') <= tot('tips') + 1, title: 'Propinas pagadas vs. propinas de la jornada',
+      detail: `Los clientes dejaron ${tot('tips')} de propina en estos turnos y se pagaron ${tot('tipsPaid')} al personal.`,
+      hint: tot('tipsPaid') <= tot('tips') + 1 ? null : 'Se pagaron más propinas de las que entraron: puede ser un pago de propinas acumuladas de otras jornadas.', a: tot('tipsPaid'), b: tot('tips')
     }
   ]
 
   return {
-    day, site: siteId ? siteName(siteId) : null, generatedAt: new Date().toISOString(),
+    day, today: jornadaToday(hour), jornada: { from: start, to: end, cutoffHour: hour }, site: siteId ? siteName(siteId) : null, generatedAt: new Date().toISOString(),
     totals: {
       shifts: shiftRows.length, openShifts: shiftRows.filter((r) => r.status === 'abierta').length, minutes: tot('minutes'),
       opening: tot('opening'), sales: round(shiftSales), cashSales: tot('cashSales'), income: tot('income'), shiftExpenses: tot('expenses'),
@@ -154,10 +170,14 @@ const buildCuadre = async ({ day, siteId }) => {
 }
 
 router.get('/reportes/cuadre', auth(ADMIN), h(async (req, res) => {
-  const day = isDay(req.query.fecha) ? req.query.fecha : todayBogota()
-  if (day > todayBogota()) return fail(res, 'Elige un día que ya haya empezado', 400)
-  res.send(await buildCuadre({ day, siteId: req.siteId || null }))
+  const hour = await cutoffHour()
+  const today = jornadaToday(hour)
+  const day = isDay(req.query.fecha) ? req.query.fecha : today
+  if (day > today) return fail(res, 'Elige una jornada que ya haya empezado', 400)
+  res.send(await buildCuadre({ day, siteId: req.siteId || null, hour }))
 }))
 
 module.exports = router
 module.exports.buildCuadre = buildCuadre
+module.exports.jornadaStart = jornadaStart
+module.exports.jornadaToday = jornadaToday

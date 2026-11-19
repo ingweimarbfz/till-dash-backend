@@ -42,6 +42,7 @@ const toDTO = (s, o) => ({
   qrOrdering: s?.qr_ordering || 'llamar',
   cashExpenseLimit: Number(s?.cash_expense_limit ?? 100000),
   cashReopenHours: Number(s?.cash_reopen_hours ?? 12),
+  dayCutoffHour: Number(s?.day_cutoff_hour ?? 6),
   deliveryFeeDefault: Number(s?.delivery_fee_default ?? 0),
   courierShareMode: s?.courier_share_mode || 'todo',
   deliveryTransferTiming: s?.delivery_transfer_timing || 'antes',
@@ -88,6 +89,7 @@ router.put('/configuracion', auth(ADMIN), h(async (req, res) => {
   if (!Number.isFinite(tip) || tip < 0 || tip > 100) errors.push('La propina debe estar entre 0 % y 100 %')
   if (b.cashExpenseLimit !== undefined && b.cashExpenseLimit !== '' && !(Number(b.cashExpenseLimit) >= 0)) errors.push('El tope de gastos de caja no es válido')
   if (b.cashReopenHours !== undefined && b.cashReopenHours !== '' && !(Number(b.cashReopenHours) >= 0 && Number(b.cashReopenHours) <= 72)) errors.push('Las horas para reabrir un turno deben estar entre 0 y 72')
+  if (b.dayCutoffHour !== undefined && b.dayCutoffHour !== '' && !(Number.isInteger(Number(b.dayCutoffHour)) && Number(b.dayCutoffHour) >= 0 && Number(b.dayCutoffHour) <= 12)) errors.push('La hora en que empieza la jornada debe estar entre 0 y 12 (a. m.)')
   if (b.expiryAlertDays !== undefined && b.expiryAlertDays !== '' && !(Number.isInteger(Number(b.expiryAlertDays)) && Number(b.expiryAlertDays) >= 1 && Number(b.expiryAlertDays) <= 365)) errors.push('Los días de aviso de vencimiento deben estar entre 1 y 365')
   if (b.qrOrdering !== undefined && !['llamar', 'confirmar', 'directo'].includes(b.qrOrdering)) errors.push('Opción de pedidos por QR no válida')
   if (errors.length) return fail(res, errors.join('. '), 400)
@@ -103,6 +105,7 @@ router.put('/configuracion', auth(ADMIN), h(async (req, res) => {
     ...(b.qrOrdering ? { qr_ordering: b.qrOrdering } : {}),
     ...(b.cashExpenseLimit !== undefined && b.cashExpenseLimit !== '' ? { cash_expense_limit: Math.round(Number(b.cashExpenseLimit)) } : {}),
     ...(b.cashReopenHours !== undefined && b.cashReopenHours !== '' ? { cash_reopen_hours: Math.round(Number(b.cashReopenHours)) } : {}),
+    ...(b.dayCutoffHour !== undefined && b.dayCutoffHour !== '' ? { day_cutoff_hour: Number(b.dayCutoffHour) } : {}),
     ...(b.deliveryTransferTiming === 'antes' || b.deliveryTransferTiming === 'al_entregar' ? { delivery_transfer_timing: b.deliveryTransferTiming } : {}),
     ...(b.courierShareMode === 'todo' || b.courierShareMode === 'porcentaje' ? { courier_share_mode: b.courierShareMode } : {}),
     ...(b.courierSharePercent !== undefined && b.courierSharePercent !== '' && Number(b.courierSharePercent) >= 0 && Number(b.courierSharePercent) <= 100 ? { courier_share_percent: Number(b.courierSharePercent) } : {}),

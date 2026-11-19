@@ -10,7 +10,7 @@ const supabase = require('../db')
 const { h, fail, clean, todayBogota } = require('../http')
 const { auth, STAFF } = require('../auth')
 const { audit } = require('../audit')
-const { can, guard, workSite, sameSite, fullName, PAY_METHODS, money, isMoney } = require('../ops')
+const { can, guard, workSite, sameSite, fullName, PAY_METHODS, money, isMoney, itemsBlock } = require('../ops')
 const { dayStart } = require('./logbook')
 
 const router = express.Router()
@@ -31,7 +31,9 @@ const shareRule = async () => {
 // El empleado que solo es domiciliario ve únicamente lo suyo.
 const onlyCourier = (user) => !can(user, ...SELLERS)
 
-const COLUMNS = 'id, number, site_id, status, type, customer_name, customer_phone, customer_address, note, delivery_pay_method, delivery_cash_with, total, tip, delivery_fee, paid, opened_at, closed_at, session_id, courier_id, delivery_status, dispatched_at, arrived_at, courier:users!orders_courier_id_fkey(id, name, last_name), customer:customers(id, zone), items:order_items(name, quantity, status)'
+const MIN_TRIP_MS = 60e3
+const FLOW = { por_despachar: ['en_camino'], en_camino: ['entregado', 'por_despachar'], entregado: ['en_camino'] }
+const COLUMNS = 'id, number, site_id, status, type, customer_name, customer_phone, customer_address, note, delivery_pay_method, delivery_cash_with, total, tip, delivery_fee, paid, opened_at, closed_at, session_id, courier_id, delivery_status, dispatched_at, arrived_at, courier:users!orders_courier_id_fkey(id, name, last_name), customer:customers(id, zone), items:order_items(name, quantity, status, area)'
 const deliveryDTO = (o, rule) => ({
   id: o.id, number: o.number, siteId: o.site_id, status: o.status, customerName: o.customer_name, customerPhone: o.customer_phone, address: o.customer_address, note: o.note, customerId: o.customer?.id ?? null, zone: o.customer?.zone ?? null,
   payMethod: o.delivery_pay_method || null, cashWith: o.delivery_cash_with === null ? null : Number(o.delivery_cash_with),
@@ -41,7 +43,9 @@ const deliveryDTO = (o, rule) => ({
   courier: o.courier ? { id: o.courier.id, name: fullName(o.courier) } : null, deliveryStatus: o.delivery_status || 'por_despachar', deliveryStatusLabel: STATUS[o.delivery_status || 'por_despachar'],
   openedAt: o.opened_at, closedAt: o.closed_at, dispatchedAt: o.dispatched_at, arrivedAt: o.arrived_at,
   minutes: o.dispatched_at && o.arrived_at ? Math.max(0, Math.round((new Date(o.arrived_at) - new Date(o.dispatched_at)) / 60000)) : null,
-  items: (o.items || []).filter((i) => i.status !== 'anulado').map((i) => ({ name: i.name, quantity: Number(i.quantity) }))
+  items: (o.items || []).filter((i) => i.status !== 'anulado').map((i) => ({ name: i.name, quantity: Number(i.quantity) })),
+  // Por qué todavía no puede salir (sin productos o comandas sin entregar); null si ya puede.
+  dispatchBlock: (o.delivery_status || 'por_despachar') === 'por_despachar' ? itemsBlock(o.number, o.items) : null
 })
 // Totales de un grupo de domicilios: lo que se cobró de domicilio, lo que le toca y las propinas.
 const totals = (list) => {
@@ -107,27 +111,49 @@ router.post('/domicilios/:id/asignar', auth(STAFF), guard(...SELLERS), h(async (
   res.send({ ok: true })
 }))
 
+// Ciclo del domicilio (TD-012): Por despachar → En camino → Entregado, sin saltarse pasos.
+// · Sale solo si tiene productos, si las comandas ya lo entregaron y si tiene domiciliario.
+// · "Entregado" lo marca solo el domiciliario asignado, y no en el mismo momento en que sale.
 router.post('/domicilios/:id/estado', auth(STAFF), guard(...SELLERS, 'domiciliario'), h(async (req, res) => {
   const o = await loadDelivery(req, res)
   if (!o) return
   const status = req.body?.status
   if (!STATUS[status]) return fail(res, 'Estado no válido', 400)
-  // Con otro medio de pago y "se cobra antes de enviar", el pedido no sale sin estar pagado.
-  if (status !== 'por_despachar' && o.status === 'abierto' && o.delivery_pay_method && o.delivery_pay_method !== 'efectivo' && (await shareRule()).timing === 'antes') {
-    return fail(res, `El ${o.number} se paga por ${(PAY_METHODS[o.delivery_pay_method] || o.delivery_pay_method).toLowerCase()} antes de enviarlo. Cóbralo en caja y luego despáchalo.`, 409)
+  const current = o.delivery_status || 'por_despachar'
+  if (status === current) return fail(res, `El ${o.number} ya está ${STATUS[status].toLowerCase()}`, 409)
+  if (!FLOW[current].includes(status)) {
+    return fail(res, status === 'entregado' ? `El ${o.number} todavía no ha salido. Primero marca "Salí con el pedido".` : 'Ese cambio de estado no es válido', 409)
   }
+  const isCourier = (req.user.positions || []).includes('domiciliario') && req.user.role === 'empleado'
   const mine = onlyCourier(req.user)
   if (mine && o.courier_id && o.courier_id !== req.user.id) return fail(res, 'Este domicilio lo tiene otro domiciliario', 403)
+  // Entregarlo (o deshacer la entrega) es solo del domiciliario asignado.
+  if ((status === 'entregado' || current === 'entregado') && !(isCourier && o.courier_id === req.user.id)) {
+    return fail(res, o.courier_id ? 'Solo el domiciliario asignado puede marcarlo entregado.' : 'El domicilio no tiene domiciliario asignado.', 403)
+  }
+  if (status === 'en_camino' && current === 'por_despachar') {
+    // Con otro medio de pago y "se cobra antes de enviar", el pedido no sale sin estar pagado.
+    if (o.status === 'abierto' && o.delivery_pay_method && o.delivery_pay_method !== 'efectivo' && (await shareRule()).timing === 'antes') {
+      return fail(res, `El ${o.number} se paga por ${(PAY_METHODS[o.delivery_pay_method] || o.delivery_pay_method).toLowerCase()} antes de enviarlo. Cóbralo en caja y luego despáchalo.`, 409)
+    }
+    if (!o.courier_id && !isCourier) return fail(res, `Asígnale un domiciliario al ${o.number} antes de despacharlo.`, 409)
+    const { data: items } = await supabase.from('order_items').select('status, area').eq('order_id', o.id)
+    const block = itemsBlock(o.number, items)
+    if (block) return fail(res, block, 409)
+  }
+  if (status === 'entregado' && o.dispatched_at && Date.now() - new Date(o.dispatched_at).getTime() < MIN_TRIP_MS) {
+    return fail(res, `El ${o.number} acaba de salir. Márcalo entregado cuando llegues donde el cliente.`, 409)
+  }
   const patch = { delivery_status: status }
   // El domiciliario que sale con un domicilio sin asignar lo toma.
-  if (mine && !o.courier_id) patch.courier_id = req.user.id
+  if (isCourier && !o.courier_id) patch.courier_id = req.user.id
   const now = new Date().toISOString()
   if (status === 'por_despachar') { patch.dispatched_at = null; patch.arrived_at = null }
-  if (status === 'en_camino') { patch.dispatched_at = now; patch.arrived_at = null }
-  if (status === 'entregado') { patch.arrived_at = now; if (!o.dispatched_at) patch.dispatched_at = now }
+  if (status === 'en_camino') { if (current === 'por_despachar') patch.dispatched_at = now; patch.arrived_at = null }
+  if (status === 'entregado') patch.arrived_at = now
   const { error } = await supabase.from('orders').update(patch).eq('id', o.id)
   if (error) throw error
-  await audit(req, 'domicilio_' + status, 'pedido', o.id, { number: o.number })
+  await audit(req, 'domicilio_' + status, 'pedido', o.id, { number: o.number, from: current })
   res.send({ ok: true })
 }))
 
@@ -298,3 +324,5 @@ router.get('/caja/turnos/:id/domiciliarios', auth(STAFF), guard('cajero'), h(asy
 
 module.exports = router
 module.exports.courierSettlement = courierSettlement
+
+module.exports.FLOW = FLOW

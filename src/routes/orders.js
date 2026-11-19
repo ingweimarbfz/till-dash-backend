@@ -14,7 +14,7 @@ const { audit } = require('../audit')
 const { bestFor, loadActive } = require('../promo')
 const { checkLowStock } = require('../stock')
 const { notify, courtesyMessage, voidMessage } = require('../notify')
-const { cashOpenAt, NO_CASH, can, guard, workSite, sameSite, dbError, money, isMoney, PAY_METHODS, fullName } = require('../ops')
+const { cashOpenAt, NO_CASH, can, guard, workSite, sameSite, dbError, money, isMoney, PAY_METHODS, fullName, itemsBlock } = require('../ops')
 const { qty } = require('./inventory')
 const plan = require('../plan')
 const { customerFromBody, createCustomer } = require('./customers')
@@ -50,7 +50,8 @@ const orderDTO = (o) => ({
   discountTotal: Number(o.discount_total), tip: Number(o.tip), deliveryFee: Number(o.delivery_fee || 0), total: Number(o.total), paid: Number(o.paid),
   courier: o.courier ? { id: o.courier.id, name: fullName(o.courier) } : null, deliveryStatus: o.delivery_status || null, deliveryPayMethod: o.delivery_pay_method || null, deliveryCashWith: o.delivery_cash_with === null || o.delivery_cash_with === undefined ? null : Number(o.delivery_cash_with), dispatchedAt: o.dispatched_at || null, arrivedAt: o.arrived_at || null,
   billRequestedAt: o.bill_requested_at, voidReason: o.void_reason, openedAt: o.opened_at, closedAt: o.closed_at,
-  items: o.items ? o.items.sort((a, b) => a.id - b.id).map(itemDTO) : undefined
+  items: o.items ? o.items.sort((a, b) => a.id - b.id).map(itemDTO) : undefined,
+  dispatchBlock: o.type === 'domicilio' && o.items && (o.delivery_status || 'por_despachar') === 'por_despachar' ? itemsBlock(o.number, o.items) : null
 })
 
 // Alias temporal de la mesa: texto corto, se borra al cerrar el pedido.

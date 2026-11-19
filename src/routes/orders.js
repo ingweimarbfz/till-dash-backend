@@ -18,6 +18,7 @@ const { cashOpenAt, NO_CASH, can, guard, workSite, sameSite, dbError, money, isM
 const { qty } = require('./inventory')
 const plan = require('../plan')
 const { customerFromBody, createCustomer } = require('./customers')
+const { validateSplit } = require('../split')
 
 const router = express.Router()
 
@@ -49,7 +50,7 @@ const orderDTO = (o) => ({
   discount: o.discount_type ? { id: o.discount_id, name: o.discount_name, type: o.discount_type, value: Number(o.discount_value), reason: o.discount_reason } : null,
   discountTotal: Number(o.discount_total), tip: Number(o.tip), deliveryFee: Number(o.delivery_fee || 0), total: Number(o.total), paid: Number(o.paid),
   courier: o.courier ? { id: o.courier.id, name: fullName(o.courier) } : null, deliveryStatus: o.delivery_status || null, deliveryPayMethod: o.delivery_pay_method || null, deliveryCashWith: o.delivery_cash_with === null || o.delivery_cash_with === undefined ? null : Number(o.delivery_cash_with), dispatchedAt: o.dispatched_at || null, arrivedAt: o.arrived_at || null,
-  billRequestedAt: o.bill_requested_at, voidReason: o.void_reason, openedAt: o.opened_at, closedAt: o.closed_at,
+  split: o.split || null, billRequestedAt: o.bill_requested_at, voidReason: o.void_reason, openedAt: o.opened_at, closedAt: o.closed_at,
   items: o.items ? o.items.sort((a, b) => a.id - b.id).map(itemDTO) : undefined
 })
 
@@ -95,7 +96,7 @@ router.get('/pedidos/:id', auth(STAFF), h(async (req, res) => {
   ])
   res.send({
     ...orderDTO(o),
-    payments: (pays || []).map((p) => ({ id: p.id, method: p.method, methodLabel: PAY_METHODS[p.method], amount: Number(p.amount), received: p.received === null ? null : Number(p.received), change: p.change === null ? null : Number(p.change), reference: p.reference, user: fullName(p.user), createdAt: p.created_at })),
+    payments: (pays || []).map((p) => ({ id: p.id, method: p.method, methodLabel: PAY_METHODS[p.method], amount: Number(p.amount), received: p.received === null ? null : Number(p.received), change: p.change === null ? null : Number(p.change), reference: p.reference, payer: p.payer || null, user: fullName(p.user), createdAt: p.created_at })),
     receivables: (cxc || []).map((r) => ({ id: r.id, number: r.number, customerName: r.customer_name, amount: Number(r.amount), paid: Number(r.paid), status: r.status }))
   })
 }))
@@ -361,6 +362,16 @@ const validatePayments = (payments) => {
   return null
 }
 
+// Guarda el reparto en el pedido y el pagador de cada pago (se insertaron en el mismo orden). Si falla, el cobro ya quedó hecho.
+const saveSplit = async (orderId, { split, payers }) => {
+  try {
+    const { error } = await supabase.from('orders').update({ split }).eq('id', orderId)
+    if (error) throw error
+    const { data: rows } = await supabase.from('order_payments').select('id').eq('order_id', orderId).order('id')
+    await Promise.all((rows || []).slice(-payers.length).map((r, n) => supabase.from('order_payments').update({ payer: payers[n] }).eq('id', r.id)))
+  } catch (e) { console.error('[cuenta dividida]', e.message) }
+}
+
 router.post('/pedidos/:id/cobrar', auth(STAFF), guard('cajero'), h(async (req, res) => {
   const o = await orderFor(req, res)
   if (!o) return
@@ -386,6 +397,13 @@ router.post('/pedidos/:id/cobrar', auth(STAFF), guard('cajero'), h(async (req, r
     }
   }
   const payments = b.payments.map((p) => ({ method: p.method, amount: money(p.amount), received: p.method === 'efectivo' && isMoney(p.received) && p.received !== '' ? money(p.received) : null, reference: clean(p.reference) }))
+  // Cuenta dividida entre personas (TD-014): cada pago dice de quién es y las partes deben cuadrar.
+  let split = null
+  if (b.split) {
+    const r = validateSplit(b.split, b.payments, o)
+    if (r.error) return fail(res, r.error, 400)
+    split = r
+  }
   const { data, error } = await supabase.rpc('charge_order', {
     p: {
       org_id: req.user.org_id, order_id: o.id, session_id: session?.id ?? null, user_id: req.user.id, tip: money(b.tip), discount, payments,
@@ -394,7 +412,8 @@ router.post('/pedidos/:id/cobrar', auth(STAFF), guard('cajero'), h(async (req, r
     }
   })
   if (error) return dbError(res, error)
-  await audit(req, 'cobrar', 'pedido', o.id, { number: o.number, total: Number(data.total), tip: money(b.tip), discount: discount?.name ?? null, methods: payments.map((p) => p.method), session: session?.id ?? null, deliveryFee: Number(data.deliveryFee || 0) })
+  if (split) await saveSplit(o.id, split)
+  await audit(req, 'cobrar', 'pedido', o.id, { number: o.number, total: Number(data.total), tip: money(b.tip), discount: discount?.name ?? null, methods: payments.map((p) => p.method), session: session?.id ?? null, deliveryFee: Number(data.deliveryFee || 0), ...(split ? { split: split.split.label, persons: split.split.persons.map((p) => `${p.name}: ${p.amount}`) } : {}) })
   res.send({ ...orderDTO(await loadOrder(o.id)), change: Number(data.change || 0), receivable: data.receivable })
 }))
 

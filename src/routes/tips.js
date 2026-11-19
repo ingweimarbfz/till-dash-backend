@@ -163,7 +163,7 @@ router.post('/personal/turnos', auth(ADMIN), payGuard, h(async (req, res) => {
   const site = await workSite(req, b.siteId)
   const t = cleanShift(b)
   if (t.error) return fail(res, t.error, 400)
-  const { data: emp } = await supabase.from('users').select('id, name, last_name, site_id, active, role, extra_roles, hour_rate, overtime_rate').eq('id', t.userId).maybeSingle()
+  const { data: emp } = await supabase.from('users').select('id, name, last_name, site_id, active, role, extra_roles, hour_rate, overtime_rate').eq('id', t.userId).eq('org_id', req.user.org_id).maybeSingle()
   if (!emp || !emp.active) return fail(res, 'Empleado no encontrado', 404)
   if (emp.site_id && emp.site_id !== site) return fail(res, 'El empleado es de otra sucursal', 400)
   const rate = t.fixed ? null : Number(emp.hour_rate) || null
@@ -171,7 +171,7 @@ router.post('/personal/turnos', auth(ADMIN), payGuard, h(async (req, res) => {
   const amount = t.fixed ? t.amount : Math.round((t.hours || 0) * (rate || 0) + (t.extraHours || 0) * (extraRate || 0))
   if (!(amount > 0)) return fail(res, t.fixed ? 'Escribe el valor del turno' : 'El empleado no tiene valor de la hora: usa valor fijo o configúralo en Usuarios', 400)
   const { data, error } = await supabase.from('staff_earnings').insert({
-    site_id: site, user_id: emp.id, kind: 'turno', hours: t.hours, rate, extra_hours: t.fixed ? null : t.extraHours, extra_rate: extraRate,
+    org_id: req.user.org_id, site_id: site, user_id: emp.id, kind: 'turno', hours: t.hours, rate, extra_hours: t.fixed ? null : t.extraHours, extra_rate: extraRate,
     fixed: t.fixed, amount, note: `Turno del ${t.date}${t.note ? ` · ${t.note}` : ''}`, created_by: req.user.id
   }).select(EARNING_COLUMNS).single()
   if (error) return dbError(res, error)

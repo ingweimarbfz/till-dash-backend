@@ -253,13 +253,15 @@ router.get('/domicilios/cuenta', auth(STAFF), guard(...SELLERS, 'domiciliario'),
   if (!courierId) return fail(res, 'Elige el domiciliario', 400)
   const to = DAY.test(req.query.hasta || '') ? req.query.hasta : todayBogota()
   const from = DAY.test(req.query.desde || '') ? req.query.desde : new Date(new Date(`${to}T12:00:00-05:00`).getTime() - 29 * 864e5).toISOString().slice(0, 10)
-  const [{ data: orders, error }, { data: payouts }, { data: u }, rule] = await Promise.all([
+  const [{ data: orders, error }, { data: payouts }, { data: u }, rule, { data: tipPays }] = await Promise.all([
     supabase.from('orders').select('id, number, status, total, tip, delivery_fee, closed_at, opened_at, session_id, delivery_status, dispatched_at, arrived_at, session:cash_sessions(status)')
       .eq('type', 'domicilio').eq('courier_id', courierId).neq('status', 'anulado').gte('opened_at', dayStart(from)).lt('opened_at', nextDay(to)).order('opened_at'),
     supabase.from('courier_payouts').select('id, amount, deliveries, fees, share, tips, created_at, session:cash_sessions(number, register:cash_registers(name))')
       .eq('user_id', courierId).gte('created_at', dayStart(from)).lt('created_at', nextDay(to)).order('created_at', { ascending: false }),
     supabase.from('users').select('id, name, last_name, site_id').eq('id', courierId).maybeSingle(),
-    shareRule()
+    shareRule(),
+    // Sus propinas se le pagan en Caja → Propinas (TD-020), no en el cierre.
+    supabase.from('tip_payouts').select('amount').eq('user_id', courierId).gte('created_at', dayStart(from)).lt('created_at', nextDay(to)).then((r) => (r.error ? { data: [] } : r))
   ])
   if (error) throw error
   if (!u || (!mine && !sameSite(req, u.site_id) && u.site_id)) return fail(res, 'Domiciliario no encontrado', 404)
@@ -274,14 +276,14 @@ router.get('/domicilios/cuenta', auth(STAFF), guard(...SELLERS, 'domiciliario'),
     if (o.status !== 'cobrado') continue
     const share = rule.of(o.delivery_fee)
     d.fees += Number(o.delivery_fee || 0); d.share += share; d.tips += Number(o.tip)
-    if (o.session?.status === 'abierta') pending += share + Number(o.tip)
+    if (o.session?.status === 'abierta') pending += share
   }
   const rows = Object.values(days).sort((a, b) => b.date.localeCompare(a.date)).map(({ minutes, ...d }) => ({ ...d, earned: d.share + d.tips, avgMinutes: minutes.length ? Math.round(minutes.reduce((a, x) => a + x, 0) / minutes.length) : null }))
   const sum = (k) => rows.reduce((a, r) => a + r[k], 0)
   const paid = (payouts || []).reduce((a, p) => a + Number(p.amount), 0)
   res.send({
     courier: { id: u.id, name: fullName(u) }, from, to, rule: { mode: rule.mode, percent: rule.percent },
-    totals: { deliveries: sum('deliveries'), fees: sum('fees'), share: sum('share'), tips: sum('tips'), earned: sum('earned'), paid, pending },
+    totals: { deliveries: sum('deliveries'), fees: sum('fees'), share: sum('share'), tips: sum('tips'), earned: sum('earned'), paid, pending, tipsPaid: (tipPays || []).reduce((a, t) => a + Number(t.amount), 0) },
     days: rows,
     payouts: (payouts || []).map((p) => ({ id: p.id, amount: Number(p.amount), deliveries: p.deliveries, fees: Number(p.fees), share: Number(p.share), tips: Number(p.tips), session: p.session?.number ?? null, register: p.session?.register?.name ?? null, createdAt: p.created_at }))
   })
@@ -300,7 +302,8 @@ const courierSettlement = async (sessionId) => {
     const c = (m[o.courier_id] = m[o.courier_id] || { userId: o.courier_id, name: fullName(o.courier), deliveries: 0, fees: 0, share: 0, tips: 0, orders: [] })
     c.deliveries++; c.fees += Number(o.delivery_fee || 0); c.share += rule.of(o.delivery_fee); c.tips += Number(o.tip); c.orders.push(o.number)
   }
-  const rows = Object.values(m).map((c) => ({ ...c, suggested: c.share + c.tips })).sort((a, b) => a.name.localeCompare(b.name))
+  // Las propinas (tips) se muestran pero no se pagan en el cierre: van a Caja → Propinas (TD-020).
+  const rows = Object.values(m).map((c) => ({ ...c, suggested: c.share })).sort((a, b) => a.name.localeCompare(b.name))
   return { rule: { mode: rule.mode, percent: rule.percent }, rows, total: rows.reduce((a, r) => a + r.suggested, 0), businessShare: rows.reduce((a, r) => a + r.fees - r.share, 0) }
 }
 

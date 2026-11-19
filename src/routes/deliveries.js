@@ -101,6 +101,10 @@ router.post('/domicilios/:id/asignar', auth(STAFF), guard(...SELLERS), h(async (
   const o = await loadDelivery(req, res)
   if (!o) return
   const courierId = Number(req.body?.courierId) || null
+  // TD-012: el domiciliario no se quita, y después de que sale ya no se cambia.
+  // Sí se puede asignar a un domicilio viejo que quedó sin domiciliario.
+  if (!courierId) return fail(res, o.courier_id ? 'El domiciliario no se puede quitar; si hace falta, cámbialo por otro antes de que salga.' : 'Elige un domiciliario', 400)
+  if (o.courier_id && o.courier_id !== courierId && (o.delivery_status || 'por_despachar') !== 'por_despachar') return fail(res, `El ${o.number} ya salió con su domiciliario; no se puede cambiar.`, 409)
   if (courierId) {
     const { data: u } = await supabase.from('users').select('id, active, positions').eq('id', courierId).maybeSingle()
     if (!u || !u.active || !(u.positions || []).includes('domiciliario')) return fail(res, 'Elige un domiciliario activo', 400)

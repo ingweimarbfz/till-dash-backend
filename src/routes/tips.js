@@ -101,12 +101,14 @@ const EARNING_COLUMNS = '*, user:users!staff_earnings_user_id_fkey(name, last_na
 router.get('/personal/pagos', auth(ADMIN), payGuard, h(async (req, res) => {
   const site = await workSite(req, req.query.sede)
   const admin = ADMIN.includes(req.user.role)
-  const [{ data: pending, error }, { data: paid }, { data: payrollUsers }, { data: sessions }, fund] = await Promise.all([
+  const [{ data: pending, error }, { data: paid }, { data: payrollUsers }, { data: sessions }, fund, { data: crew }] = await Promise.all([
     supabase.from('staff_earnings').select(EARNING_COLUMNS).eq('site_id', site).eq('status', 'pendiente').order('created_at'),
     supabase.from('staff_earnings').select(EARNING_COLUMNS).eq('site_id', site).eq('status', 'pagado').order('paid_at', { ascending: false }).limit(200),
     admin ? supabase.from('users').select('id, name, last_name, positions, site_id, salary, pay_period').eq('active', true).eq('pay_mode', 'nomina').order('name') : { data: [] },
     supabase.from('cash_sessions').select('id, number, register:cash_registers(name)').eq('site_id', site).eq('status', 'abierta').order('opened_at'),
-    fundOf(req, site)
+    fundOf(req, site),
+    // Para registrar a mano un turno que no se pagó en el cierre.
+    supabase.from('users').select('id, name, last_name, site_id, pay_mode, hour_rate, overtime_rate').eq('active', true).in('role', ['empleado', 'admin']).order('name')
   ])
   if (error) throw error
   const team = (payrollUsers || []).filter((u) => !u.site_id || u.site_id === site)
@@ -127,7 +129,8 @@ router.get('/personal/pagos', auth(ADMIN), payGuard, h(async (req, res) => {
         due, last: mine[0] ? { from: mine[0].period_from, to: mine[0].period_to, amount: Number(mine[0].amount), paidAt: mine[0].paid_at } : null
       }
     }),
-    history: (paid || []).map(earningDTO)
+    history: (paid || []).map(earningDTO),
+    crew: (crew || []).filter((u) => !u.site_id || u.site_id === site).map((u) => ({ id: u.id, name: fullName(u), payMode: u.pay_mode || 'ninguno', hourRate: Number(u.hour_rate || 0), overtimeRate: Number(u.overtime_rate || 0) }))
   })
 }))
 

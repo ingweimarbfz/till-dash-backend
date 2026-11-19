@@ -66,8 +66,33 @@ test('pagos al personal: validación', () => {
   assert.deepEqual(cleanEarnings([3, '3', 'x', -1, 7]), [3, 7])
   assert.deepEqual(cleanPayroll([{ userId: 2, amount: '750000', from: '2026-11-01', to: '2026-11-15' }]).payroll, [{ user_id: 2, amount: 750000, period_from: '2026-11-01', period_to: '2026-11-15' }])
   assert.ok(cleanPayroll([{ userId: 2, amount: 1, from: '2026-11-15', to: '2026-11-01' }]).error)
-  assert.deepEqual(payFrom({ payMode: 'turno', hourRate: '8000.4', overtimeRate: 10000, salary: 9 }), { pay_mode: 'turno', hour_rate: 8000, overtime_rate: 10000, salary: 0, pay_period: 'mensual' })
-  assert.deepEqual(payFrom({ payMode: 'nomina', salary: 1500000, payPeriod: 'quincenal' }), { pay_mode: 'nomina', hour_rate: 0, overtime_rate: 0, salary: 1500000, pay_period: 'quincenal' })
+  assert.deepEqual(payFrom({ payMode: 'turno', hourRate: '8000.4', overtimeRate: 10000, salary: 9 }), { courier_pay: 'domicilios', pay_mode: 'turno', hour_rate: 8000, overtime_rate: 10000, salary: 0, pay_period: 'mensual' })
+  assert.deepEqual(payFrom({ payMode: 'nomina', salary: 1500000, payPeriod: 'quincenal' }), { courier_pay: 'domicilios', pay_mode: 'nomina', hour_rate: 0, overtime_rate: 0, salary: 1500000, pay_period: 'quincenal' })
   assert.throws(() => payFrom({ payMode: 'turno' }), /valor de la hora/)
   assert.equal(payFrom({}).pay_mode, 'ninguno')
+})
+
+const { cleanShift } = require('../src/tips')
+const { canManagePay } = require('../src/auth')
+
+test('TD-021: permiso de pagos solo para superadmin o admin asignado', () => {
+  assert.equal(canManagePay({ role: 'superadmin' }), true)
+  assert.equal(canManagePay({ role: 'admin', can_manage_pay: true }), true)
+  assert.equal(canManagePay({ role: 'admin', can_manage_pay: false }), false)
+  assert.equal(canManagePay({ role: 'empleado', can_manage_pay: true }), false)
+})
+
+test('TD-021: turno registrado a mano por horas o valor fijo', () => {
+  assert.deepEqual(cleanShift({ userId: 3, date: '2026-11-18', hours: '8', extraHours: '1,5' }), { userId: 3, fixed: false, hours: 8, extraHours: 1.5, amount: 0, date: '2026-11-18', note: null })
+  assert.equal(cleanShift({ userId: 3, date: '2026-11-18', fixed: true, amount: 50000 }).amount, 50000)
+  assert.ok(cleanShift({ userId: 3, date: '2026-11-18' }).error)
+  assert.ok(cleanShift({ userId: 3, date: '2026-11-18', fixed: true }).error)
+  assert.ok(cleanShift({ userId: 3, hours: 8 }).error)
+  assert.ok(cleanShift({ userId: 3, date: '2026-11-18', hours: 30 }).error)
+})
+
+test('TD-021: domiciliario por jornada necesita turno o nómina', () => {
+  assert.equal(payFrom({ payMode: 'turno', hourRate: 7000, courierPay: 'jornada', positions: ['domiciliario'] }).courier_pay, 'jornada')
+  assert.throws(() => payFrom({ payMode: 'ninguno', courierPay: 'jornada', positions: ['domiciliario'] }), /jornada/)
+  assert.equal(payFrom({ payMode: 'ninguno', courierPay: 'otro' }).courier_pay, 'domicilios')
 })

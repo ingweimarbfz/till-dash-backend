@@ -5,12 +5,13 @@
 //   más adelante, el reparto de propinas.
 // · Solo el superadmin crea o edita superadmins; siempre debe quedar uno activo.
 // · La contraseña inicial es el número de identificación.
+// · La forma de pago solo la ve y cambia quien tiene el permiso de pagos (superadmin o admin asignado).
 // =====================================================================
 const express = require('express')
 const bcrypt = require('bcryptjs')
 const supabase = require('../db')
 const { h, fail, clean, EMAIL_RE, PHONE_RE, DOC_RE, NAME_RE, imageError, HttpError } = require('../http')
-const { auth, ADMIN, ROLES, POSITIONS, PROFILE_ORDER, USER_COLUMNS, toUserDTO } = require('../auth')
+const { auth, ADMIN, ROLES, POSITIONS, PROFILE_ORDER, USER_COLUMNS, toUserDTO, canManagePay } = require('../auth')
 const { audit } = require('../audit')
 const plan = require('../plan')
 
@@ -50,8 +51,11 @@ const positionsFrom = (b, role, extra) => {
 
 // Forma de pago (TD-020): por turno (horas × valor de la hora), nómina (salario quincenal o mensual) o ninguna.
 const PAY_MODES = ['ninguno', 'turno', 'nomina']
-const PAY_COLUMNS = `${USER_COLUMNS}, pay_mode, hour_rate, overtime_rate, salary, pay_period`
-const withPay = (u) => ({ ...toUserDTO(u), payMode: u.pay_mode || 'ninguno', hourRate: Number(u.hour_rate || 0), overtimeRate: Number(u.overtime_rate || 0), salary: Number(u.salary || 0), payPeriod: u.pay_period || 'mensual' })
+const PAY_COLUMNS = `${USER_COLUMNS}, pay_mode, hour_rate, overtime_rate, salary, pay_period, courier_pay`
+// Los datos de pago solo los ve quien tiene el permiso de pagos (TD-021).
+const withPay = (u, show = true) => (!show ? toUserDTO(u) : { ...toUserDTO(u), payMode: u.pay_mode || 'ninguno', hourRate: Number(u.hour_rate || 0), overtimeRate: Number(u.overtime_rate || 0), salary: Number(u.salary || 0), payPeriod: u.pay_period || 'mensual', courierPay: u.courier_pay || 'domicilios' })
+// Permiso de pagos: solo el super administrador lo da, y solo a administradores.
+const payPermission = (req, b, role) => (req.user.role === 'superadmin' && b.canManagePay !== undefined ? { can_manage_pay: role === 'admin' && Boolean(b.canManagePay) } : {})
 const payFrom = (b) => {
   const mode = PAY_MODES.includes(b.payMode) ? b.payMode : 'ninguno'
   const hourRate = Math.round(Number(b.hourRate) || 0)
@@ -60,7 +64,10 @@ const payFrom = (b) => {
   if (hourRate < 0 || overtimeRate < 0 || salary < 0) throw new HttpError('Los valores de pago no pueden ser negativos')
   if (mode === 'turno' && !hourRate) throw new HttpError('Escribe el valor de la hora para pagarle por turnos')
   if (mode === 'nomina' && !salary) throw new HttpError('Escribe el salario de la quincena o del mes')
-  return { pay_mode: mode, hour_rate: mode === 'turno' ? hourRate : 0, overtime_rate: mode === 'turno' ? overtimeRate : 0, salary: mode === 'nomina' ? salary : 0, pay_period: b.payPeriod === 'quincenal' ? 'quincenal' : 'mensual' }
+  // Domiciliario por jornada (TD-021): se le paga como empleado, así que necesita turno o nómina.
+  const courierPay = b.courierPay === 'jornada' ? 'jornada' : 'domicilios'
+  if (courierPay === 'jornada' && (b.positions || []).includes('domiciliario') && mode === 'ninguno') throw new HttpError('Al domiciliario por jornada elígele pago por turno o por nómina')
+  return { courier_pay: courierPay, pay_mode: mode, hour_rate: mode === 'turno' ? hourRate : 0, overtime_rate: mode === 'turno' ? overtimeRate : 0, salary: mode === 'nomina' ? salary : 0, pay_period: b.payPeriod === 'quincenal' ? 'quincenal' : 'mensual' }
 }
 
 const dupMessage = (e) => (e?.code === '23505'
@@ -84,7 +91,7 @@ router.get('/usuarios', auth(ADMIN), h(async (req, res) => {
   res.send(data
     .filter((u) => !rol || u.role === rol || (u.extra_roles || []).includes(rol))
     .filter((u) => !cargo || (u.positions || []).includes(cargo))
-    .map(withPay))
+    .map((u) => withPay(u, canManagePay(req.user))))
 }))
 
 router.post('/usuarios', auth(ADMIN), h(async (req, res) => {
@@ -109,11 +116,12 @@ router.post('/usuarios', auth(ADMIN), h(async (req, res) => {
     avatar_url: clean(b.avatarUrl),
     password_hash: await bcrypt.hash(String(b.password || clean(b.identification)), 10),
     active: b.active !== false,
-    ...(b.payMode !== undefined ? payFrom(b) : {})
+    ...(b.payMode !== undefined && canManagePay(req.user) ? payFrom(b) : {}),
+    ...payPermission(req, b, role)
   }).select(PAY_COLUMNS).single()
   if (error) return dupMessage(error) ? fail(res, dupMessage(error), 409) : fail(res, error)
   await audit(req, 'crear', 'usuario', data.id, { role, extra, positions, username: data.username })
-  res.status(201).send(withPay(data))
+  res.status(201).send(withPay(data, canManagePay(req.user)))
 }))
 
 router.put('/usuarios/:id', auth(ADMIN), h(async (req, res) => {
@@ -145,13 +153,14 @@ router.put('/usuarios/:id', auth(ADMIN), h(async (req, res) => {
     active: b.active !== false
   }
   if (b.avatarUrl !== undefined) patch.avatar_url = clean(b.avatarUrl)
-  if (b.payMode !== undefined) Object.assign(patch, payFrom(b))
+  if (b.payMode !== undefined && canManagePay(req.user)) Object.assign(patch, payFrom(b))
+  Object.assign(patch, payPermission(req, b, role))
   if (b.resetPassword) patch.password_hash = await bcrypt.hash(String(patch.identification), 10)
   else if (b.password) patch.password_hash = await bcrypt.hash(b.password, 10)
   const { data, error } = await supabase.from('users').update(patch).eq('id', id).select(PAY_COLUMNS).single()
   if (error) return dupMessage(error) ? fail(res, dupMessage(error), 409) : fail(res, error)
   await audit(req, 'editar', 'usuario', id, { role, extra, positions, active: data.active, password: Boolean(b.resetPassword || b.password) })
-  res.send(withPay(data))
+  res.send(withPay(data, canManagePay(req.user)))
 }))
 
 module.exports = router

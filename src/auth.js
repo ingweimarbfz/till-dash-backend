@@ -18,7 +18,7 @@ const ADMIN = ['superadmin', 'admin']
 const STAFF = ['superadmin', 'admin', 'empleado']
 const ALL = ROLES
 
-const USER_COLUMNS = 'id, org_id, site_id, identification, name, last_name, username, email, phone, role, extra_roles, positions, avatar_url, active, last_login_at, created_at, site:sites(id, name, city)'
+const USER_COLUMNS = 'id, org_id, site_id, identification, name, last_name, username, email, phone, role, extra_roles, positions, can_manage_pay, avatar_url, active, last_login_at, created_at, site:sites(id, name, city)'
 
 // Perfiles con los que puede entrar un usuario: el principal y los adicionales (como en QuontUp360).
 const PROFILE_ORDER = ['superadmin', 'admin', 'empleado']
@@ -28,6 +28,9 @@ const profilesOf = (u) => {
   const set = new Set([base, ...(u.extra_roles || [])])
   return PROFILE_ORDER.filter((r) => set.has(r))
 }
+
+// Pagos asignados al personal (TD-021): el super administrador, o el administrador al que él se lo asigne.
+const canManagePay = (u) => u.role === 'superadmin' || (u.role === 'admin' && Boolean(u.can_manage_pay))
 
 const toUserDTO = (u) => ({
   id: u.id,
@@ -44,6 +47,7 @@ const toUserDTO = (u) => ({
   primaryRole: u.primary_role || u.role,
   extraRoles: u.extra_roles || [],
   positions: u.positions || [],
+  canManagePay: canManagePay(u),
   profiles: profilesOf(u),
   avatarUrl: u.avatar_url,
   active: u.active,
@@ -90,4 +94,4 @@ const auth = (roles = ALL) => async (req, res, next) => {
   }
 }
 
-module.exports = { ROLES, ROLE_LABELS, POSITIONS, POSITION_LABELS, PROFILE_ORDER, OWNER, ADMIN, STAFF, ALL, USER_COLUMNS, profilesOf, toUserDTO, signToken, auth }
+module.exports = { ROLES, ROLE_LABELS, POSITIONS, POSITION_LABELS, PROFILE_ORDER, OWNER, ADMIN, STAFF, ALL, USER_COLUMNS, profilesOf, toUserDTO, canManagePay, signToken, auth }

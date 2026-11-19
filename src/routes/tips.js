@@ -9,12 +9,15 @@
 const express = require('express')
 const supabase = require('../db')
 const { h, fail, clean, todayBogota } = require('../http')
-const { auth, ADMIN, STAFF } = require('../auth')
+const { auth, ADMIN, STAFF, canManagePay } = require('../auth')
 const { audit } = require('../audit')
 const { guard, workSite, dbError, fullName } = require('../ops')
-const { tipBalance, cleanPayments, payoutDTO, TIP_SOURCES, payrollDue, cleanEarnings, cleanPayroll, earningDTO } = require('../tips')
+const { tipBalance, cleanPayments, payoutDTO, TIP_SOURCES, payrollDue, cleanEarnings, cleanPayroll, earningDTO, cleanShift } = require('../tips')
 
 const router = express.Router()
+
+// Pagos asignados (turnos, domicilios pendientes y nómina): superadmin o admin con el permiso (TD-021).
+const payGuard = (req, res, next) => (canManagePay(req.user) ? next() : fail(res, 'Solo el super administrador o un administrador con el permiso de pagos puede ver los pagos al personal', 403))
 
 // Cajas abiertas de la sucursal con su efectivo (para pagar desde la caja).
 const withCash = (sessions) => Promise.all((sessions || []).map(async (s) => {
@@ -95,15 +98,17 @@ router.post('/propinas/pagos', auth(STAFF), guard('cajero'), h(async (req, res) 
 // · Nómina: empleados con pago por nómina, con el periodo sugerido (quincena o mes) y lo ya pagado.
 const EARNING_COLUMNS = '*, user:users!staff_earnings_user_id_fkey(name, last_name), payer:users!staff_earnings_paid_by_fkey(name, last_name), session:cash_sessions!staff_earnings_session_id_fkey(number)'
 
-router.get('/personal/pagos', auth(STAFF), guard('cajero'), h(async (req, res) => {
+router.get('/personal/pagos', auth(ADMIN), payGuard, h(async (req, res) => {
   const site = await workSite(req, req.query.sede)
   const admin = ADMIN.includes(req.user.role)
-  const [{ data: pending, error }, { data: paid }, { data: payrollUsers }, { data: sessions }, fund] = await Promise.all([
+  const [{ data: pending, error }, { data: paid }, { data: payrollUsers }, { data: sessions }, fund, { data: crew }] = await Promise.all([
     supabase.from('staff_earnings').select(EARNING_COLUMNS).eq('site_id', site).eq('status', 'pendiente').order('created_at'),
     supabase.from('staff_earnings').select(EARNING_COLUMNS).eq('site_id', site).eq('status', 'pagado').order('paid_at', { ascending: false }).limit(200),
     admin ? supabase.from('users').select('id, name, last_name, positions, site_id, salary, pay_period').eq('active', true).eq('pay_mode', 'nomina').order('name') : { data: [] },
     supabase.from('cash_sessions').select('id, number, register:cash_registers(name)').eq('site_id', site).eq('status', 'abierta').order('opened_at'),
-    fundOf(req, site)
+    fundOf(req, site),
+    // Para registrar a mano un turno que no se pagó en el cierre.
+    supabase.from('users').select('id, name, last_name, site_id, pay_mode, hour_rate, overtime_rate').eq('active', true).in('role', ['empleado', 'admin']).order('name')
   ])
   if (error) throw error
   const team = (payrollUsers || []).filter((u) => !u.site_id || u.site_id === site)
@@ -124,11 +129,12 @@ router.get('/personal/pagos', auth(STAFF), guard('cajero'), h(async (req, res) =
         due, last: mine[0] ? { from: mine[0].period_from, to: mine[0].period_to, amount: Number(mine[0].amount), paidAt: mine[0].paid_at } : null
       }
     }),
-    history: (paid || []).map(earningDTO)
+    history: (paid || []).map(earningDTO),
+    crew: (crew || []).filter((u) => !u.site_id || u.site_id === site).map((u) => ({ id: u.id, name: fullName(u), payMode: u.pay_mode || 'ninguno', hourRate: Number(u.hour_rate || 0), overtimeRate: Number(u.overtime_rate || 0) }))
   })
 }))
 
-router.post('/personal/pagos', auth(STAFF), guard('cajero'), h(async (req, res) => {
+router.post('/personal/pagos', auth(ADMIN), payGuard, h(async (req, res) => {
   const b = req.body || {}
   const site = await workSite(req, b.siteId)
   const source = ['caja', 'fondo', 'transferencia'].includes(b.source) ? b.source : null
@@ -148,6 +154,29 @@ router.post('/personal/pagos', auth(STAFF), guard('cajero'), h(async (req, res) 
   if (error) return dbError(res, error)
   await audit(req, 'pagar', 'personal', null, { number: data.number, total: Number(data.total), source, earnings: earnings.length, payroll: pr.payroll.length })
   res.status(201).send({ number: data.number, total: Number(data.total), source })
+}))
+
+// Registrar un turno que no se pagó en el cierre (por ejemplo, porque cerró la caja alguien sin el permiso).
+// Queda pendiente y se paga desde la lista de pendientes. b: {siteId, userId, date, hours, extraHours, fixed, amount, note}
+router.post('/personal/turnos', auth(ADMIN), payGuard, h(async (req, res) => {
+  const b = req.body || {}
+  const site = await workSite(req, b.siteId)
+  const t = cleanShift(b)
+  if (t.error) return fail(res, t.error, 400)
+  const { data: emp } = await supabase.from('users').select('id, name, last_name, site_id, active, role, extra_roles, hour_rate, overtime_rate').eq('id', t.userId).maybeSingle()
+  if (!emp || !emp.active) return fail(res, 'Empleado no encontrado', 404)
+  if (emp.site_id && emp.site_id !== site) return fail(res, 'El empleado es de otra sucursal', 400)
+  const rate = t.fixed ? null : Number(emp.hour_rate) || null
+  const extraRate = t.fixed || !t.extraHours ? null : Number(emp.overtime_rate) || rate
+  const amount = t.fixed ? t.amount : Math.round((t.hours || 0) * (rate || 0) + (t.extraHours || 0) * (extraRate || 0))
+  if (!(amount > 0)) return fail(res, t.fixed ? 'Escribe el valor del turno' : 'El empleado no tiene valor de la hora: usa valor fijo o configúralo en Usuarios', 400)
+  const { data, error } = await supabase.from('staff_earnings').insert({
+    site_id: site, user_id: emp.id, kind: 'turno', hours: t.hours, rate, extra_hours: t.fixed ? null : t.extraHours, extra_rate: extraRate,
+    fixed: t.fixed, amount, note: `Turno del ${t.date}${t.note ? ` · ${t.note}` : ''}`, created_by: req.user.id
+  }).select(EARNING_COLUMNS).single()
+  if (error) return dbError(res, error)
+  await audit(req, 'crear', 'pago_personal', data.id, { userId: emp.id, amount, hours: t.hours, extraHours: t.extraHours, fixed: t.fixed })
+  res.status(201).send(earningDTO(data))
 }))
 
 module.exports = router

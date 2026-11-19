@@ -32,6 +32,8 @@ const shareRule = async () => {
   const percent = mode === 'todo' ? 100 : Number(data?.courier_share_percent ?? 100)
   return { mode, percent, timing: data?.delivery_transfer_timing === 'al_entregar' ? 'al_entregar' : 'antes', of: (fee) => round((Number(fee) || 0) * percent / 100) }
 }
+// Domiciliario que se paga por jornada como empleado (TD-021): el valor de sus domicilios queda para el negocio.
+const byShift = (u) => u?.courier_pay === 'jornada'
 // El empleado que solo es domiciliario ve únicamente lo suyo.
 const onlyCourier = (user) => !can(user, ...SELLERS)
 
@@ -40,13 +42,13 @@ const MIN_TRIP_MS = 60e3
 const paysCash = (o) => !o.delivery_pay_method || o.delivery_pay_method === 'efectivo'
 const isCourierUser = (user) => (user.positions || []).includes('domiciliario') && user.role === 'empleado'
 const FLOW = { por_despachar: ['en_camino'], en_camino: ['entregado', 'por_despachar'], entregado: ['en_camino'] }
-const COLUMNS = 'id, number, site_id, status, type, customer_name, customer_phone, customer_address, note, delivery_pay_method, delivery_cash_with, total, tip, delivery_fee, paid, opened_at, closed_at, session_id, courier_id, delivery_status, dispatched_at, arrived_at, cash_received_at, cash_received_amount, cash_received_fee, courier:users!orders_courier_id_fkey(id, name, last_name), customer:customers(id, zone), items:order_items(name, quantity, status, area)'
+const COLUMNS = 'id, number, site_id, status, type, customer_name, customer_phone, customer_address, note, delivery_pay_method, delivery_cash_with, total, tip, delivery_fee, paid, opened_at, closed_at, session_id, courier_id, delivery_status, dispatched_at, arrived_at, cash_received_at, cash_received_amount, cash_received_fee, courier:users!orders_courier_id_fkey(id, name, last_name, courier_pay), customer:customers(id, zone), items:order_items(name, quantity, status, area)'
 const deliveryDTO = (o, rule) => ({
   id: o.id, number: o.number, siteId: o.site_id, status: o.status, customerName: o.customer_name, customerPhone: o.customer_phone, address: o.customer_address, note: o.note, customerId: o.customer?.id ?? null, zone: o.customer?.zone ?? null,
   payMethod: o.delivery_pay_method || null, cashWith: o.delivery_cash_with === null ? null : Number(o.delivery_cash_with),
   change: o.delivery_cash_with !== null && o.delivery_pay_method === 'efectivo' ? Math.max(0, Number(o.delivery_cash_with) - Number(o.total)) : null,
   mustPayFirst: Boolean(o.delivery_pay_method && o.delivery_pay_method !== 'efectivo' && o.status === 'abierto' && rule.timing === 'antes'),
-  total: Number(o.total), tip: Number(o.tip), deliveryFee: Number(o.delivery_fee || 0), share: rule.of(o.delivery_fee), paid: o.status === 'cobrado',
+  total: Number(o.total), tip: Number(o.tip), deliveryFee: Number(o.delivery_fee || 0), share: byShift(o.courier) ? 0 : rule.of(o.delivery_fee), paid: o.status === 'cobrado',
   courier: o.courier ? { id: o.courier.id, name: fullName(o.courier) } : null, deliveryStatus: o.delivery_status || 'por_despachar', deliveryStatusLabel: STATUS[o.delivery_status || 'por_despachar'],
   openedAt: o.opened_at, closedAt: o.closed_at, dispatchedAt: o.dispatched_at, arrivedAt: o.arrived_at,
   // TD-015: efectivo que el domiciliario dice haber recibido (falta cobrarlo en caja mientras el pedido siga abierto).
@@ -258,7 +260,7 @@ router.get('/domicilios/cuenta', auth(STAFF), guard(...SELLERS, 'domiciliario'),
       .eq('type', 'domicilio').eq('courier_id', courierId).neq('status', 'anulado').gte('opened_at', dayStart(from)).lt('opened_at', nextDay(to)).order('opened_at'),
     supabase.from('courier_payouts').select('id, amount, deliveries, fees, share, tips, created_at, session:cash_sessions(number, register:cash_registers(name))')
       .eq('user_id', courierId).gte('created_at', dayStart(from)).lt('created_at', nextDay(to)).order('created_at', { ascending: false }),
-    supabase.from('users').select('id, name, last_name, site_id').eq('id', courierId).maybeSingle(),
+    supabase.from('users').select('id, name, last_name, site_id, courier_pay').eq('id', courierId).maybeSingle(),
     shareRule(),
     // Sus propinas se le pagan en Caja → Propinas (TD-020), no en el cierre.
     supabase.from('tip_payouts').select('amount').eq('user_id', courierId).gte('created_at', dayStart(from)).lt('created_at', nextDay(to)).then((r) => (r.error ? { data: [] } : r)),
@@ -276,7 +278,7 @@ router.get('/domicilios/cuenta', auth(STAFF), guard(...SELLERS, 'domiciliario'),
     d.deliveries++
     if (o.dispatched_at && o.arrived_at) d.minutes.push((new Date(o.arrived_at) - new Date(o.dispatched_at)) / 60000)
     if (o.status !== 'cobrado') continue
-    const share = rule.of(o.delivery_fee)
+    const share = byShift(u) ? 0 : rule.of(o.delivery_fee)
     d.fees += Number(o.delivery_fee || 0); d.share += share; d.tips += Number(o.tip)
     if (o.session?.status === 'abierta') pending += share
   }
@@ -286,7 +288,7 @@ router.get('/domicilios/cuenta', auth(STAFF), guard(...SELLERS, 'domiciliario'),
   const paid = (payouts || []).reduce((a, p) => a + Number(p.amount), 0) + (owed || []).filter((e) => e.status === 'pagado' && inRange(e.paid_at)).reduce((a, e) => a + Number(e.amount), 0)
   pending += (owed || []).filter((e) => e.status === 'pendiente').reduce((a, e) => a + Number(e.amount), 0)
   res.send({
-    courier: { id: u.id, name: fullName(u) }, from, to, rule: { mode: rule.mode, percent: rule.percent },
+    courier: { id: u.id, name: fullName(u), byShift: byShift(u) }, from, to, rule: { mode: rule.mode, percent: rule.percent },
     totals: { deliveries: sum('deliveries'), fees: sum('fees'), share: sum('share'), tips: sum('tips'), earned: sum('earned'), paid, pending, tipsPaid: (tipPays || []).reduce((a, t) => a + Number(t.amount), 0) },
     days: rows,
     payouts: (payouts || []).map((p) => ({ id: p.id, amount: Number(p.amount), deliveries: p.deliveries, fees: Number(p.fees), share: Number(p.share), tips: Number(p.tips), session: p.session?.number ?? null, register: p.session?.register?.name ?? null, createdAt: p.created_at }))
@@ -297,14 +299,14 @@ router.get('/domicilios/cuenta', auth(STAFF), guard(...SELLERS, 'domiciliario'),
 // Domicilios cobrados en el turno con domiciliario asignado: su parte del valor del domicilio más las propinas.
 const courierSettlement = async (sessionId) => {
   const [{ data }, rule] = await Promise.all([
-    supabase.from('orders').select('id, number, tip, delivery_fee, courier_id, courier:users!orders_courier_id_fkey(id, name, last_name)')
+    supabase.from('orders').select('id, number, tip, delivery_fee, courier_id, courier:users!orders_courier_id_fkey(id, name, last_name, courier_pay)')
       .eq('session_id', sessionId).eq('status', 'cobrado').eq('type', 'domicilio').not('courier_id', 'is', null),
     shareRule()
   ])
   const m = {}
   for (const o of data || []) {
-    const c = (m[o.courier_id] = m[o.courier_id] || { userId: o.courier_id, name: fullName(o.courier), deliveries: 0, fees: 0, share: 0, tips: 0, orders: [] })
-    c.deliveries++; c.fees += Number(o.delivery_fee || 0); c.share += rule.of(o.delivery_fee); c.tips += Number(o.tip); c.orders.push(o.number)
+    const c = (m[o.courier_id] = m[o.courier_id] || { userId: o.courier_id, name: fullName(o.courier), byShift: byShift(o.courier), deliveries: 0, fees: 0, share: 0, tips: 0, orders: [] })
+    c.deliveries++; c.fees += Number(o.delivery_fee || 0); c.share += c.byShift ? 0 : rule.of(o.delivery_fee); c.tips += Number(o.tip); c.orders.push(o.number)
   }
   // Las propinas (tips) se muestran pero no se pagan en el cierre: van a Caja → Propinas (TD-020).
   const rows = Object.values(m).map((c) => ({ ...c, suggested: c.share })).sort((a, b) => a.name.localeCompare(b.name))

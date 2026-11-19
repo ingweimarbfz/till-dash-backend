@@ -24,3 +24,11 @@ test('catálogo por sucursal (TD-024)', () => {
   const promo = { id: 1, active: true, scope: 'todos', type: 'porcentaje', value: 10, weekdays: [] }
   assert.equal(bestFor([promo], { ...p, price: priceAt(p, 2, prices) }).price, 10800)
 })
+
+test('opciones del QR propias de la sucursal (TD-025)', () => {
+  const { ownQrOf, orderMode } = require('../src/menu')
+  const o = ownQrOf({ orderDirect: true, billView: 'raro', directCategories: ['3', 0, 'x'] })
+  assert.deepEqual(o, { callWaiter: true, requestBill: true, billView: 'completa', orderConfirm: false, orderDirect: true, directCategories: [3] })
+  assert.equal(orderMode(o), 'directo')
+  assert.equal(orderMode(ownQrOf({ callWaiter: false })), 'none')
+})

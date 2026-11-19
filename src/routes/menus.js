@@ -12,7 +12,7 @@ const { auth, ADMIN, STAFF } = require('../auth')
 const { audit } = require('../audit')
 const plan = require('../plan')
 const { currentOrg } = require('../tenant')
-const { buildMenu, menuDTO, menuAppliesAt, clock, qrOptionsOf, orderMode } = require('../menu')
+const { buildMenu, menuDTO, menuAppliesAt, clock, qrOptionsAt, ownQrOf, orderMode, QR_COLUMNS } = require('../menu')
 
 const router = express.Router()
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/
@@ -86,27 +86,51 @@ router.delete('/cartas/:id(\\d+)', auth(ADMIN), h(async (req, res) => {
 }))
 
 // ---------------------------------------------------------------- Opciones del QR
-const optionsDTO = (s) => { const o = qrOptionsOf(s); return { ...o, mode: orderMode(o) } }
+// Generales (app_settings) o de una sucursal (?sucursal= / body.siteId, TD-025). La sucursal sin opciones
+// propias usa las generales; con body.useGeneral vuelve a usarlas.
+const optionsDTO = (o) => ({ ...o, mode: orderMode(o) })
+const siteOf = async (v) => {
+  const id = Number(v) || null
+  if (!id) return { id: null }
+  const { data } = await supabase.from('sites').select('id').eq('id', id).maybeSingle()
+  return data ? { id } : { error: 'La sucursal no existe' }
+}
 router.get('/cartas/opciones', auth(STAFF), h(async (req, res) => {
-  const { data } = await supabase.from('app_settings').select('qr_ordering, qr_call_waiter, qr_request_bill, qr_bill_view, qr_order_confirm, qr_order_direct, qr_direct_categories').maybeSingle()
-  res.send({ ...optionsDTO(data), qrModule: await plan.orgHas(req.user.org_id, 'carta_qr') })
+  const site = await siteOf(req.query.sucursal)
+  if (site.error) return fail(res, site.error, 404)
+  const { data } = await supabase.from('app_settings').select(QR_COLUMNS).maybeSingle()
+  const { options, own } = await qrOptionsAt(site.id, data)
+  res.send({ ...optionsDTO(options), siteId: site.id, own, qrModule: await plan.orgHas(req.user.org_id, 'carta_qr') })
 }))
 router.put('/cartas/opciones', auth(ADMIN), h(async (req, res) => {
   const b = req.body || {}
   if (!(await plan.orgHas(req.user.org_id, 'carta_qr'))) return fail(res, 'Tu plan no incluye la carta por QR. Pide un cambio en "Mi plan".', 403)
-  const row = {
-    qr_call_waiter: b.callWaiter !== false, qr_request_bill: b.requestBill !== false,
-    qr_bill_view: ['completa', 'sin_valores', 'oculta'].includes(b.billView) ? b.billView : 'completa',
-    qr_order_confirm: Boolean(b.orderConfirm), qr_order_direct: Boolean(b.orderDirect),
-    qr_direct_categories: ids(b.directCategories)
+  const site = await siteOf(b.siteId)
+  if (site.error) return fail(res, site.error, 404)
+  const o = ownQrOf({ ...b, directCategories: ids(b.directCategories) })
+  if (site.id && b.useGeneral) {
+    const { error } = await supabase.from('sites').update({ qr_options: null }).eq('id', site.id)
+    if (error) throw error
+    await audit(req, 'editar', 'opciones_qr', site.id, { site: site.id, general: true })
+    const { options } = await qrOptionsAt(site.id)
+    return res.send({ ...optionsDTO(options), siteId: site.id, own: false, qrModule: true })
   }
-  if (row.qr_order_confirm && row.qr_order_direct && !row.qr_direct_categories.length) return fail(res, 'Con las dos formas de pedir activas, elige qué categorías van directo a cocina y bar', 400)
-  // Compatibilidad con la opción anterior (una sola forma).
-  row.qr_ordering = row.qr_order_direct && !row.qr_order_confirm ? 'directo' : row.qr_order_confirm ? 'confirmar' : 'llamar'
-  const { data, error } = await supabase.from('app_settings').update(row).eq('org_id', currentOrg()).select('qr_ordering, qr_call_waiter, qr_request_bill, qr_bill_view, qr_order_confirm, qr_order_direct, qr_direct_categories').single()
-  if (error) throw error
-  await audit(req, 'editar', 'opciones_qr', null, { callWaiter: row.qr_call_waiter, requestBill: row.qr_request_bill, billView: row.qr_bill_view, confirm: row.qr_order_confirm, direct: row.qr_order_direct })
-  res.send({ ...optionsDTO(data), qrModule: true })
+  if (o.orderConfirm && o.orderDirect && !o.directCategories.length) return fail(res, 'Con las dos formas de pedir activas, elige qué categorías van directo a cocina y bar', 400)
+  if (site.id) {
+    const { error } = await supabase.from('sites').update({ qr_options: o }).eq('id', site.id)
+    if (error) throw error
+  } else {
+    const row = {
+      qr_call_waiter: o.callWaiter, qr_request_bill: o.requestBill, qr_bill_view: o.billView,
+      qr_order_confirm: o.orderConfirm, qr_order_direct: o.orderDirect, qr_direct_categories: o.directCategories,
+      // Compatibilidad con la opción anterior (una sola forma).
+      qr_ordering: o.orderDirect && !o.orderConfirm ? 'directo' : o.orderConfirm ? 'confirmar' : 'llamar'
+    }
+    const { error } = await supabase.from('app_settings').update(row).eq('org_id', currentOrg())
+    if (error) throw error
+  }
+  await audit(req, 'editar', 'opciones_qr', site.id, { site: site.id, callWaiter: o.callWaiter, requestBill: o.requestBill, billView: o.billView, confirm: o.orderConfirm, direct: o.orderDirect })
+  res.send({ ...optionsDTO(o), siteId: site.id, own: Boolean(site.id), qrModule: true })
 }))
 
 module.exports = router

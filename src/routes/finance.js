@@ -29,7 +29,7 @@ const METHODS = { efectivo: 'Efectivo', transferencia: 'Transferencia', tarjeta:
 const WITHDRAWAL_KINDS = { utilidad: 'Pago de utilidades', retiro: 'Retiro de capital' }
 const VAULT_LABELS = {
   deposito: 'Depósito', retiro: 'Retiro', cierre_caja: 'Cierre de caja', base_caja: 'Base de caja', consignacion: 'Consignación al banco', ajuste: 'Ajuste',
-  ingreso: 'Ingreso de dinero', gasto: 'Gasto', traslado: 'Traslado', retiro_socio: 'Retiro de socio', anulacion: 'Anulación'
+  ingreso: 'Ingreso de dinero', gasto: 'Gasto', traslado: 'Traslado', retiro_socio: 'Retiro de socio', anulacion: 'Anulación', pago_propina: 'Pago de propinas', pago_personal: 'Pago al personal'
 }
 const isDay = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || '')
 const round = (v) => Math.round(Number(v) || 0)

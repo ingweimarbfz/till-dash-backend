@@ -36,6 +36,7 @@ app.use(require('./routes/menus'))
 app.use(require('./routes/suppliers'))
 app.use(require('./routes/deliveries'))
 app.use(require('./routes/customers'))
+app.use(require('./routes/tips'))
 
 app.use((req, res) => res.status(404).send({ message: 'Ruta no encontrada' }))
 

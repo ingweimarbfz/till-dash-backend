@@ -91,8 +91,9 @@ const buildReport = async (req) => {
       .eq('status', 'cobrado').gte('closed_at', start).lt('closed_at', end)).order('closed_at')),
     all(() => bySite(supabase.from('orders').select('id, number, site_id, total, gross, void_reason, closed_at, updated_at, voider:users!orders_voided_by_fkey(name, last_name), table:dining_tables!orders_table_id_fkey(name)')
       .eq('status', 'anulado').gte('updated_at', start).lt('updated_at', end)).order('updated_at')),
-    all(() => supabase.from('tip_payouts').select('id, amount, user_id, created_at, user:users!tip_payouts_user_id_fkey(name, last_name), session:cash_sessions!inner(number, site_id)')
-      .gte('created_at', start).lt('created_at', end).order('created_at')).then((r) => (site ? r.filter((t) => t.session?.site_id === site) : r)),
+    // Propinas pagadas en el cierre (hasta TD-019) o desde Caja → Propinas (TD-020, pueden no tener turno).
+    all(() => bySite(supabase.from('tip_payouts').select('id, number, amount, user_id, site_id, source, created_at, user:users!tip_payouts_user_id_fkey(name, last_name), session:cash_sessions!tip_payouts_session_id_fkey(number)')
+      .gte('created_at', start).lt('created_at', end)).order('created_at')),
     all(() => bySite(supabase.from('incidents').select('id, number, type, title, cost, status, occurred_at, charge_to_responsible, responsible:users!incidents_responsible_id_fkey(name, last_name)')
       .gte('occurred_at', start).lt('occurred_at', end)).neq('status', 'descartado').order('occurred_at')),
     supabase.from('sites').select('id, name').then((r) => r.data || [])
@@ -209,7 +210,7 @@ const buildReport = async (req) => {
     tips: {
       generated: round(tipsGenerated), paid: round(tipsPaid), pending: round(tipsGenerated - tipsPaid),
       byEmployee: Object.values(payoutByUser).map((x) => ({ ...x, amount: round(x.amount) })).sort((a, b) => b.amount - a.amount),
-      payouts: payouts.map((t) => ({ id: t.id, name: fullName(t.user), amount: Number(t.amount), session: t.session?.number, at: t.created_at }))
+      payouts: payouts.map((t) => ({ id: t.id, name: fullName(t.user), amount: Number(t.amount), session: t.session?.number || t.number || null, source: t.source || 'cierre', at: t.created_at }))
     },
     discounts: Object.values(discounts).map((x) => ({ ...x, amount: round(x.amount) })).sort((a, b) => b.amount - a.amount),
     courtesies: courtesies.sort((a, b) => String(b.at).localeCompare(String(a.at))),

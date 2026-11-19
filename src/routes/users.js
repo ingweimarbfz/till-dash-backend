@@ -48,6 +48,21 @@ const positionsFrom = (b, role, extra) => {
   return isEmployee ? [...new Set(list)] : []
 }
 
+// Forma de pago (TD-020): por turno (horas × valor de la hora), nómina (salario quincenal o mensual) o ninguna.
+const PAY_MODES = ['ninguno', 'turno', 'nomina']
+const PAY_COLUMNS = `${USER_COLUMNS}, pay_mode, hour_rate, overtime_rate, salary, pay_period`
+const withPay = (u) => ({ ...toUserDTO(u), payMode: u.pay_mode || 'ninguno', hourRate: Number(u.hour_rate || 0), overtimeRate: Number(u.overtime_rate || 0), salary: Number(u.salary || 0), payPeriod: u.pay_period || 'mensual' })
+const payFrom = (b) => {
+  const mode = PAY_MODES.includes(b.payMode) ? b.payMode : 'ninguno'
+  const hourRate = Math.round(Number(b.hourRate) || 0)
+  const overtimeRate = Math.round(Number(b.overtimeRate) || 0)
+  const salary = Math.round(Number(b.salary) || 0)
+  if (hourRate < 0 || overtimeRate < 0 || salary < 0) throw new HttpError('Los valores de pago no pueden ser negativos')
+  if (mode === 'turno' && !hourRate) throw new HttpError('Escribe el valor de la hora para pagarle por turnos')
+  if (mode === 'nomina' && !salary) throw new HttpError('Escribe el salario de la quincena o del mes')
+  return { pay_mode: mode, hour_rate: mode === 'turno' ? hourRate : 0, overtime_rate: mode === 'turno' ? overtimeRate : 0, salary: mode === 'nomina' ? salary : 0, pay_period: b.payPeriod === 'quincenal' ? 'quincenal' : 'mensual' }
+}
+
 const dupMessage = (e) => (e?.code === '23505'
   ? (String(e.message).includes('username') ? 'Ese nombre de usuario ya existe' : 'Ya existe un usuario con esa identificación')
   : null)
@@ -60,7 +75,7 @@ const activeOwners = async (excludeId) => {
 }
 
 router.get('/usuarios', auth(ADMIN), h(async (req, res) => {
-  let q = supabase.from('users').select(USER_COLUMNS).order('name')
+  let q = supabase.from('users').select(PAY_COLUMNS).order('name')
   if (req.siteId) q = q.or(`site_id.eq.${req.siteId},role.in.(superadmin,admin)`)
   const { data, error } = await q
   if (error) throw error
@@ -69,7 +84,7 @@ router.get('/usuarios', auth(ADMIN), h(async (req, res) => {
   res.send(data
     .filter((u) => !rol || u.role === rol || (u.extra_roles || []).includes(rol))
     .filter((u) => !cargo || (u.positions || []).includes(cargo))
-    .map(toUserDTO))
+    .map(withPay))
 }))
 
 router.post('/usuarios', auth(ADMIN), h(async (req, res) => {
@@ -93,11 +108,12 @@ router.post('/usuarios', auth(ADMIN), h(async (req, res) => {
     site_id: Number(b.siteId) || null,
     avatar_url: clean(b.avatarUrl),
     password_hash: await bcrypt.hash(String(b.password || clean(b.identification)), 10),
-    active: b.active !== false
-  }).select(USER_COLUMNS).single()
+    active: b.active !== false,
+    ...(b.payMode !== undefined ? payFrom(b) : {})
+  }).select(PAY_COLUMNS).single()
   if (error) return dupMessage(error) ? fail(res, dupMessage(error), 409) : fail(res, error)
   await audit(req, 'crear', 'usuario', data.id, { role, extra, positions, username: data.username })
-  res.status(201).send(toUserDTO(data))
+  res.status(201).send(withPay(data))
 }))
 
 router.put('/usuarios/:id', auth(ADMIN), h(async (req, res) => {
@@ -129,14 +145,16 @@ router.put('/usuarios/:id', auth(ADMIN), h(async (req, res) => {
     active: b.active !== false
   }
   if (b.avatarUrl !== undefined) patch.avatar_url = clean(b.avatarUrl)
+  if (b.payMode !== undefined) Object.assign(patch, payFrom(b))
   if (b.resetPassword) patch.password_hash = await bcrypt.hash(String(patch.identification), 10)
   else if (b.password) patch.password_hash = await bcrypt.hash(b.password, 10)
-  const { data, error } = await supabase.from('users').update(patch).eq('id', id).select(USER_COLUMNS).single()
+  const { data, error } = await supabase.from('users').update(patch).eq('id', id).select(PAY_COLUMNS).single()
   if (error) return dupMessage(error) ? fail(res, dupMessage(error), 409) : fail(res, error)
   await audit(req, 'editar', 'usuario', id, { role, extra, positions, active: data.active, password: Boolean(b.resetPassword || b.password) })
-  res.send(toUserDTO(data))
+  res.send(withPay(data))
 }))
 
 module.exports = router
 module.exports.profilesFrom = profilesFrom
 module.exports.positionsFrom = positionsFrom
+module.exports.payFrom = payFrom

@@ -253,7 +253,7 @@ router.get('/domicilios/cuenta', auth(STAFF), guard(...SELLERS, 'domiciliario'),
   if (!courierId) return fail(res, 'Elige el domiciliario', 400)
   const to = DAY.test(req.query.hasta || '') ? req.query.hasta : todayBogota()
   const from = DAY.test(req.query.desde || '') ? req.query.desde : new Date(new Date(`${to}T12:00:00-05:00`).getTime() - 29 * 864e5).toISOString().slice(0, 10)
-  const [{ data: orders, error }, { data: payouts }, { data: u }, rule, { data: tipPays }] = await Promise.all([
+  const [{ data: orders, error }, { data: payouts }, { data: u }, rule, { data: tipPays }, { data: owed }] = await Promise.all([
     supabase.from('orders').select('id, number, status, total, tip, delivery_fee, closed_at, opened_at, session_id, delivery_status, dispatched_at, arrived_at, session:cash_sessions(status)')
       .eq('type', 'domicilio').eq('courier_id', courierId).neq('status', 'anulado').gte('opened_at', dayStart(from)).lt('opened_at', nextDay(to)).order('opened_at'),
     supabase.from('courier_payouts').select('id, amount, deliveries, fees, share, tips, created_at, session:cash_sessions(number, register:cash_registers(name))')
@@ -261,7 +261,9 @@ router.get('/domicilios/cuenta', auth(STAFF), guard(...SELLERS, 'domiciliario'),
     supabase.from('users').select('id, name, last_name, site_id').eq('id', courierId).maybeSingle(),
     shareRule(),
     // Sus propinas se le pagan en Caja → Propinas (TD-020), no en el cierre.
-    supabase.from('tip_payouts').select('amount').eq('user_id', courierId).gte('created_at', dayStart(from)).lt('created_at', nextDay(to)).then((r) => (r.error ? { data: [] } : r))
+    supabase.from('tip_payouts').select('amount').eq('user_id', courierId).gte('created_at', dayStart(from)).lt('created_at', nextDay(to)).then((r) => (r.error ? { data: [] } : r)),
+    // Domicilios que en el cierre quedaron pendientes o se pagaron después en Pagos al personal (TD-020).
+    supabase.from('staff_earnings').select('amount, status, paid_at').eq('user_id', courierId).eq('kind', 'domicilios').then((r) => (r.error ? { data: [] } : r))
   ])
   if (error) throw error
   if (!u || (!mine && !sameSite(req, u.site_id) && u.site_id)) return fail(res, 'Domiciliario no encontrado', 404)
@@ -280,7 +282,9 @@ router.get('/domicilios/cuenta', auth(STAFF), guard(...SELLERS, 'domiciliario'),
   }
   const rows = Object.values(days).sort((a, b) => b.date.localeCompare(a.date)).map(({ minutes, ...d }) => ({ ...d, earned: d.share + d.tips, avgMinutes: minutes.length ? Math.round(minutes.reduce((a, x) => a + x, 0) / minutes.length) : null }))
   const sum = (k) => rows.reduce((a, r) => a + r[k], 0)
-  const paid = (payouts || []).reduce((a, p) => a + Number(p.amount), 0)
+  const inRange = (d) => d && new Date(d) >= new Date(dayStart(from)) && new Date(d) < new Date(nextDay(to))
+  const paid = (payouts || []).reduce((a, p) => a + Number(p.amount), 0) + (owed || []).filter((e) => e.status === 'pagado' && inRange(e.paid_at)).reduce((a, e) => a + Number(e.amount), 0)
+  pending += (owed || []).filter((e) => e.status === 'pendiente').reduce((a, e) => a + Number(e.amount), 0)
   res.send({
     courier: { id: u.id, name: fullName(u) }, from, to, rule: { mode: rule.mode, percent: rule.percent },
     totals: { deliveries: sum('deliveries'), fees: sum('fees'), share: sum('share'), tips: sum('tips'), earned: sum('earned'), paid, pending, tipsPaid: (tipPays || []).reduce((a, t) => a + Number(t.amount), 0) },

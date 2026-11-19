@@ -42,3 +42,32 @@ test('propinas: validación del pago', () => {
   assert.match(cleanPayments([{ amount: 1000 }]).error, /empleado/)
   assert.match(cleanPayments([{ userId: 1, amount: -5 }]).error, /Revisa/)
 })
+
+const { payPeriod, prevPeriod, payrollDue, cleanPayroll, cleanEarnings } = require('../src/tips')
+const { payFrom } = require('../src/routes/users')
+
+test('nómina: periodos quincenales y mensuales', () => {
+  assert.deepEqual(payPeriod('2026-11-19', 'quincenal'), { from: '2026-11-16', to: '2026-11-30' })
+  assert.deepEqual(payPeriod('2026-02-03', 'quincenal'), { from: '2026-02-01', to: '2026-02-15' })
+  assert.deepEqual(payPeriod('2028-02-20', 'mensual'), { from: '2028-02-01', to: '2028-02-29' })
+  assert.deepEqual(prevPeriod('2026-11-16', 'quincenal'), { from: '2026-11-01', to: '2026-11-15' })
+  assert.deepEqual(prevPeriod('2026-01-01', 'quincenal'), { from: '2025-12-16', to: '2025-12-31' })
+  assert.deepEqual(prevPeriod('2026-01-01', 'mensual'), { from: '2025-12-01', to: '2025-12-31' })
+})
+
+test('nómina: se sugiere el periodo más antiguo sin pagar (anterior o actual)', () => {
+  assert.deepEqual(payrollDue('2026-11-19', 'quincenal', []), { from: '2026-11-01', to: '2026-11-15', current: false })
+  assert.deepEqual(payrollDue('2026-11-19', 'quincenal', ['2026-11-01']), { from: '2026-11-16', to: '2026-11-30', current: true })
+  assert.equal(payrollDue('2026-11-19', 'quincenal', ['2026-11-01', '2026-11-16']), null)
+  assert.deepEqual(payrollDue('2026-11-19', 'mensual', ['2026-10-01']), { from: '2026-11-01', to: '2026-11-30', current: true })
+})
+
+test('pagos al personal: validación', () => {
+  assert.deepEqual(cleanEarnings([3, '3', 'x', -1, 7]), [3, 7])
+  assert.deepEqual(cleanPayroll([{ userId: 2, amount: '750000', from: '2026-11-01', to: '2026-11-15' }]).payroll, [{ user_id: 2, amount: 750000, period_from: '2026-11-01', period_to: '2026-11-15' }])
+  assert.ok(cleanPayroll([{ userId: 2, amount: 1, from: '2026-11-15', to: '2026-11-01' }]).error)
+  assert.deepEqual(payFrom({ payMode: 'turno', hourRate: '8000.4', salary: 9 }), { pay_mode: 'turno', hour_rate: 8000, salary: 0, pay_period: 'mensual' })
+  assert.deepEqual(payFrom({ payMode: 'nomina', salary: 1500000, payPeriod: 'quincenal' }), { pay_mode: 'nomina', hour_rate: 0, salary: 1500000, pay_period: 'quincenal' })
+  assert.throws(() => payFrom({ payMode: 'turno' }), /valor de la hora/)
+  assert.equal(payFrom({}).pay_mode, 'ninguno')
+})

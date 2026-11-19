@@ -74,3 +74,61 @@ const payoutDTO = (t) => ({
 })
 
 module.exports = { TIP_SOURCES, tipOwner, tipBalance, cleanPayments, payoutDTO }
+
+// ---------------------------------------------------------------- Pagos al personal (turnos, domicilios y nómina)
+const EARNING_KINDS = { turno: 'Turno', domicilios: 'Domicilios', nomina: 'Nómina' }
+const pad = (n) => String(n).padStart(2, '0')
+const lastDay = (y, m) => new Date(Date.UTC(y, m, 0)).getUTCDate()  // m: 1-12
+// Periodo de nómina que contiene el día (YYYY-MM-DD): quincena (1-15 / 16-fin) o mes completo.
+const payPeriod = (day, period = 'mensual') => {
+  const [y, m, d] = day.split('-').map(Number)
+  const end = lastDay(y, m)
+  if (period === 'quincenal') return d <= 15 ? { from: `${y}-${pad(m)}-01`, to: `${y}-${pad(m)}-15` } : { from: `${y}-${pad(m)}-16`, to: `${y}-${pad(m)}-${pad(end)}` }
+  return { from: `${y}-${pad(m)}-01`, to: `${y}-${pad(m)}-${pad(end)}` }
+}
+// Periodo anterior al que empieza en `from`.
+const prevPeriod = (from, period = 'mensual') => {
+  const [y, m, d] = from.split('-').map(Number)
+  if (period === 'quincenal' && d === 16) return { from: `${y}-${pad(m)}-01`, to: `${y}-${pad(m)}-15` }
+  const pm = m === 1 ? 12 : m - 1; const py = m === 1 ? y - 1 : y
+  return period === 'quincenal' ? { from: `${py}-${pad(pm)}-16`, to: `${py}-${pad(pm)}-${pad(lastDay(py, pm))}` } : { from: `${py}-${pad(pm)}-01`, to: `${py}-${pad(pm)}-${pad(lastDay(py, pm))}` }
+}
+// Lo que se sugiere pagar de nómina: el periodo más antiguo sin pagar entre el anterior y el actual.
+const payrollDue = (today, period, paidFroms = []) => {
+  const cur = payPeriod(today, period)
+  const prev = prevPeriod(cur.from, period)
+  const paid = new Set(paidFroms)
+  if (!paid.has(prev.from)) return { ...prev, current: false }
+  if (!paid.has(cur.from)) return { ...cur, current: true }
+  return null
+}
+
+const cleanEarnings = (ids) => {
+  const list = [...new Set((Array.isArray(ids) ? ids : []).map(Number).filter((x) => Number.isInteger(x) && x > 0))]
+  return list
+}
+const cleanPayroll = (list) => {
+  const out = []
+  for (const p of Array.isArray(list) ? list : []) {
+    const amount = Math.round(Number(p?.amount))
+    const day = /^\d{4}-\d{2}-\d{2}$/
+    if (!Number(p?.userId) || !(amount > 0) || !day.test(p.from || '') || !day.test(p.to || '') || p.to < p.from) return { error: 'Revisa el empleado, el periodo y el valor de la nómina' }
+    out.push({ user_id: Number(p.userId), amount, period_from: p.from, period_to: p.to })
+  }
+  return { payroll: out }
+}
+
+const earningDTO = (e) => ({
+  id: e.id, userId: e.user_id, name: fullName(e.user), kind: e.kind, kindLabel: EARNING_KINDS[e.kind], session: e.session?.number ?? null,
+  hours: e.hours === null ? null : Number(e.hours), rate: e.rate === null ? null : Number(e.rate), deliveries: e.deliveries, periodFrom: e.period_from, periodTo: e.period_to,
+  amount: Number(e.amount), note: e.note, status: e.status, createdAt: e.created_at,
+  paidAt: e.paid_at, paidSource: e.paid_source, paidSourceLabel: e.paid_source ? TIP_SOURCES[e.paid_source] : null, paidMethod: e.paid_method, paidNumber: e.paid_number, paidBy: fullName(e.payer)
+})
+
+module.exports.EARNING_KINDS = EARNING_KINDS
+module.exports.payPeriod = payPeriod
+module.exports.prevPeriod = prevPeriod
+module.exports.payrollDue = payrollDue
+module.exports.cleanEarnings = cleanEarnings
+module.exports.cleanPayroll = cleanPayroll
+module.exports.earningDTO = earningDTO

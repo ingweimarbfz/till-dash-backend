@@ -50,7 +50,7 @@ create or replace function public.pay_tips(p jsonb) returns jsonb
 language plpgsql set search_path = '' as $$
 declare v_org bigint := (p->>'org_id')::bigint; v_user bigint := (p->>'user_id')::bigint; v_site bigint := (p->>'site_id')::bigint;
   v_src text := p->>'source'; v_method text := coalesce(nullif(p->>'method', ''), 'efectivo'); v_note text := nullif(trim(coalesce(p->>'note', '')), '');
-  s record; v_vault bigint; v_num text; v_total numeric := 0; v_count int := 0; t jsonb; v_amt numeric; v_emp record; v_name text; v_cash numeric;
+  s record; v_vault bigint; v_num text; v_total numeric := 0; v_count int := 0; t jsonb; v_amt numeric; v_emp record; v_name text; v_cash numeric; v_sid bigint;
 begin
   if v_src not in ('caja', 'fondo', 'transferencia') then raise exception 'Elige de dónde sale el dinero' using errcode = 'P0001'; end if;
   if not exists (select 1 from public.sites where id = v_site and org_id = v_org) then raise exception 'Sucursal no encontrada' using errcode = 'P0001'; end if;
@@ -69,6 +69,7 @@ begin
     if s.id is null then raise exception 'Turno no encontrado' using errcode = 'P0001'; end if;
     if s.status <> 'abierta' then raise exception 'El turno % ya está cerrado', s.number using errcode = 'P0001'; end if;
     if s.site_id <> v_site then raise exception 'El turno es de otra sucursal' using errcode = 'P0001'; end if;
+    v_sid := s.id;
     v_cash := public.session_cash(s.id);
     if v_cash < v_total then
       raise exception 'En la caja hay % de efectivo y el pago es de %', public.fmt_money(v_cash), public.fmt_money(v_total) using errcode = 'P0001';
@@ -85,10 +86,10 @@ begin
     if v_emp.id is null then raise exception 'Uno de los empleados del pago no existe' using errcode = 'P0001'; end if;
     v_name := trim(v_emp.name || ' ' || coalesce(v_emp.last_name, ''));
     insert into public.tip_payouts (org_id, site_id, session_id, user_id, amount, paid_by, source, method, vault_id, number, note)
-      values (v_org, v_site, case when v_src = 'caja' then s.id end, v_emp.id, v_amt, v_user, v_src, v_method, v_vault, v_num, v_note);
+      values (v_org, v_site, v_sid, v_emp.id, v_amt, v_user, v_src, v_method, v_vault, v_num, v_note);
     if v_src = 'caja' then
       insert into public.cash_movements (org_id, session_id, type, method, amount, ref, note, user_id)
-        values (v_org, s.id, 'pago_propina', 'efectivo', -v_amt, v_num, 'Propina para ' || v_name, v_user);
+        values (v_org, v_sid, 'pago_propina', 'efectivo', -v_amt, v_num, 'Propina para ' || v_name, v_user);
     end if;
   end loop;
 

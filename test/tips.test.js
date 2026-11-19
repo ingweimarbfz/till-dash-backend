@@ -71,3 +71,22 @@ test('pagos al personal: validación', () => {
   assert.throws(() => payFrom({ payMode: 'turno' }), /valor de la hora/)
   assert.equal(payFrom({}).pay_mode, 'ninguno')
 })
+
+const { cleanShift } = require('../src/tips')
+const { canManagePay } = require('../src/auth')
+
+test('TD-021: permiso de pagos solo para superadmin o admin asignado', () => {
+  assert.equal(canManagePay({ role: 'superadmin' }), true)
+  assert.equal(canManagePay({ role: 'admin', can_manage_pay: true }), true)
+  assert.equal(canManagePay({ role: 'admin', can_manage_pay: false }), false)
+  assert.equal(canManagePay({ role: 'empleado', can_manage_pay: true }), false)
+})
+
+test('TD-021: turno registrado a mano por horas o valor fijo', () => {
+  assert.deepEqual(cleanShift({ userId: 3, date: '2026-11-18', hours: '8', extraHours: '1,5' }), { userId: 3, fixed: false, hours: 8, extraHours: 1.5, amount: 0, date: '2026-11-18', note: null })
+  assert.equal(cleanShift({ userId: 3, date: '2026-11-18', fixed: true, amount: 50000 }).amount, 50000)
+  assert.ok(cleanShift({ userId: 3, date: '2026-11-18' }).error)
+  assert.ok(cleanShift({ userId: 3, date: '2026-11-18', fixed: true }).error)
+  assert.ok(cleanShift({ userId: 3, hours: 8 }).error)
+  assert.ok(cleanShift({ userId: 3, date: '2026-11-18', hours: 30 }).error)
+})

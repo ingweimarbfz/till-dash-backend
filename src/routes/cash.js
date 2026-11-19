@@ -11,7 +11,7 @@ const supabase = require('../db')
 const { resolveSupplier } = require('../suppliers')
 const { h, fail, clean, imageError } = require('../http')
 const { TRANSFER_METHODS, MOVE_COLUMNS, loadTransfers, transferTotals } = require('../transfers')
-const { auth, ADMIN, STAFF } = require('../auth')
+const { auth, ADMIN, STAFF, canManagePay } = require('../auth')
 const { audit } = require('../audit')
 const { notify, cashOpenMessage, cashCloseMessage, vaultMessage, cashRequestMessage, cashReopenMessage } = require('../notify')
 const { guard, workSite, sameSite, dbError, money, isMoney, PAY_METHODS, fullName } = require('../ops')
@@ -175,6 +175,8 @@ router.post('/caja/turnos/:id/movimientos', auth(STAFF), guard('cajero'), h(asyn
 router.get('/caja/turnos/:id/personal', auth(STAFF), guard('cajero'), h(async (req, res) => {
   const s = await loadSession(req.params.id)
   if (!s || !sameSite(req, s.site_id)) return fail(res, 'Turno no encontrado', 404)
+  // Sin el permiso de pagos (TD-021) no se ven los valores ni se pagan turnos en el cierre.
+  if (!canManagePay(req.user)) return res.send({ hours: 0, employees: [], allowed: false })
   const [{ data: staff }, { data: orders }] = await Promise.all([
     supabase.from('users').select('id, name, last_name, positions, site_id, hour_rate, overtime_rate').eq('active', true).eq('pay_mode', 'turno').order('name').then((r) => (r.error ? { data: [] } : r)),
     supabase.from('orders').select('waiter_id, courier_id, cashier_id').eq('session_id', s.id)
@@ -183,7 +185,7 @@ router.get('/caja/turnos/:id/personal', auth(STAFF), guard('cajero'), h(async (r
   for (const o of orders || []) for (const k of ['waiter_id', 'courier_id', 'cashier_id']) if (o[k]) worked.add(o[k])
   const hours = Math.max(0.5, Math.round(((Date.now() - new Date(s.opened_at).getTime()) / 36e5) * 2) / 2)
   res.send({
-    hours,
+    hours, allowed: true,
     employees: (staff || []).filter((u) => !u.site_id || u.site_id === s.site_id).map((u) => ({
       id: u.id, name: fullName(u), positions: u.positions || [], hourRate: Number(u.hour_rate || 0), overtimeRate: Number(u.overtime_rate || 0), worked: worked.has(u.id)
     })).sort((a, b) => Number(b.worked) - Number(a.worked) || a.name.localeCompare(b.name))
@@ -204,6 +206,7 @@ router.post('/caja/turnos/:id/cerrar', auth(STAFF), guard('cajero'), h(async (re
   // payNow = false lo deja pendiente en Pagos al personal.
   const staff = (Array.isArray(b.staff) ? b.staff : []).filter((t) => Number(t?.amount) > 0)
   if (staff.some((t) => !Number(t.userId) || !isMoney(t.amount) || (t.hours !== undefined && t.hours !== '' && t.hours !== null && !(Number(t.hours) > 0 && Number(t.hours) <= 24)) || (Number(t.extraHours) < 0 || Number(t.extraHours) > 24))) return fail(res, 'Revisa las horas y los valores de los turnos', 400)
+  if (staff.length && !canManagePay(req.user)) return fail(res, 'Solo el super administrador o un administrador con el permiso de pagos paga turnos', 403)
   if (new Set(staff.map((t) => Number(t.userId))).size !== staff.length) return fail(res, 'Un empleado aparece dos veces en los turnos', 400)
   // Lo que el sistema calculó para cada domiciliario (su parte de los domicilios) queda guardado con el pago.
   // Sus propinas no van aquí (tips = 0): se le pagan en Caja → Propinas como al resto del personal.

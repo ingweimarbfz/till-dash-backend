@@ -125,6 +125,25 @@ const earningDTO = (e) => ({
   paidAt: e.paid_at, paidSource: e.paid_source, paidSourceLabel: e.paid_source ? TIP_SOURCES[e.paid_source] : null, paidMethod: e.paid_method, paidNumber: e.paid_number, paidBy: fullName(e.payer)
 })
 
+// Turno registrado a mano (TD-021): por horas (horas + horas extra) o valor fijo.
+const cleanShift = (b = {}) => {
+  const num = (v) => (v === undefined || v === null || v === '' ? null : Number(String(v).replace(',', '.')))
+  const userId = Number(b.userId)
+  const fixed = Boolean(b.fixed)
+  const hours = num(b.hours)
+  const extraHours = num(b.extraHours)
+  const amount = Math.round(Number(b.amount) || 0)
+  const date = /^\d{4}-\d{2}-\d{2}$/.test(String(b.date || '')) ? String(b.date) : null
+  if (!userId) return { error: 'Elige el empleado' }
+  if (!date) return { error: 'Elige la fecha del turno' }
+  if (hours !== null && !(hours > 0 && hours <= 24)) return { error: 'Las horas deben estar entre 0 y 24' }
+  if (extraHours !== null && !(extraHours >= 0 && extraHours <= 24)) return { error: 'Las horas extra deben estar entre 0 y 24' }
+  if (!fixed && !hours) return { error: 'Escribe las horas del turno' }
+  if (fixed && !(amount > 0)) return { error: 'Escribe el valor del turno' }
+  return { userId, fixed, hours, extraHours: extraHours || null, amount, date, note: String(b.note || '').trim().slice(0, 120) || null }
+}
+
+module.exports.cleanShift = cleanShift
 module.exports.EARNING_KINDS = EARNING_KINDS
 module.exports.payPeriod = payPeriod
 module.exports.prevPeriod = prevPeriod

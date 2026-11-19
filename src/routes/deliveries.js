@@ -13,6 +13,10 @@ const { audit } = require('../audit')
 const { can, guard, workSite, sameSite, fullName, PAY_METHODS, money, isMoney, itemsBlock } = require('../ops')
 const { dayStart } = require('./logbook')
 const { notify, cashReceivedMessage } = require('../notify')
+const bcrypt = require('bcryptjs')
+const { NAME_RE, PHONE_RE, DOC_RE } = require('../http')
+const plan = require('../plan')
+const { COURIER_COLUMNS, courierFrom, vehicleLabel } = require('../courier')
 
 const router = express.Router()
 
@@ -42,14 +46,14 @@ const MIN_TRIP_MS = 60e3
 const paysCash = (o) => !o.delivery_pay_method || o.delivery_pay_method === 'efectivo'
 const isCourierUser = (user) => (user.positions || []).includes('domiciliario') && user.role === 'empleado'
 const FLOW = { por_despachar: ['en_camino'], en_camino: ['entregado', 'por_despachar'], entregado: ['en_camino'] }
-const COLUMNS = 'id, number, site_id, status, type, customer_name, customer_phone, customer_address, note, delivery_pay_method, delivery_cash_with, total, tip, delivery_fee, paid, opened_at, closed_at, session_id, courier_id, delivery_status, dispatched_at, arrived_at, cash_received_at, cash_received_amount, cash_received_fee, courier:users!orders_courier_id_fkey(id, name, last_name, courier_pay), customer:customers(id, zone), items:order_items(name, quantity, status, area)'
+const COLUMNS = 'id, number, site_id, status, type, customer_name, customer_phone, customer_address, note, delivery_pay_method, delivery_cash_with, total, tip, delivery_fee, paid, opened_at, closed_at, session_id, courier_id, delivery_status, dispatched_at, arrived_at, cash_received_at, cash_received_amount, cash_received_fee, courier:users!orders_courier_id_fkey(id, name, last_name, courier_pay, courier_external, vehicle_type, vehicle_has_plate, vehicle_plate), customer:customers(id, zone), items:order_items(name, quantity, status, area)'
 const deliveryDTO = (o, rule) => ({
   id: o.id, number: o.number, siteId: o.site_id, status: o.status, customerName: o.customer_name, customerPhone: o.customer_phone, address: o.customer_address, note: o.note, customerId: o.customer?.id ?? null, zone: o.customer?.zone ?? null,
   payMethod: o.delivery_pay_method || null, cashWith: o.delivery_cash_with === null ? null : Number(o.delivery_cash_with),
   change: o.delivery_cash_with !== null && o.delivery_pay_method === 'efectivo' ? Math.max(0, Number(o.delivery_cash_with) - Number(o.total)) : null,
   mustPayFirst: Boolean(o.delivery_pay_method && o.delivery_pay_method !== 'efectivo' && o.status === 'abierto' && rule.timing === 'antes'),
   total: Number(o.total), tip: Number(o.tip), deliveryFee: Number(o.delivery_fee || 0), share: byShift(o.courier) ? 0 : rule.of(o.delivery_fee), paid: o.status === 'cobrado',
-  courier: o.courier ? { id: o.courier.id, name: fullName(o.courier) } : null, deliveryStatus: o.delivery_status || 'por_despachar', deliveryStatusLabel: STATUS[o.delivery_status || 'por_despachar'],
+  courier: o.courier ? { id: o.courier.id, name: fullName(o.courier), external: Boolean(o.courier.courier_external), vehicle: vehicleLabel(o.courier) } : null, deliveryStatus: o.delivery_status || 'por_despachar', deliveryStatusLabel: STATUS[o.delivery_status || 'por_despachar'],
   openedAt: o.opened_at, closedAt: o.closed_at, dispatchedAt: o.dispatched_at, arrivedAt: o.arrived_at,
   // TD-015: efectivo que el domiciliario dice haber recibido (falta cobrarlo en caja mientras el pedido siga abierto).
   cashPay: paysCash(o), cashReceivedAt: o.cash_received_at || null, cashReceivedAmount: num(o.cash_received_amount), cashReceivedFee: num(o.cash_received_fee),
@@ -69,9 +73,11 @@ const totals = (list) => {
     toCollect: list.filter((d) => !d.paid && d.status === 'abierto').reduce((a, d) => a + d.total, 0), sales: charged.reduce((a, d) => a + d.total - d.tip, 0)
   }
 }
+// TD-022: si es externo, si trabaja con base propia y su vehículo.
+const courierRow = (u) => ({ id: u.id, name: fullName(u), phone: u.phone || null, external: Boolean(u.courier_external), ownFloat: u.courier_float === 'propia', vehicle: vehicleLabel(u) })
 const couriersOf = async (siteId) => {
-  const { data } = await supabase.from('users').select('id, name, last_name, site_id, phone').eq('active', true).eq('role', 'empleado').contains('positions', ['domiciliario']).order('name')
-  return (data || []).filter((u) => !siteId || !u.site_id || u.site_id === siteId).map((u) => ({ id: u.id, name: fullName(u), phone: u.phone || null }))
+  const { data } = await supabase.from('users').select(`id, name, last_name, site_id, phone, ${COURIER_COLUMNS}`).eq('active', true).eq('role', 'empleado').contains('positions', ['domiciliario']).order('name')
+  return (data || []).filter((u) => !siteId || !u.site_id || u.site_id === siteId).map(courierRow)
 }
 
 // ---------------------------------------------------------------- Lista del día
@@ -141,9 +147,12 @@ router.post('/domicilios/:id/estado', auth(STAFF), guard(...SELLERS, 'domiciliar
   }
   const isCourier = (req.user.positions || []).includes('domiciliario') && req.user.role === 'empleado'
   const mine = onlyCourier(req.user)
+  // TD-022: el domiciliario externo puede no usar la app; sus entregas también las marca el personal.
+  const { data: assigned } = o.courier_id ? await supabase.from('users').select('courier_external').eq('id', o.courier_id).maybeSingle() : { data: null }
+  const staffDelivers = Boolean(assigned?.courier_external) && !mine
   if (mine && o.courier_id && o.courier_id !== req.user.id) return fail(res, 'Este domicilio lo tiene otro domiciliario', 403)
   // Entregarlo (o deshacer la entrega) es solo del domiciliario asignado.
-  if ((status === 'entregado' || current === 'entregado') && !(isCourier && o.courier_id === req.user.id)) {
+  if ((status === 'entregado' || current === 'entregado') && !(isCourier && o.courier_id === req.user.id) && !staffDelivers) {
     return fail(res, o.courier_id ? 'Solo el domiciliario asignado puede marcarlo entregado.' : 'El domicilio no tiene domiciliario asignado.', 403)
   }
   if (status === 'en_camino' && current === 'por_despachar') {
@@ -156,7 +165,7 @@ router.post('/domicilios/:id/estado', auth(STAFF), guard(...SELLERS, 'domiciliar
     const block = itemsBlock(o.number, items)
     if (block) return fail(res, block, 409)
   }
-  if (status === 'entregado' && o.dispatched_at && Date.now() - new Date(o.dispatched_at).getTime() < MIN_TRIP_MS) {
+  if (status === 'entregado' && !staffDelivers && o.dispatched_at && Date.now() - new Date(o.dispatched_at).getTime() < MIN_TRIP_MS) {
     return fail(res, `El ${o.number} acaba de salir. Márcalo entregado cuando llegues donde el cliente.`, 409)
   }
   const patch = { delivery_status: status }
@@ -244,6 +253,59 @@ router.get('/domicilios/avisos', auth(STAFF), guard(...SELLERS), h(async (req, r
     ...cashFigures(o), id: o.id, number: o.number, total: Number(o.total), customerName: o.customer_name, address: o.customer_address,
     courier: o.courier ? { id: o.courier.id, name: fullName(o.courier) } : null, receivedAt: o.cash_received_at
   })))
+}))
+
+// ---------------------------------------------------------------- Registro rápido de domiciliario externo (TD-022)
+// Para el que no trabaja para la empresa: nombre, celular y vehículo. Trabaja con base propia y queda en la sucursal.
+// Entra con el usuario que se le genera y su identificación (o su celular) como contraseña, si quiere usar la app.
+const slug = (v) => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '')
+const freeUsername = async (name, phone) => {
+  const base = `dom.${slug(name).slice(0, 18) || 'externo'}`
+  for (const cand of [base, `${base}${String(phone).slice(-4)}`, ...[2, 3, 4, 5].map((n) => `${base}${String(phone).slice(-4)}${n}`)]) {
+    const { data } = await supabase.from('users').select('id').eq('username', cand).limit(1)
+    if (!(data || []).length) return cand
+  }
+  return `${base}${Date.now().toString(36)}`
+}
+const quickCourierErrors = (b) => {
+  const errors = []
+  if (!clean(b.name)) errors.push('Escribe el nombre')
+  else if (!NAME_RE.test(clean(b.name))) errors.push('El nombre solo admite letras')
+  if (clean(b.lastName) && !NAME_RE.test(clean(b.lastName))) errors.push('Los apellidos solo admiten letras')
+  if (!clean(b.phone)) errors.push('Escribe el celular')
+  else if (!PHONE_RE.test(clean(b.phone))) errors.push('Celular no válido (7 a 10 dígitos)')
+  if (clean(b.identification) && !DOC_RE.test(clean(b.identification))) errors.push('Identificación no válida')
+  return errors
+}
+router.post('/domicilios/domiciliarios', auth(STAFF), guard(...SELLERS), h(async (req, res) => {
+  const b = req.body || {}
+  const errors = quickCourierErrors(b)
+  if (errors.length) return fail(res, errors.join('. '), 400)
+  const courier = courierFrom({ ...b, courierFloat: b.courierFloat || 'propia' }, { external: true })
+  const site = await workSite(req, b.siteId)
+  const phone = clean(b.phone)
+  const identification = clean(b.identification) || phone
+  const { data: same } = await supabase.from('users').select('id, name, last_name, active, positions').eq('identification', identification).maybeSingle()
+  if (same) return fail(res, `Ya existe ${fullName(same)} con ${clean(b.identification) ? 'esa identificación' : 'ese celular como identificación'}${(same.positions || []).includes('domiciliario') ? (same.active ? '. Búscalo en la lista de domiciliarios.' : '; está inactivo, actívalo en Usuarios.') : '.'}`, 409)
+  await plan.checkLimit(req.user.org_id, 'employees')
+  const username = await freeUsername(b.name, phone)
+  const { data, error } = await supabase.from('users').insert({
+    identification, name: clean(b.name), last_name: clean(b.lastName) || '', username, phone, email: null,
+    role: 'empleado', extra_roles: [], positions: ['domiciliario'], site_id: site, active: true,
+    password_hash: await bcrypt.hash(identification, 10), courier_pay: 'domicilios', ...courier
+  }).select(`id, name, last_name, site_id, phone, ${COURIER_COLUMNS}`).single()
+  if (error) return error.code === '23505' ? fail(res, 'Ya existe un usuario con esa identificación', 409) : fail(res, error)
+  await audit(req, 'registro_rapido_domiciliario', 'usuario', data.id, { username, external: true, vehicle: vehicleLabel(data) })
+  // Si viene de un domicilio, queda asignado de una vez (mismas reglas de "asignar").
+  let assigned = null
+  if (Number(b.orderId)) {
+    const { data: o } = await supabase.from('orders').select('id, number, site_id, type, status, courier_id, delivery_status').eq('id', Number(b.orderId)).maybeSingle()
+    if (o && o.type === 'domicilio' && o.status !== 'anulado' && sameSite(req, o.site_id) && (!o.courier_id || (o.delivery_status || 'por_despachar') === 'por_despachar')) {
+      const { error: e2 } = await supabase.from('orders').update({ courier_id: data.id }).eq('id', o.id)
+      if (!e2) { assigned = o.number; await audit(req, 'asignar_domiciliario', 'pedido', o.id, { number: o.number, from: o.courier_id, to: data.id }) }
+    }
+  }
+  res.status(201).send({ ...courierRow(data), username, password: clean(b.identification) ? 'su identificación' : 'su celular', assigned })
 }))
 
 // ---------------------------------------------------------------- Cuenta del domiciliario
@@ -366,8 +428,9 @@ router.post('/domicilios/bases', auth(STAFF), guard('cajero'), h(async (req, res
   const b = req.body || {}
   const site = await workSite(req, b.siteId)
   if (!isMoney(b.amount) || !(money(b.amount) > 0)) return fail(res, 'Escribe el valor de la base', 400)
-  const { data: u } = await supabase.from('users').select('id, name, last_name, active, positions').eq('id', Number(b.courierId)).maybeSingle()
+  const { data: u } = await supabase.from('users').select('id, name, last_name, active, positions, courier_float').eq('id', Number(b.courierId)).maybeSingle()
   if (!u || !u.active || !(u.positions || []).includes('domiciliario')) return fail(res, 'Elige un domiciliario activo', 400)
+  if (u.courier_float === 'propia') return fail(res, `${fullName(u)} trabaja con su propia base; no se le entrega base de la caja.`, 409)
   const { data: open } = await supabase.from('courier_floats').select('id').eq('user_id', u.id).eq('status', 'abierta').limit(1)
   if ((open || []).length) return fail(res, `${fullName(u)} ya tiene una base sin liquidar. Liquídala antes de darle otra.`, 409)
   const { data: sessions } = await supabase.from('cash_sessions').select('id, number, opened_by').eq('site_id', site).eq('status', 'abierta')
@@ -420,6 +483,7 @@ router.get('/caja/turnos/:id/domiciliarios', auth(STAFF), guard('cajero'), h(asy
 
 module.exports = router
 module.exports.courierSettlement = courierSettlement
+module.exports.quickCourierErrors = quickCourierErrors
 
 module.exports.FLOW = FLOW
 module.exports.paysCash = paysCash

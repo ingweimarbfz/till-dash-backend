@@ -268,7 +268,9 @@ const expenseDTO = (sites) => (e) => ({
 router.get('/finanzas/gastos', auth(ADMIN), h(async (req, res) => {
   const r = rangeOf(req.query)
   let q = inRange(supabase.from('expenses').select('*, partner:partners(name), vault:vaults(name, kind), session:cash_sessions(number), creator:users!expenses_created_by_fkey(name, last_name)'), 'paid_on', r).order('paid_on', { ascending: false }).order('id', { ascending: false })
-  if (req.siteId) q = q.eq('site_id', req.siteId)
+  // TD-038: ?fondo=general solo lo general (site_id vacío); ?fondo=<sede> solo esa sede.
+  if (req.query.fondo) q = fundSite(req.query.fondo) ? q.eq('site_id', fundSite(req.query.fondo)) : q.is('site_id', null)
+  else if (req.siteId) q = q.eq('site_id', req.siteId)
   if (EXPENSE_CATEGORIES[req.query.categoria]) q = q.eq('category', req.query.categoria)
   const f = clean(req.query.q)
   if (f) { const v = f.replace(/[%,()]/g, ''); q = q.or(`number.ilike.%${v}%,description.ilike.%${v}%,supplier.ilike.%${v}%`) }

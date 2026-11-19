@@ -11,6 +11,7 @@ const { auth, ADMIN, STAFF } = require('../auth')
 const { audit } = require('../audit')
 const { fullName } = require('../ops')
 const { SUPPLIER_CATEGORIES } = require('../suppliers')
+const { siteIdsOf, inSite, checkSites } = require('../catalog')
 
 const router = express.Router()
 const DOC_TYPES = ['NIT', 'CC', 'CE', 'RUT', 'Otro']
@@ -19,7 +20,7 @@ const supplierDTO = (s) => ({
   id: s.id, name: s.name, legalName: s.legal_name, docType: s.doc_type, docNumber: s.doc_number, category: s.category, categoryLabel: SUPPLIER_CATEGORIES[s.category],
   contactName: s.contact_name, phone: s.phone, whatsapp: s.whatsapp, email: s.email, address: s.address, city: s.city,
   paymentTerms: s.payment_terms, bankName: s.bank_name, bankAccountType: s.bank_account_type, bankAccount: s.bank_account,
-  deliveryDays: (s.delivery_days || []).map(Number), notes: s.notes, active: s.active, createdAt: s.created_at, updatedAt: s.updated_at
+  deliveryDays: (s.delivery_days || []).map(Number), notes: s.notes, active: s.active, siteIds: (s.site_ids || []).map(Number), createdAt: s.created_at, updatedAt: s.updated_at
 })
 
 const supplierRow = (b) => {
@@ -40,7 +41,8 @@ const supplierRow = (b) => {
       category: SUPPLIER_CATEGORIES[b.category] ? b.category : 'otro', contact_name: clean(b.contactName)?.slice(0, 120) ?? null,
       phone: clean(b.phone), whatsapp: clean(b.whatsapp), email: clean(b.email)?.toLowerCase() ?? null, address: clean(b.address)?.slice(0, 200) ?? null, city: clean(b.city)?.slice(0, 80) ?? null,
       payment_terms: terms, bank_name: clean(b.bankName)?.slice(0, 80) ?? null, bank_account_type: b.bankAccountType || null, bank_account: clean(b.bankAccount)?.slice(0, 40) ?? null,
-      delivery_days: days, notes: clean(b.notes)?.slice(0, 500) ?? null, active: b.active !== false, updated_at: new Date().toISOString()
+      delivery_days: days, notes: clean(b.notes)?.slice(0, 500) ?? null, active: b.active !== false, updated_at: new Date().toISOString(),
+      ...(b.siteIds !== undefined ? { site_ids: siteIdsOf(b.siteIds) } : {})
     }
   }
 }
@@ -50,6 +52,7 @@ const dupError = (res, error) => {
 }
 
 // Lista (todo el personal la usa para elegir el proveedor). ?activos=1 solo los activos.
+// TD-025: ?para=<sucursal> deja solo los que le sirven a esa sucursal (los de todas y los suyos).
 router.get('/proveedores', auth(STAFF), h(async (req, res) => {
   let q = supabase.from('suppliers').select('*').order('name')
   if (req.query.activos === '1') q = q.eq('active', true)
@@ -67,7 +70,7 @@ router.get('/proveedores', auth(STAFF), h(async (req, res) => {
   const paid = count(exps, (x) => Number(x.amount))
   const last = (buys || []).reduce((m, x) => { if (!m[x.supplier_id] || x.created_at > m[x.supplier_id]) m[x.supplier_id] = x.created_at; return m }, {})
   res.send({
-    rows: data.map((s) => ({ ...supplierDTO(s), products: pc[s.id] || 0, purchases90: Math.round(bought[s.id] || 0), paid90: Math.round(paid[s.id] || 0), lastPurchase: last[s.id] || null })),
+    rows: data.filter((s) => inSite(s, Number(req.query.para) || null)).map((s) => ({ ...supplierDTO(s), products: pc[s.id] || 0, purchases90: Math.round(bought[s.id] || 0), paid90: Math.round(paid[s.id] || 0), lastPurchase: last[s.id] || null })),
     categories: SUPPLIER_CATEGORIES
   })
 }))
@@ -116,6 +119,7 @@ router.get('/proveedores/:id(\\d+)', auth(ADMIN), h(async (req, res) => {
 router.post('/proveedores', auth(ADMIN), h(async (req, res) => {
   const { row, error: e } = supplierRow(req.body || {})
   if (e) return fail(res, e, 400)
+  const se = await checkSites(siteIdsOf(req.body?.siteIds)); if (se) return fail(res, se, 400)
   const { data, error } = await supabase.from('suppliers').insert({ ...row, created_by: req.user.id }).select('*').single()
   if (error) return dupError(res, error)
   await audit(req, 'crear', 'proveedor', data.id, { name: data.name })
@@ -124,6 +128,7 @@ router.post('/proveedores', auth(ADMIN), h(async (req, res) => {
 router.put('/proveedores/:id(\\d+)', auth(ADMIN), h(async (req, res) => {
   const { row, error: e } = supplierRow(req.body || {})
   if (e) return fail(res, e, 400)
+  const se = await checkSites(siteIdsOf(req.body?.siteIds)); if (se) return fail(res, se, 400)
   const { data, error } = await supabase.from('suppliers').update(row).eq('id', Number(req.params.id)).select('*').maybeSingle()
   if (error) return dupError(res, error)
   if (!data) return fail(res, 'Proveedor no encontrado', 404)

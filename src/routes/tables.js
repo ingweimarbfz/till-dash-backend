@@ -13,7 +13,7 @@ const { audit } = require('../audit')
 const plan = require('../plan')
 const { runAsOrg } = require('../tenant')
 const { workSite, sameSite, fullName, cashOpenAt, NO_CASH } = require('../ops')
-const { buildMenu, qrOptionsOf, orderMode, goesDirect } = require('../menu')
+const { buildMenu, qrOptionsAt, orderMode, goesDirect } = require('../menu')
 const { notify, callMessage } = require('../notify')
 const jwt = require('jsonwebtoken')
 const { JWT_SECRET } = require('../config')
@@ -261,8 +261,7 @@ router.post('/carta/:token/llamar', h(async (req, res) => {
   if (!t) return fail(res, 'Este código QR ya no está activo. Pide ayuda al personal.', 404)
   const kind = ['mesero', 'cuenta'].includes(req.body?.kind) ? req.body.kind : 'mesero'
   await runAsOrg(t.org_id, async () => {
-    const { data: st } = await supabase.from('app_settings').select('qr_call_waiter, qr_request_bill').maybeSingle()
-    const o = qrOptionsOf(st)
+    const { options: o } = await qrOptionsAt(t.site_id)
     if (kind === 'mesero' && !o.callWaiter) return fail(res, 'Esta opción no está disponible en este lugar.', 403)
     if (kind === 'cuenta' && !o.requestBill) return fail(res, 'Pide la cuenta directamente al personal.', 403)
     const note = clean(req.body?.note)?.slice(0, 140) ?? null
@@ -308,8 +307,7 @@ router.post('/carta/:token/pedido', h(async (req, res) => {
   const customer = clean(b.name)?.slice(0, 60) ?? null
   const note = clean(b.note)?.slice(0, 140) ?? null
   await runAsOrg(t.org_id, async () => {
-    const { data: st } = await supabase.from('app_settings').select('qr_ordering, qr_order_confirm, qr_order_direct, qr_direct_categories').maybeSingle()
-    const o = qrOptionsOf(st)
+    const { options: o } = await qrOptionsAt(t.site_id)
     const mode = orderMode(o)
     if (mode === 'none') return fail(res, 'En este lugar los pedidos se hacen con el mesero. Toca "Llamar al mesero".', 403)
     if (!(await cashOpenAt(t.site_id))) return fail(res, 'Todavía no estamos recibiendo pedidos. Llama al mesero.', 409)

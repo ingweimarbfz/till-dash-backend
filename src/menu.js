@@ -20,6 +20,24 @@ const qrOptionsOf = (s) => ({
   orderDirect: s?.qr_order_direct ?? s?.qr_ordering === 'directo',
   directCategories: (s?.qr_direct_categories || []).map(Number)
 })
+// TD-025: opciones del QR de una sucursal. Si la sucursal no tiene las suyas (sites.qr_options null),
+// usa las generales. Devuelve { options, own } (own: la sucursal tiene opciones propias).
+const QR_COLUMNS = 'qr_ordering, qr_call_waiter, qr_request_bill, qr_bill_view, qr_order_confirm, qr_order_direct, qr_direct_categories'
+const ownQrOf = (o) => ({
+  callWaiter: o.callWaiter !== false, requestBill: o.requestBill !== false,
+  billView: ['completa', 'sin_valores', 'oculta'].includes(o.billView) ? o.billView : 'completa',
+  orderConfirm: Boolean(o.orderConfirm), orderDirect: Boolean(o.orderDirect),
+  directCategories: (Array.isArray(o.directCategories) ? o.directCategories : []).map(Number).filter((x) => Number.isInteger(x) && x > 0)
+})
+const qrOptionsAt = async (siteId, general = undefined) => {
+  const [g, { data: site }] = await Promise.all([
+    general !== undefined ? Promise.resolve(general) : supabase.from('app_settings').select(QR_COLUMNS).maybeSingle().then((r) => r.data),
+    siteId ? supabase.from('sites').select('qr_options').eq('id', Number(siteId)).maybeSingle() : Promise.resolve({ data: null })
+  ])
+  if (site?.qr_options) return { options: ownQrOf(site.qr_options), own: true }
+  return { options: qrOptionsOf(g), own: false }
+}
+
 // none · confirmar · directo · mixto
 const orderMode = (o) => (o.orderConfirm && o.orderDirect ? 'mixto' : o.orderDirect ? 'directo' : o.orderConfirm ? 'confirmar' : 'none')
 // ¿Este producto va directo a cocina? (según el modo y su categoría)
@@ -88,7 +106,7 @@ const buildMenu = async ({ siteId, menuId = null }) => {
   const left = new Map((stock || []).map((x) => [x.product_id, Number(x.stock)]))
   const hidden = new Set((menu?.hidden_product_ids || []).map(Number))
   const p = { ...DEFAULT_PRESENTATION, ...(menu ? { layout: menu.layout, showPhotos: menu.show_photos, showDescriptions: menu.show_descriptions, soldOut: menu.sold_out } : {}) }
-  const qr = qrOptionsOf(s)
+  const { options: qr } = await qrOptionsAt(siteId, s)
   let products = (prods || []).filter((x) => !hidden.has(x.id) && inSite(x, siteId) && catIds.has(x.category_id)).map((raw) => {
     const x = { ...raw, price: priceAt(raw, siteId, prices) }
     const best = bestFor(promos, x)
@@ -119,4 +137,4 @@ const buildMenu = async ({ siteId, menuId = null }) => {
   }
 }
 
-module.exports = { buildMenu, pickMenu, menuDTO, menuAppliesAt, clock, qrOptionsOf, orderMode, goesDirect }
+module.exports = { buildMenu, pickMenu, menuDTO, menuAppliesAt, clock, qrOptionsOf, qrOptionsAt, ownQrOf, orderMode, goesDirect, QR_COLUMNS }

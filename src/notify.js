@@ -126,13 +126,22 @@ const cashOpenMessage = ({ number, register, site, siteId, amount, fromVault, us
   html: lines([`🔓 <b>APERTURA DE CAJA · ${esc(number)}</b>`, SEP, `💵 ${esc(register)} · base ${cop(amount)}${fromVault ? ' (desde la bóveda)' : ''}`,
     site ? `📍 ${esc(site)}` : null, who(user)])
 })
-const cashCloseMessage = ({ number, register, site, siteId, sales, byMethod, expected, counted, difference, toVault, tips, orders, user, tipsPaid = [], couriersPaid = [], nextFloat = 0, note }) => ({
+// Transferencias del turno (TD-017): cuánto se verificó, cuánto quedó por verificar y cuánto no llegó.
+const transfersLine = (t) => {
+  if (!t?.count) return null
+  if (t.verificada.count === t.count) return `📲 Transferencias verificadas: ${cop(t.amount)} (${t.count})`
+  return [`📲 Transferencias: ${cop(t.amount)}`, t.verificada.count ? `   ✅ Verificadas: ${cop(t.verificada.amount)} (${t.verificada.count})` : null,
+    t.pendiente.count ? `   ⏳ Por verificar: ${cop(t.pendiente.amount)} (${t.pendiente.count})` : null,
+    t.no_llego.count ? `   ❌ No llegaron: ${cop(t.no_llego.amount)} (${t.no_llego.count})` : null].filter(Boolean).join('\n')
+}
+const cashCloseMessage = ({ number, register, site, siteId, sales, byMethod, expected, counted, difference, toVault, tips, orders, user, tipsPaid = [], couriersPaid = [], nextFloat = 0, transfers = null, note }) => ({
   siteId, path: '/caja',
   html: lines([`🔒 <b>CIERRE DE CAJA · ${esc(number)}</b>`, SEP, `💵 ${esc(register)}${site ? ` · 📍 ${esc(site)}` : ''}`,
     `🧾 ${orders} pedido${orders === 1 ? '' : 's'} · ventas ${cop(sales)} · propinas ${cop(tips)}`,
     ...Object.entries(byMethod).map(([m, v]) => `   ${esc(m)}: ${cop(v)}`),
     `Efectivo esperado: ${cop(expected)}`, `Efectivo contado: ${cop(counted)}`,
     Number(difference) === 0 ? '✅ Cuadra exacto' : `${difference > 0 ? '⬆️ Sobrante' : '⚠️ Faltante'}: ${cop(Math.abs(difference))}`,
+    transfersLine(transfers),
     tipsPaid.length ? `🤝 Propinas pagadas:` : null, ...tipsPaid.map((t) => `   ${esc(t.name)}: ${cop(t.amount)}`),
     couriersPaid.length ? `🛵 Domiciliarios:` : null, ...couriersPaid.map((t) => `   ${esc(t.name)}: ${cop(t.amount)} (${t.deliveries} domicilio${t.deliveries === 1 ? '' : 's'})`),
     nextFloat > 0 ? `🪙 Queda en caja para el próximo turno: ${cop(nextFloat)}` : null,
@@ -175,4 +184,4 @@ const cashReceivedMessage = ({ order, amount, fee, received, change, courier, si
     '🧾 Cóbralo en caja cuando entregue el dinero.', site ? `📍 ${esc(site)} · ${hour()}` : hour()])
 })
 
-module.exports = { SECTIONS, cashReceivedMessage, tg, esc, qty, cop, loadSettings, notify, send, lowStockMessage, movementMessage, transferMessage, courtesyMessage, voidMessage, cashOpenMessage, cashCloseMessage, vaultMessage, callMessage, incidentMessage, cashRequestMessage, cashReopenMessage }
+module.exports = { transfersLine, SECTIONS, cashReceivedMessage, tg, esc, qty, cop, loadSettings, notify, send, lowStockMessage, movementMessage, transferMessage, courtesyMessage, voidMessage, cashOpenMessage, cashCloseMessage, vaultMessage, callMessage, incidentMessage, cashRequestMessage, cashReopenMessage }

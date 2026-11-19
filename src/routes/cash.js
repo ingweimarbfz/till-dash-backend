@@ -9,7 +9,8 @@
 const express = require('express')
 const supabase = require('../db')
 const { resolveSupplier } = require('../suppliers')
-const { h, fail, clean } = require('../http')
+const { h, fail, clean, imageError } = require('../http')
+const { TRANSFER_METHODS, MOVE_COLUMNS, loadTransfers, transferTotals } = require('../transfers')
 const { auth, ADMIN, STAFF } = require('../auth')
 const { audit } = require('../audit')
 const { notify, cashOpenMessage, cashCloseMessage, vaultMessage, cashRequestMessage, cashReopenMessage } = require('../notify')
@@ -25,13 +26,15 @@ const registerDTO = (r) => ({ id: r.id, siteId: r.site_id, site: r.site?.name ??
 
 // Resumen de un turno: ventas por forma de pago, propinas, abonos, ingresos, egresos y efectivo esperado.
 const sessionSummary = async (s) => {
-  const [{ data: moves }, { data: orders }, { data: payouts }, { data: credit }, { data: couriers }] = await Promise.all([
+  const [{ data: moves }, { data: orders }, { data: payouts }, { data: credit }, { data: couriers }, transfers] = await Promise.all([
     supabase.from('cash_movements').select('*, user:users(name, last_name)').eq('session_id', s.id).order('created_at'),
     supabase.from('orders').select('id, number, total, tip, discount_total, courtesy_total, table:dining_tables!orders_table_id_fkey(name), closed_at').eq('session_id', s.id).eq('status', 'cobrado').order('closed_at'),
     supabase.from('tip_payouts').select('id, amount, user_id, user:users!tip_payouts_user_id_fkey(name, last_name)').eq('session_id', s.id).order('id'),
     // Cobrado a cuenta por cobrar: no entra dinero a la caja, pero se vendió en el turno.
     supabase.from('order_payments').select('amount').eq('session_id', s.id).eq('method', 'cuenta_por_cobrar'),
-    supabase.from('courier_payouts').select('id, amount, deliveries, fees, share, tips, user_id, user:users!courier_payouts_user_id_fkey(name, last_name)').eq('session_id', s.id).order('id').then((r) => (r.error ? { data: [] } : r))
+    supabase.from('courier_payouts').select('id, amount, deliveries, fees, share, tips, user_id, user:users!courier_payouts_user_id_fkey(name, last_name)').eq('session_id', s.id).order('id').then((r) => (r.error ? { data: [] } : r)),
+    // Transferencias por verificar (TD-017). Si la tabla aún no existe, el resumen sigue sin ellas.
+    loadTransfers({ sessionId: s.id }).then(transferTotals).catch(() => null)
   ])
   const m = moves || []
   const os = orders || []
@@ -59,7 +62,7 @@ const sessionSummary = async (s) => {
     courtesies: os.reduce((a, o) => a + Number(o.courtesy_total), 0), courtesyCost: courtesyItems.reduce((a, x) => a + x.cost, 0), courtesyItems, orders: os.length,
     byMethod: Object.entries(byMethod).map(([method, amount]) => ({ method, label: PAY_METHODS[method], amount })),
     tipsPaid: -sum('propina_pagada'), couriersPaid: -sum('domicilio_pagado'), courierFloats: sum('base_domiciliario') + sum('retorno_domiciliario'),
-    expectedCash: s.status === 'cerrada' ? Number(s.expected_cash) : expected,
+    expectedCash: s.status === 'cerrada' ? Number(s.expected_cash) : expected, transfers,
     movements: m.map((x) => ({ id: x.id, type: x.type, typeLabel: MOVE_TYPES[x.type], method: x.method, methodLabel: PAY_METHODS[x.method], amount: Number(x.amount), ref: x.ref, note: x.note, orderId: x.order_id, user: fullName(x.user), createdAt: x.created_at })),
     tipPayouts: (payouts || []).map((t) => ({ id: t.id, userId: t.user_id, name: fullName(t.user), amount: Number(t.amount) })),
     courierPayouts: (couriers || []).map((t) => ({ id: t.id, userId: t.user_id, name: fullName(t.user), amount: Number(t.amount), deliveries: t.deliveries, fees: Number(t.fees), share: Number(t.share), tips: Number(t.tips) })),
@@ -231,13 +234,77 @@ router.post('/caja/turnos/:id/cerrar', auth(STAFF), guard('cajero'), h(async (re
   if (error) return dbError(res, error)
   const after = await loadSession(s.id)
   const summary = await sessionSummary(after)
-  await audit(req, 'cerrar', 'turno_caja', s.id, { number: s.number, expected: Number(data.expected), counted: Number(data.counted), difference: Number(data.difference), tipsPaid: Number(data.tipsPaid), nextFloat: Number(data.nextFloat), toVault: Number(data.toVault) })
+  const tr = summary.transfers
+  await audit(req, 'cerrar', 'turno_caja', s.id, { number: s.number, expected: Number(data.expected), counted: Number(data.counted), difference: Number(data.difference), tipsPaid: Number(data.tipsPaid), nextFloat: Number(data.nextFloat), toVault: Number(data.toVault), ...(tr?.count ? { transfersPending: tr.pendiente.amount, transfersMissing: tr.no_llego.amount } : {}) })
   notify('caja', () => cashCloseMessage({
     number: s.number, register: s.register?.name, site: s.site?.name, siteId: s.site_id, sales: before.sales, tips: before.tips, orders: before.orders,
     byMethod: Object.fromEntries(before.byMethod.map((x) => [x.label, x.amount])), expected: Number(data.expected), counted: Number(data.counted),
-    difference: Number(data.difference), toVault: Number(data.toVault), nextFloat: Number(data.nextFloat), tipsPaid: summary.tipPayouts, couriersPaid: summary.courierPayouts, note: clean(b.note), user: req.user
+    difference: Number(data.difference), toVault: Number(data.toVault), nextFloat: Number(data.nextFloat), tipsPaid: summary.tipPayouts, couriersPaid: summary.courierPayouts, transfers: tr, note: clean(b.note), user: req.user
   }))
   res.send({ ...sessionDTO(after), summary })
+}))
+
+// ---------------------------------------------------------------- Transferencias (TD-017)
+// Nequi, Daviplata y transferencias no entran al efectivo: se confirma que llegaron revisando la cuenta
+// o el celular, con foto del comprobante si se quiere. Lo que no se revise queda "por verificar".
+const CHECK_VALUES = ['pendiente', 'verificada', 'no_llego']
+router.get('/caja/turnos/:id/transferencias', auth(STAFF), guard('cajero'), h(async (req, res) => {
+  const s = await loadSession(req.params.id)
+  if (!s || !sameSite(req, s.site_id)) return fail(res, 'Turno no encontrado', 404)
+  const rows = await loadTransfers({ sessionId: s.id })
+  res.send({ rows, totals: transferTotals(rows) })
+}))
+// Todas las transferencias de la sucursal en los últimos días (por defecto 30), para revisar lo pendiente.
+router.get('/caja/transferencias', auth(STAFF), guard('cajero'), h(async (req, res) => {
+  const site = ADMIN.includes(req.user.role) ? req.siteId : req.user.site_id
+  const days = Math.min(Math.max(Math.round(Number(req.query.dias)) || 30, 1), 180)
+  const all = await loadTransfers({ siteId: site, from: new Date(Date.now() - days * 864e5).toISOString() })
+  const rows = CHECK_VALUES.includes(req.query.estado) ? all.filter((r) => r.status === req.query.estado) : all
+  res.send({ rows: rows.reverse(), totals: transferTotals(all), days })
+}))
+const loadTransferMove = async (req) => {
+  const { data: m } = await supabase.from('cash_movements').select(MOVE_COLUMNS).eq('id', Number(req.params.id)).maybeSingle()
+  if (!m || !TRANSFER_METHODS.includes(m.method) || !['venta', 'abono'].includes(m.type) || !(Number(m.amount) > 0) || !sameSite(req, m.session.site_id)) return null
+  return m
+}
+router.get('/caja/transferencias/:id(\\d+)/comprobante', auth(STAFF), guard('cajero'), h(async (req, res) => {
+  const m = await loadTransferMove(req)
+  if (!m) return fail(res, 'Transferencia no encontrada', 404)
+  const { data } = await supabase.from('transfer_checks').select('proof').eq('movement_id', m.id).maybeSingle()
+  if (!data?.proof) return fail(res, 'Esta transferencia no tiene comprobante', 404)
+  res.send({ proof: data.proof })
+}))
+// Marca una transferencia: verificada (llegó), no_llego o pendiente (deshace la revisión).
+// body: { status, account?, note?, proof? } · proof: data URL de la foto; null la quita; sin el campo, se deja la que había.
+router.put('/caja/transferencias/:id(\\d+)', auth(STAFF), guard('cajero'), h(async (req, res) => {
+  const m = await loadTransferMove(req)
+  if (!m) return fail(res, 'Transferencia no encontrada', 404)
+  const b = req.body || {}
+  if (!CHECK_VALUES.includes(b.status)) return fail(res, 'Indica si la transferencia llegó o no', 400)
+  const admin = ADMIN.includes(req.user.role)
+  const { data: prev } = await supabase.from('transfer_checks').select('status').eq('movement_id', m.id).maybeSingle()
+  // Con el turno cerrado, el cajero puede terminar de verificar lo pendiente; cambiar lo ya revisado es del administrador.
+  if (!admin && m.session.status !== 'abierta' && prev) return fail(res, 'El turno ya se cerró: solo el administrador puede cambiar una transferencia ya revisada', 403)
+  if (b.status === 'pendiente') {
+    if (prev) {
+      const { error } = await supabase.from('transfer_checks').delete().eq('movement_id', m.id)
+      if (error) throw error
+    }
+  } else {
+    if (b.status === 'no_llego' && !clean(b.note)) return fail(res, 'Escribe qué pasó con la transferencia que no llegó', 400)
+    const row = { movement_id: m.id, status: b.status, account: clean(b.account) || null, note: clean(b.note) || null, checked_by: req.user.id, checked_at: new Date().toISOString() }
+    if (b.proof !== undefined) {
+      const err = imageError(b.proof, 2000)
+      if (err) return fail(res, err, 400)
+      row.proof = b.proof || null
+    }
+    const { error } = await supabase.from('transfer_checks').upsert(row, { onConflict: 'movement_id' })
+    if (error) throw error
+  }
+  await audit(req, b.status === 'pendiente' ? 'deshacer_verificacion' : b.status === 'verificada' ? 'verificar_transferencia' : 'transferencia_no_llego', 'turno_caja', m.session_id,
+    { number: m.session.number, ref: m.ref, method: m.method, amount: Number(m.amount), from: prev?.status || 'pendiente', note: clean(b.note) || undefined })
+  const rows = await loadTransfers({ sessionId: m.session_id })
+  res.send(rows.find((r) => r.id === m.id))
 }))
 
 // ---------------------------------------------------------------- Gastos del turno y solicitudes de recursos

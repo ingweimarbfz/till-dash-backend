@@ -31,7 +31,9 @@ const TENANT_TABLES = new Set([
   // TD-017: verificación de transferencias
   'transfer_checks',
   // TD-020: pagos al personal
-  'staff_earnings'
+  'staff_earnings',
+  // TD-024: precio de cada producto por sucursal
+  'product_site_prices'
 ])
 
 const withOrg = (rows, org) => (Array.isArray(rows) ? rows.map((r) => ({ ...r, org_id: org })) : { ...rows, org_id: org })

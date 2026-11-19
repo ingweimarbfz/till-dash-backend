@@ -52,6 +52,8 @@ const promoBrief = (p, price, listPrice) => ({
   endsAt: p.ends_at, timeTo: hm(p.time_to), price, savings: listPrice - price
 })
 
-const loadActive = async () => (await supabase.from('promotions').select('*').eq('active', true)).data || []
+// Promociones activas; con siteId, solo las que aplican en esa sucursal (TD-024: site_ids vacío = todas).
+const loadActive = async (siteId = null) => ((await supabase.from('promotions').select('*').eq('active', true)).data || [])
+  .filter((p) => !siteId || !(p.site_ids || []).length || p.site_ids.map(Number).includes(Number(siteId)))
 
 module.exports = { statusOf, bestFor, priceWith, promoBrief, loadActive, hm, bogota, covers }

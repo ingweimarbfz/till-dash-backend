@@ -34,17 +34,29 @@ const sessionSummary = async (s) => {
     supabase.from('courier_payouts').select('id, amount, deliveries, fees, share, tips, user_id, user:users!courier_payouts_user_id_fkey(name, last_name)').eq('session_id', s.id).order('id').then((r) => (r.error ? { data: [] } : r))
   ])
   const m = moves || []
+  const os = orders || []
+  // Cortesías del turno (TD-013): lo que se regaló, a precio de venta y a costo (lo que asume el establecimiento).
+  const gifts = []
+  for (let i = 0; i < os.length; i += 300) {
+    const { data } = await supabase.from('order_items').select('id, order_id, name, quantity, unit_price, courtesy_reason, product:products(cost)')
+      .in('order_id', os.slice(i, i + 300).map((o) => o.id)).eq('courtesy', true).neq('status', 'anulado').order('id')
+    gifts.push(...(data || []))
+  }
+  const byOrder = new Map(os.map((o) => [o.id, o]))
+  const courtesyItems = gifts.map((g) => ({
+    id: g.id, orderId: g.order_id, order: byOrder.get(g.order_id)?.number ?? null, name: g.name, quantity: Number(g.quantity), reason: g.courtesy_reason,
+    value: Math.round(Number(g.quantity) * Number(g.unit_price)), cost: Math.round(Number(g.quantity) * Number(g.product?.cost || 0))
+  }))
   const byMethod = {}
   for (const x of m.filter((y) => y.type === 'venta' || y.type === 'abono')) byMethod[x.method] = (byMethod[x.method] || 0) + Number(x.amount)
   const cxc = (credit || []).reduce((a, x) => a + Number(x.amount), 0)
   if (cxc) byMethod.cuenta_por_cobrar = (byMethod.cuenta_por_cobrar || 0) + cxc
   const sum = (t) => m.filter((x) => x.type === t).reduce((a, x) => a + Number(x.amount), 0)
   const expected = m.filter((x) => x.method === 'efectivo').reduce((a, x) => a + Number(x.amount), 0)
-  const os = orders || []
   return {
     sales: sum('venta'), receivablePayments: sum('abono'), income: sum('ingreso'), expenses: -sum('egreso'), toVault: -sum('a_boveda'),
     tips: os.reduce((a, o) => a + Number(o.tip), 0), discounts: os.reduce((a, o) => a + Number(o.discount_total), 0),
-    courtesies: os.reduce((a, o) => a + Number(o.courtesy_total), 0), orders: os.length,
+    courtesies: os.reduce((a, o) => a + Number(o.courtesy_total), 0), courtesyCost: courtesyItems.reduce((a, x) => a + x.cost, 0), courtesyItems, orders: os.length,
     byMethod: Object.entries(byMethod).map(([method, amount]) => ({ method, label: PAY_METHODS[method], amount })),
     tipsPaid: -sum('propina_pagada'), couriersPaid: -sum('domicilio_pagado'), courierFloats: sum('base_domiciliario') + sum('retorno_domiciliario'),
     expectedCash: s.status === 'cerrada' ? Number(s.expected_cash) : expected,

@@ -14,10 +14,11 @@ const { audit } = require('../audit')
 const { bestFor, loadActive } = require('../promo')
 const { checkLowStock } = require('../stock')
 const { notify, courtesyMessage, voidMessage } = require('../notify')
-const { cashOpenAt, NO_CASH, can, guard, workSite, sameSite, dbError, money, isMoney, PAY_METHODS, fullName } = require('../ops')
+const { cashOpenAt, NO_CASH, can, guard, workSite, sameSite, dbError, money, isMoney, PAY_METHODS, fullName, itemsBlock } = require('../ops')
 const { qty } = require('./inventory')
 const plan = require('../plan')
 const { customerFromBody, createCustomer } = require('./customers')
+const { validateSplit } = require('../split')
 
 const router = express.Router()
 
@@ -49,8 +50,9 @@ const orderDTO = (o) => ({
   discount: o.discount_type ? { id: o.discount_id, name: o.discount_name, type: o.discount_type, value: Number(o.discount_value), reason: o.discount_reason } : null,
   discountTotal: Number(o.discount_total), tip: Number(o.tip), deliveryFee: Number(o.delivery_fee || 0), total: Number(o.total), paid: Number(o.paid),
   courier: o.courier ? { id: o.courier.id, name: fullName(o.courier) } : null, deliveryStatus: o.delivery_status || null, deliveryPayMethod: o.delivery_pay_method || null, deliveryCashWith: o.delivery_cash_with === null || o.delivery_cash_with === undefined ? null : Number(o.delivery_cash_with), dispatchedAt: o.dispatched_at || null, arrivedAt: o.arrived_at || null,
-  billRequestedAt: o.bill_requested_at, voidReason: o.void_reason, openedAt: o.opened_at, closedAt: o.closed_at,
-  items: o.items ? o.items.sort((a, b) => a.id - b.id).map(itemDTO) : undefined
+  split: o.split || null, billRequestedAt: o.bill_requested_at, voidReason: o.void_reason, openedAt: o.opened_at, closedAt: o.closed_at,
+  items: o.items ? o.items.sort((a, b) => a.id - b.id).map(itemDTO) : undefined,
+  dispatchBlock: o.type === 'domicilio' && o.items && (o.delivery_status || 'por_despachar') === 'por_despachar' ? itemsBlock(o.number, o.items) : null
 })
 
 // Alias temporal de la mesa: texto corto, se borra al cerrar el pedido.
@@ -95,20 +97,23 @@ router.get('/pedidos/:id', auth(STAFF), h(async (req, res) => {
   ])
   res.send({
     ...orderDTO(o),
-    payments: (pays || []).map((p) => ({ id: p.id, method: p.method, methodLabel: PAY_METHODS[p.method], amount: Number(p.amount), received: p.received === null ? null : Number(p.received), change: p.change === null ? null : Number(p.change), reference: p.reference, user: fullName(p.user), createdAt: p.created_at })),
+    payments: (pays || []).map((p) => ({ id: p.id, method: p.method, methodLabel: PAY_METHODS[p.method], amount: Number(p.amount), received: p.received === null ? null : Number(p.received), change: p.change === null ? null : Number(p.change), reference: p.reference, payer: p.payer || null, user: fullName(p.user), createdAt: p.created_at })),
     receivables: (cxc || []).map((r) => ({ id: r.id, number: r.number, customerName: r.customer_name, amount: Number(r.amount), paid: Number(r.paid), status: r.status }))
   })
 }))
 
 // ---------------------------------------------------------------- Productos del pedido
 // Arma las filas con el precio vigente (promoción incluida) y el área de la categoría.
-const buildItems = async (req, items) => {
+// Cortesía al agregar (TD-013): { courtesy: true, courtesyReason } en productos marcados "se puede dar
+// como cortesía"; el cajero y el administrador pueden darla en cualquier producto. Desde el QR no aplica.
+const COURTESY_DEFAULT = 'Cortesía de la casa'
+const buildItems = async (req, items, { allowCourtesy = true } = {}) => {
   const list = (Array.isArray(items) ? items : []).filter((i) => Number(i.productId) && Number(i.quantity) > 0)
   if (!list.length) return { error: 'Agrega al menos un producto' }
   if (list.length > 60) return { error: 'Máximo 60 productos por envío' }
   const ids = [...new Set(list.map((i) => Number(i.productId)))]
   const [{ data: prods }, promos] = await Promise.all([
-    supabase.from('products').select('id, name, price, category_id, active, track_stock, category:product_categories(area)').in('id', ids),
+    supabase.from('products').select('id, name, price, cost, category_id, active, track_stock, courtesy_allowed, category:product_categories(area)').in('id', ids),
     loadActive()
   ])
   const byId = new Map((prods || []).map((p) => [p.id, p]))
@@ -117,7 +122,10 @@ const buildItems = async (req, items) => {
     const p = byId.get(Number(i.productId))
     if (!p || !p.active) return { error: 'Uno de los productos no existe o está inactivo' }
     const best = bestFor(promos, p)
+    const gift = Boolean(i.courtesy) && allowCourtesy
+    if (gift && !p.courtesy_allowed && !can(req.user, 'cajero')) return { error: `${p.name} no está habilitado como cortesía. Pídele a la caja que la dé o actívalo en el producto.` }
     rows.push({
+      ...(gift ? { courtesy: true, courtesy_reason: clean(i.courtesyReason)?.slice(0, 200) || COURTESY_DEFAULT, courtesy_by: req.user.id } : {}),
       product_id: p.id, name: p.name, area: p.category?.area || 'ninguna', quantity: qty(i.quantity), list_price: Number(p.price),
       unit_price: best ? best.price : Number(p.price), promotion_id: best?.promo.id ?? null, promotion_name: best?.promo.name ?? null,
       note: clean(i.note)?.slice(0, 200) ?? null, user_id: req.user.id, status: p.category?.area && p.category.area !== 'ninguna' ? 'pendiente' : 'listo'
@@ -134,10 +142,18 @@ const insertItems = async (req, order, rows) => {
   return { data }
 }
 
+// Cortesías marcadas al agregar: quedan en la bitácora y avisan por Telegram como las de la caja.
+const courtesiesAdded = (req, order, rows) => {
+  for (const it of rows.filter((x) => x.courtesy)) {
+    audit(req, 'cortesia', 'pedido', order.id, { number: order.number, item: it.name, quantity: Number(it.quantity), reason: it.courtesy_reason }).catch(() => {})
+    notify('pedidos', () => courtesyMessage({ order, item: it, reason: it.courtesy_reason, user: req.user, siteId: order.site_id, site: order.site?.name }))
+  }
+}
+
 // Pedido de una mesa desde el QR: usa el pedido abierto de la mesa o abre uno, y le agrega los productos.
 // userId: el mesero que aceptó el pedido, o null si el cliente lo hizo directo (queda a nombre del mesero de la mesa).
 const addToTable = async ({ orgId, table, items, userId = null, note = null }) => {
-  const built = await buildItems({ user: { id: userId } }, items)
+  const built = await buildItems({ user: { id: userId } }, items, { allowCourtesy: false })
   if (built.error) return { error: built.error }
   const find = async () => (await supabase.from('orders').select('id, number, site_id, waiter_id').eq('table_id', table.id).eq('status', 'abierto').maybeSingle()).data
   let o = await find()
@@ -214,6 +230,7 @@ router.post('/pedidos', auth(STAFF), guard(...SELLERS), h(async (req, res) => {
       await supabase.from('orders').delete().eq('id', order.id)
       return dbError(res, r.error)
     }
+    courtesiesAdded(req, { ...order, site_id: site }, built.rows)
   }
   if (table) await supabase.from('dining_tables').update({ to_release_at: null }).eq('id', table.id)
   await supabase.from('table_calls').update({ status: 'atendido', attended_by: req.user.id, attended_at: new Date().toISOString() }).eq('table_id', table?.id ?? 0).eq('kind', 'mesero').eq('status', 'pendiente')
@@ -229,7 +246,8 @@ router.post('/pedidos/:id/items', auth(STAFF), guard(...SELLERS), h(async (req, 
   if (built.error) return fail(res, built.error, 400)
   const r = await insertItems(req, o, built.rows)
   if (r.error) return dbError(res, r.error)
-  await audit(req, 'agregar', 'pedido', o.id, { number: o.number, items: built.rows.map((x) => `${x.quantity} × ${x.name}`) })
+  await audit(req, 'agregar', 'pedido', o.id, { number: o.number, items: built.rows.map((x) => `${x.quantity} × ${x.name}${x.courtesy ? ' (cortesía)' : ''}`) })
+  courtesiesAdded(req, o, built.rows)
   res.status(201).send(orderDTO(await loadOrder(o.id)))
 }))
 
@@ -361,6 +379,16 @@ const validatePayments = (payments) => {
   return null
 }
 
+// Guarda el reparto en el pedido y el pagador de cada pago (se insertaron en el mismo orden). Si falla, el cobro ya quedó hecho.
+const saveSplit = async (orderId, { split, payers }) => {
+  try {
+    const { error } = await supabase.from('orders').update({ split }).eq('id', orderId)
+    if (error) throw error
+    const { data: rows } = await supabase.from('order_payments').select('id').eq('order_id', orderId).order('id')
+    await Promise.all((rows || []).slice(-payers.length).map((r, n) => supabase.from('order_payments').update({ payer: payers[n] }).eq('id', r.id)))
+  } catch (e) { console.error('[cuenta dividida]', e.message) }
+}
+
 router.post('/pedidos/:id/cobrar', auth(STAFF), guard('cajero'), h(async (req, res) => {
   const o = await orderFor(req, res)
   if (!o) return
@@ -386,6 +414,13 @@ router.post('/pedidos/:id/cobrar', auth(STAFF), guard('cajero'), h(async (req, r
     }
   }
   const payments = b.payments.map((p) => ({ method: p.method, amount: money(p.amount), received: p.method === 'efectivo' && isMoney(p.received) && p.received !== '' ? money(p.received) : null, reference: clean(p.reference) }))
+  // Cuenta dividida entre personas (TD-014): cada pago dice de quién es y las partes deben cuadrar.
+  let split = null
+  if (b.split) {
+    const r = validateSplit(b.split, b.payments, o)
+    if (r.error) return fail(res, r.error, 400)
+    split = r
+  }
   const { data, error } = await supabase.rpc('charge_order', {
     p: {
       org_id: req.user.org_id, order_id: o.id, session_id: session?.id ?? null, user_id: req.user.id, tip: money(b.tip), discount, payments,
@@ -394,7 +429,8 @@ router.post('/pedidos/:id/cobrar', auth(STAFF), guard('cajero'), h(async (req, r
     }
   })
   if (error) return dbError(res, error)
-  await audit(req, 'cobrar', 'pedido', o.id, { number: o.number, total: Number(data.total), tip: money(b.tip), discount: discount?.name ?? null, methods: payments.map((p) => p.method), session: session?.id ?? null, deliveryFee: Number(data.deliveryFee || 0) })
+  if (split) await saveSplit(o.id, split)
+  await audit(req, 'cobrar', 'pedido', o.id, { number: o.number, total: Number(data.total), tip: money(b.tip), discount: discount?.name ?? null, methods: payments.map((p) => p.method), session: session?.id ?? null, deliveryFee: Number(data.deliveryFee || 0), ...(split ? { split: split.split.label, persons: split.split.persons.map((p) => `${p.name}: ${p.amount}`) } : {}) })
   res.send({ ...orderDTO(await loadOrder(o.id)), change: Number(data.change || 0), receivable: data.receivable })
 }))
 

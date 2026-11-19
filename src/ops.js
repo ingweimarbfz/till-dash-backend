@@ -44,4 +44,18 @@ const cashOpenAt = async (siteId) => {
 }
 const NO_CASH = 'La caja del día no está abierta. Pide al cajero que abra el turno antes de tomar pedidos.'
 
-module.exports = { cashOpenAt, NO_CASH, can, guard, workSite, sameSite, dbError, money, isMoney, PAY_METHODS, fullName }
+// Domicilios (TD-012): por qué un domicilio todavía no puede salir. Sin productos, o con productos de cocina,
+// bar o barista que las comandas aún no han entregado. null si ya puede salir.
+const PREP_AREAS = ['cocina', 'bar', 'barista']
+const itemsBlock = (number, items) => {
+  const live = (items || []).filter((i) => i.status !== 'anulado')
+  if (!live.length) return `El ${number} no tiene productos. Agrégalos antes de despacharlo.`
+  const waiting = live.filter((i) => ['pendiente', 'preparando'].includes(i.status) || (i.status === 'listo' && PREP_AREAS.includes(i.area)))
+  if (waiting.length) {
+    const areas = [...new Set(waiting.map((i) => i.area).filter((a) => PREP_AREAS.includes(a)))]
+    return `El ${number} todavía no sale de comandas${areas.length ? ` (${areas.join(', ')})` : ''}. Cuando lo marquen "Entregado" en comandas, ya puede salir.`
+  }
+  return null
+}
+
+module.exports = { itemsBlock, cashOpenAt, NO_CASH, can, guard, workSite, sameSite, dbError, money, isMoney, PAY_METHODS, fullName }

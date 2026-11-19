@@ -71,6 +71,10 @@ const payFrom = (b) => {
   return { courier_pay: courierPay, pay_mode: mode, hour_rate: mode === 'turno' ? hourRate : 0, overtime_rate: mode === 'turno' ? overtimeRate : 0, salary: mode === 'nomina' ? salary : 0, pay_period: b.payPeriod === 'quincenal' ? 'quincenal' : 'mensual' }
 }
 
+// TD-026: el domiciliario externo no trabaja para la empresa. Solo se le paga por domicilios (su parte del
+// valor de cada uno); nunca por jornada, turno ni nómina. Se aplica después de payFrom y sin importar el permiso.
+const externalPay = (courier) => (courier?.courier_external ? { courier_pay: 'domicilios', pay_mode: 'ninguno', hour_rate: 0, overtime_rate: 0, salary: 0 } : {})
+
 // Base y vehículo del domiciliario (TD-022): lo edita cualquier administrador; no depende del permiso de pagos.
 const courierPatch = (b, positions) => (positions.includes('domiciliario') ? courierFrom(b) : NOT_COURIER)
 
@@ -121,7 +125,8 @@ router.post('/usuarios', auth(ADMIN), h(async (req, res) => {
     password_hash: await bcrypt.hash(String(b.password || clean(b.identification)), 10),
     active: b.active !== false,
     ...courierPatch(b, positions),
-    ...(b.payMode !== undefined && canManagePay(req.user) ? payFrom(b) : {}),
+    ...(b.payMode !== undefined && canManagePay(req.user) ? payFrom({ ...b, ...(courierPatch(b, positions).courier_external ? { courierPay: 'domicilios', payMode: 'ninguno' } : {}) }) : {}),
+    ...externalPay(courierPatch(b, positions)),
     ...payPermission(req, b, role)
   }).select(PAY_COLUMNS).single()
   if (error) return dupMessage(error) ? fail(res, dupMessage(error), 409) : fail(res, error)
@@ -158,8 +163,10 @@ router.put('/usuarios/:id', auth(ADMIN), h(async (req, res) => {
     active: b.active !== false
   }
   if (b.avatarUrl !== undefined) patch.avatar_url = clean(b.avatarUrl)
-  Object.assign(patch, courierPatch(b, positions))
-  if (b.payMode !== undefined && canManagePay(req.user)) Object.assign(patch, payFrom(b))
+  const courier = courierPatch(b, positions)
+  Object.assign(patch, courier)
+  if (b.payMode !== undefined && canManagePay(req.user)) Object.assign(patch, payFrom(courier.courier_external ? { ...b, courierPay: 'domicilios', payMode: 'ninguno' } : b))
+  Object.assign(patch, externalPay(courier))
   Object.assign(patch, payPermission(req, b, role))
   if (b.resetPassword) patch.password_hash = await bcrypt.hash(String(patch.identification), 10)
   else if (b.password) patch.password_hash = await bcrypt.hash(b.password, 10)

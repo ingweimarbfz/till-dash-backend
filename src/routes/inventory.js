@@ -92,7 +92,7 @@ router.put('/inventario/categorias/:id', auth(ADMIN), h(async (req, res) => {
 }))
 
 // ---------------------------------------------------------------- Productos
-const PRODUCT_COLUMNS = 'id, sku, name, category_id, description, unit, cost, price, track_stock, stock, min_stock, photo_url, show_in_menu, active, supplier_id, category:product_categories(id, name, emoji, color, area), supplier:suppliers(id, name)'
+const PRODUCT_COLUMNS = 'id, sku, name, category_id, description, unit, cost, price, track_stock, stock, min_stock, photo_url, show_in_menu, courtesy_allowed, active, supplier_id, category:product_categories(id, name, emoji, color, area), supplier:suppliers(id, name)'
 // promos: promociones activas; si alguna está vigente para el producto, se informa el precio con promoción.
 const productDTO = (p, promos = []) => {
   const best = bestFor(promos, p)
@@ -100,7 +100,7 @@ const productDTO = (p, promos = []) => {
     id: p.id, sku: p.sku, name: p.name, categoryId: p.category_id, category: p.category?.name ?? null, categoryEmoji: p.category?.emoji ?? null,
     categoryColor: p.category?.color ?? null, area: p.category?.area ?? null, description: p.description, unit: p.unit, unitLabel: UNITS[p.unit],
     cost: Number(p.cost), price: Number(p.price), trackStock: p.track_stock, stock: Number(p.stock), minStock: Number(p.min_stock),
-    lowStock: p.track_stock && isLow(p.stock, p.min_stock), photoUrl: p.photo_url, showInMenu: p.show_in_menu, active: p.active, supplierId: p.supplier_id ?? null, supplier: p.supplier?.name ?? null,
+    lowStock: p.track_stock && isLow(p.stock, p.min_stock), photoUrl: p.photo_url, showInMenu: p.show_in_menu, courtesyAllowed: Boolean(p.courtesy_allowed), active: p.active, supplierId: p.supplier_id ?? null, supplier: p.supplier?.name ?? null,
     promo: best ? promoBrief(best.promo, best.price, Number(p.price)) : null, finalPrice: best ? best.price : Number(p.price),
     ...(p.gallery !== undefined ? { gallery: p.gallery || [] } : {})
   }
@@ -131,7 +131,7 @@ const validateProduct = async (b) => {
 const productRow = (b) => ({
   sku: clean(b.sku), name: clean(b.name), category_id: num(b.categoryId), description: clean(b.description), unit: UNITS[b.unit] ? b.unit : 'und',
   cost: Number(b.cost) || 0, price: Number(b.price) || 0, track_stock: b.trackStock !== false, min_stock: qty(Number(b.minStock) || 0),
-  photo_url: clean(b.photoUrl), show_in_menu: b.showInMenu !== false, active: b.active !== false, supplier_id: num(b.supplierId) || null,
+  photo_url: clean(b.photoUrl), show_in_menu: b.showInMenu !== false, ...(b.courtesyAllowed !== undefined ? { courtesy_allowed: b.courtesyAllowed === true } : {}), active: b.active !== false, supplier_id: num(b.supplierId) || null,
   ...(Array.isArray(b.gallery) ? { gallery: b.gallery.filter(Boolean).slice(0, 3) } : {})
 })
 

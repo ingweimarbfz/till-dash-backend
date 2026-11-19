@@ -104,13 +104,16 @@ router.get('/pedidos/:id', auth(STAFF), h(async (req, res) => {
 
 // ---------------------------------------------------------------- Productos del pedido
 // Arma las filas con el precio vigente (promoción incluida) y el área de la categoría.
-const buildItems = async (req, items) => {
+// Cortesía al agregar (TD-013): { courtesy: true, courtesyReason } en productos marcados "se puede dar
+// como cortesía"; el cajero y el administrador pueden darla en cualquier producto. Desde el QR no aplica.
+const COURTESY_DEFAULT = 'Cortesía de la casa'
+const buildItems = async (req, items, { allowCourtesy = true } = {}) => {
   const list = (Array.isArray(items) ? items : []).filter((i) => Number(i.productId) && Number(i.quantity) > 0)
   if (!list.length) return { error: 'Agrega al menos un producto' }
   if (list.length > 60) return { error: 'Máximo 60 productos por envío' }
   const ids = [...new Set(list.map((i) => Number(i.productId)))]
   const [{ data: prods }, promos] = await Promise.all([
-    supabase.from('products').select('id, name, price, category_id, active, track_stock, category:product_categories(area)').in('id', ids),
+    supabase.from('products').select('id, name, price, cost, category_id, active, track_stock, courtesy_allowed, category:product_categories(area)').in('id', ids),
     loadActive()
   ])
   const byId = new Map((prods || []).map((p) => [p.id, p]))
@@ -119,7 +122,10 @@ const buildItems = async (req, items) => {
     const p = byId.get(Number(i.productId))
     if (!p || !p.active) return { error: 'Uno de los productos no existe o está inactivo' }
     const best = bestFor(promos, p)
+    const gift = Boolean(i.courtesy) && allowCourtesy
+    if (gift && !p.courtesy_allowed && !can(req.user, 'cajero')) return { error: `${p.name} no está habilitado como cortesía. Pídele a la caja que la dé o actívalo en el producto.` }
     rows.push({
+      ...(gift ? { courtesy: true, courtesy_reason: clean(i.courtesyReason)?.slice(0, 200) || COURTESY_DEFAULT, courtesy_by: req.user.id } : {}),
       product_id: p.id, name: p.name, area: p.category?.area || 'ninguna', quantity: qty(i.quantity), list_price: Number(p.price),
       unit_price: best ? best.price : Number(p.price), promotion_id: best?.promo.id ?? null, promotion_name: best?.promo.name ?? null,
       note: clean(i.note)?.slice(0, 200) ?? null, user_id: req.user.id, status: p.category?.area && p.category.area !== 'ninguna' ? 'pendiente' : 'listo'
@@ -136,10 +142,18 @@ const insertItems = async (req, order, rows) => {
   return { data }
 }
 
+// Cortesías marcadas al agregar: quedan en la bitácora y avisan por Telegram como las de la caja.
+const courtesiesAdded = (req, order, rows) => {
+  for (const it of rows.filter((x) => x.courtesy)) {
+    audit(req, 'cortesia', 'pedido', order.id, { number: order.number, item: it.name, quantity: Number(it.quantity), reason: it.courtesy_reason }).catch(() => {})
+    notify('pedidos', () => courtesyMessage({ order, item: it, reason: it.courtesy_reason, user: req.user, siteId: order.site_id, site: order.site?.name }))
+  }
+}
+
 // Pedido de una mesa desde el QR: usa el pedido abierto de la mesa o abre uno, y le agrega los productos.
 // userId: el mesero que aceptó el pedido, o null si el cliente lo hizo directo (queda a nombre del mesero de la mesa).
 const addToTable = async ({ orgId, table, items, userId = null, note = null }) => {
-  const built = await buildItems({ user: { id: userId } }, items)
+  const built = await buildItems({ user: { id: userId } }, items, { allowCourtesy: false })
   if (built.error) return { error: built.error }
   const find = async () => (await supabase.from('orders').select('id, number, site_id, waiter_id').eq('table_id', table.id).eq('status', 'abierto').maybeSingle()).data
   let o = await find()
@@ -216,6 +230,7 @@ router.post('/pedidos', auth(STAFF), guard(...SELLERS), h(async (req, res) => {
       await supabase.from('orders').delete().eq('id', order.id)
       return dbError(res, r.error)
     }
+    courtesiesAdded(req, { ...order, site_id: site }, built.rows)
   }
   if (table) await supabase.from('dining_tables').update({ to_release_at: null }).eq('id', table.id)
   await supabase.from('table_calls').update({ status: 'atendido', attended_by: req.user.id, attended_at: new Date().toISOString() }).eq('table_id', table?.id ?? 0).eq('kind', 'mesero').eq('status', 'pendiente')
@@ -231,7 +246,8 @@ router.post('/pedidos/:id/items', auth(STAFF), guard(...SELLERS), h(async (req, 
   if (built.error) return fail(res, built.error, 400)
   const r = await insertItems(req, o, built.rows)
   if (r.error) return dbError(res, r.error)
-  await audit(req, 'agregar', 'pedido', o.id, { number: o.number, items: built.rows.map((x) => `${x.quantity} × ${x.name}`) })
+  await audit(req, 'agregar', 'pedido', o.id, { number: o.number, items: built.rows.map((x) => `${x.quantity} × ${x.name}${x.courtesy ? ' (cortesía)' : ''}`) })
+  courtesiesAdded(req, o, built.rows)
   res.status(201).send(orderDTO(await loadOrder(o.id)))
 }))
 

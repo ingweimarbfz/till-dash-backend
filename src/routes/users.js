@@ -51,9 +51,9 @@ const positionsFrom = (b, role, extra) => {
 
 // Forma de pago (TD-020): por turno (horas × valor de la hora), nómina (salario quincenal o mensual) o ninguna.
 const PAY_MODES = ['ninguno', 'turno', 'nomina']
-const PAY_COLUMNS = `${USER_COLUMNS}, pay_mode, hour_rate, overtime_rate, salary, pay_period`
+const PAY_COLUMNS = `${USER_COLUMNS}, pay_mode, hour_rate, overtime_rate, salary, pay_period, courier_pay`
 // Los datos de pago solo los ve quien tiene el permiso de pagos (TD-021).
-const withPay = (u, show = true) => (!show ? toUserDTO(u) : { ...toUserDTO(u), payMode: u.pay_mode || 'ninguno', hourRate: Number(u.hour_rate || 0), overtimeRate: Number(u.overtime_rate || 0), salary: Number(u.salary || 0), payPeriod: u.pay_period || 'mensual' })
+const withPay = (u, show = true) => (!show ? toUserDTO(u) : { ...toUserDTO(u), payMode: u.pay_mode || 'ninguno', hourRate: Number(u.hour_rate || 0), overtimeRate: Number(u.overtime_rate || 0), salary: Number(u.salary || 0), payPeriod: u.pay_period || 'mensual', courierPay: u.courier_pay || 'domicilios' })
 // Permiso de pagos: solo el super administrador lo da, y solo a administradores.
 const payPermission = (req, b, role) => (req.user.role === 'superadmin' && b.canManagePay !== undefined ? { can_manage_pay: role === 'admin' && Boolean(b.canManagePay) } : {})
 const payFrom = (b) => {
@@ -64,7 +64,10 @@ const payFrom = (b) => {
   if (hourRate < 0 || overtimeRate < 0 || salary < 0) throw new HttpError('Los valores de pago no pueden ser negativos')
   if (mode === 'turno' && !hourRate) throw new HttpError('Escribe el valor de la hora para pagarle por turnos')
   if (mode === 'nomina' && !salary) throw new HttpError('Escribe el salario de la quincena o del mes')
-  return { pay_mode: mode, hour_rate: mode === 'turno' ? hourRate : 0, overtime_rate: mode === 'turno' ? overtimeRate : 0, salary: mode === 'nomina' ? salary : 0, pay_period: b.payPeriod === 'quincenal' ? 'quincenal' : 'mensual' }
+  // Domiciliario por jornada (TD-021): se le paga como empleado, así que necesita turno o nómina.
+  const courierPay = b.courierPay === 'jornada' ? 'jornada' : 'domicilios'
+  if (courierPay === 'jornada' && (b.positions || []).includes('domiciliario') && mode === 'ninguno') throw new HttpError('Al domiciliario por jornada elígele pago por turno o por nómina')
+  return { courier_pay: courierPay, pay_mode: mode, hour_rate: mode === 'turno' ? hourRate : 0, overtime_rate: mode === 'turno' ? overtimeRate : 0, salary: mode === 'nomina' ? salary : 0, pay_period: b.payPeriod === 'quincenal' ? 'quincenal' : 'mensual' }
 }
 
 const dupMessage = (e) => (e?.code === '23505'

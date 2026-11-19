@@ -51,3 +51,17 @@ test('con pérdida no hay utilidad para repartir y los meses salen en orden', ()
 test('fondo: vacío o general es el fondo general', () => {
   assert.strictEqual(fundSite(''), null); assert.strictEqual(fundSite('general'), null); assert.strictEqual(fundSite('3'), 3)
 })
+
+// TD-037: "¿En qué se va el dinero?" incluye los gastos de caja (turnos pagados al cerrar), banco y socios.
+test('allExpensesByCategory suma todas las fuentes', () => {
+  const { allExpensesByCategory } = require('../src/routes/finance')
+  const rows = allExpensesByCategory([
+    { category: 'nomina', source: 'fondo', amount: '24000' },
+    { category: 'nomina', source: 'caja', amount: '68000' },
+    { category: 'arriendo', source: 'fondo', amount: '2200000' }
+  ])
+  assert.equal(rows[0].key, 'arriendo')
+  const n = rows.find((r) => r.key === 'nomina')
+  assert.equal(n.total, 92000)
+  assert.deepEqual(n.bySource, { fondo: 24000, caja: 68000 })
+})

@@ -14,6 +14,7 @@ const { h, fail, clean, EMAIL_RE, PHONE_RE, DOC_RE, NAME_RE, imageError, HttpErr
 const { auth, ADMIN, ROLES, POSITIONS, PROFILE_ORDER, USER_COLUMNS, toUserDTO, canManagePay } = require('../auth')
 const { audit } = require('../audit')
 const plan = require('../plan')
+const { COURIER_COLUMNS, courierFrom, NOT_COURIER, courierDTO } = require('../courier')
 
 const router = express.Router()
 
@@ -51,9 +52,9 @@ const positionsFrom = (b, role, extra) => {
 
 // Forma de pago (TD-020): por turno (horas × valor de la hora), nómina (salario quincenal o mensual) o ninguna.
 const PAY_MODES = ['ninguno', 'turno', 'nomina']
-const PAY_COLUMNS = `${USER_COLUMNS}, pay_mode, hour_rate, overtime_rate, salary, pay_period, courier_pay`
+const PAY_COLUMNS = `${USER_COLUMNS}, pay_mode, hour_rate, overtime_rate, salary, pay_period, courier_pay, ${COURIER_COLUMNS}`
 // Los datos de pago solo los ve quien tiene el permiso de pagos (TD-021).
-const withPay = (u, show = true) => (!show ? toUserDTO(u) : { ...toUserDTO(u), payMode: u.pay_mode || 'ninguno', hourRate: Number(u.hour_rate || 0), overtimeRate: Number(u.overtime_rate || 0), salary: Number(u.salary || 0), payPeriod: u.pay_period || 'mensual', courierPay: u.courier_pay || 'domicilios' })
+const withPay = (u, show = true) => (!show ? { ...toUserDTO(u), ...courierDTO(u) } : { ...toUserDTO(u), ...courierDTO(u), payMode: u.pay_mode || 'ninguno', hourRate: Number(u.hour_rate || 0), overtimeRate: Number(u.overtime_rate || 0), salary: Number(u.salary || 0), payPeriod: u.pay_period || 'mensual', courierPay: u.courier_pay || 'domicilios' })
 // Permiso de pagos: solo el super administrador lo da, y solo a administradores.
 const payPermission = (req, b, role) => (req.user.role === 'superadmin' && b.canManagePay !== undefined ? { can_manage_pay: role === 'admin' && Boolean(b.canManagePay) } : {})
 const payFrom = (b) => {
@@ -69,6 +70,9 @@ const payFrom = (b) => {
   if (courierPay === 'jornada' && (b.positions || []).includes('domiciliario') && mode === 'ninguno') throw new HttpError('Al domiciliario por jornada elígele pago por turno o por nómina')
   return { courier_pay: courierPay, pay_mode: mode, hour_rate: mode === 'turno' ? hourRate : 0, overtime_rate: mode === 'turno' ? overtimeRate : 0, salary: mode === 'nomina' ? salary : 0, pay_period: b.payPeriod === 'quincenal' ? 'quincenal' : 'mensual' }
 }
+
+// Base y vehículo del domiciliario (TD-022): lo edita cualquier administrador; no depende del permiso de pagos.
+const courierPatch = (b, positions) => (positions.includes('domiciliario') ? courierFrom(b) : NOT_COURIER)
 
 const dupMessage = (e) => (e?.code === '23505'
   ? (String(e.message).includes('username') ? 'Ese nombre de usuario ya existe' : 'Ya existe un usuario con esa identificación')
@@ -116,6 +120,7 @@ router.post('/usuarios', auth(ADMIN), h(async (req, res) => {
     avatar_url: clean(b.avatarUrl),
     password_hash: await bcrypt.hash(String(b.password || clean(b.identification)), 10),
     active: b.active !== false,
+    ...courierPatch(b, positions),
     ...(b.payMode !== undefined && canManagePay(req.user) ? payFrom(b) : {}),
     ...payPermission(req, b, role)
   }).select(PAY_COLUMNS).single()
@@ -153,6 +158,7 @@ router.put('/usuarios/:id', auth(ADMIN), h(async (req, res) => {
     active: b.active !== false
   }
   if (b.avatarUrl !== undefined) patch.avatar_url = clean(b.avatarUrl)
+  Object.assign(patch, courierPatch(b, positions))
   if (b.payMode !== undefined && canManagePay(req.user)) Object.assign(patch, payFrom(b))
   Object.assign(patch, payPermission(req, b, role))
   if (b.resetPassword) patch.password_hash = await bcrypt.hash(String(patch.identification), 10)
@@ -167,3 +173,4 @@ module.exports = router
 module.exports.profilesFrom = profilesFrom
 module.exports.positionsFrom = positionsFrom
 module.exports.payFrom = payFrom
+module.exports.courierPatch = courierPatch

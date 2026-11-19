@@ -14,6 +14,7 @@ const SECTIONS = {
   caja: { label: 'Caja y bóveda', hint: 'Apertura y cierre de turnos con el arqueo, retiros y consignaciones de la bóveda' },
   mesas: { label: 'Mesas', hint: 'Llamados al mesero y cuentas pedidas desde el QR de la mesa' },
   incidentes: { label: 'Incidentes', hint: 'Platos rotos, daños, faltantes y accidentes reportados por el equipo' },
+  domicilios: { label: 'Domicilios', hint: 'El domiciliario avisa que recibió el dinero de un domicilio en efectivo, para cobrarlo en caja' },
   resumen: { label: 'Resumen diario', hint: 'Ventas, órdenes y propinas del día (etapa 4)', soon: true }
 }
 const API = 'https://api.telegram.org'
@@ -165,4 +166,12 @@ const callMessage = ({ table, kind, site, siteId, note, items }) => ({
     site ? `📍 ${esc(site)} · ${hour()}` : hour()])
 })
 
-module.exports = { SECTIONS, tg, esc, qty, cop, loadSettings, notify, send, lowStockMessage, movementMessage, transferMessage, courtesyMessage, voidMessage, cashOpenMessage, cashCloseMessage, vaultMessage, callMessage, incidentMessage, cashRequestMessage, cashReopenMessage }
+// TD-015: el domiciliario recibió el efectivo del cliente; falta cobrarlo en caja.
+const cashReceivedMessage = ({ order, amount, courier, site, siteId }) => ({
+  siteId, path: `/pedidos/${order.id}`,
+  html: lines([`💵 <b>DINERO RECIBIDO · ${esc(order.number)}</b>`, SEP, `🛵 ${esc(fullName(courier))} recibió ${cop(amount)} en efectivo`,
+    order.customer_name ? `👤 Cliente: ${esc(order.customer_name)}` : null, order.customer_address ? `🏠 ${esc(order.customer_address)}` : null,
+    '🧾 Cóbralo en caja cuando entregue el dinero.', site ? `📍 ${esc(site)} · ${hour()}` : hour()])
+})
+
+module.exports = { SECTIONS, cashReceivedMessage, tg, esc, qty, cop, loadSettings, notify, send, lowStockMessage, movementMessage, transferMessage, courtesyMessage, voidMessage, cashOpenMessage, cashCloseMessage, vaultMessage, callMessage, incidentMessage, cashRequestMessage, cashReopenMessage }

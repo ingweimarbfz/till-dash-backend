@@ -12,6 +12,7 @@ const { auth, STAFF } = require('../auth')
 const { audit } = require('../audit')
 const { can, guard, workSite, sameSite, fullName, PAY_METHODS, money, isMoney, itemsBlock } = require('../ops')
 const { dayStart } = require('./logbook')
+const { notify, cashReceivedMessage } = require('../notify')
 
 const router = express.Router()
 
@@ -20,6 +21,9 @@ const STATUS = { por_despachar: 'Por despachar', en_camino: 'En camino', entrega
 const DAY = /^\d{4}-\d{2}-\d{2}$/
 const nextDay = (d) => new Date(new Date(`${d}T00:00:00-05:00`).getTime() + 864e5).toISOString()
 const round = (v) => Math.round(Number(v) || 0)
+const num = (v) => (v === null || v === undefined ? null : Number(v))
+// Lo que debe pagar el cliente si el domicilio vale `fee` (el total ya trae el valor del domicilio con que se abrió).
+const dueWith = (o, fee) => round(Number(o.total) - Number(o.delivery_fee || 0) + fee)
 
 // Qué parte del valor del domicilio le toca al domiciliario.
 const shareRule = async () => {
@@ -32,8 +36,11 @@ const shareRule = async () => {
 const onlyCourier = (user) => !can(user, ...SELLERS)
 
 const MIN_TRIP_MS = 60e3
+// Sin forma de pago elegida, el domicilio se paga en efectivo al domiciliario (igual que en la base de cambio).
+const paysCash = (o) => !o.delivery_pay_method || o.delivery_pay_method === 'efectivo'
+const isCourierUser = (user) => (user.positions || []).includes('domiciliario') && user.role === 'empleado'
 const FLOW = { por_despachar: ['en_camino'], en_camino: ['entregado', 'por_despachar'], entregado: ['en_camino'] }
-const COLUMNS = 'id, number, site_id, status, type, customer_name, customer_phone, customer_address, note, delivery_pay_method, delivery_cash_with, total, tip, delivery_fee, paid, opened_at, closed_at, session_id, courier_id, delivery_status, dispatched_at, arrived_at, courier:users!orders_courier_id_fkey(id, name, last_name), customer:customers(id, zone), items:order_items(name, quantity, status, area)'
+const COLUMNS = 'id, number, site_id, status, type, customer_name, customer_phone, customer_address, note, delivery_pay_method, delivery_cash_with, total, tip, delivery_fee, paid, opened_at, closed_at, session_id, courier_id, delivery_status, dispatched_at, arrived_at, cash_received_at, cash_received_amount, cash_received_fee, courier:users!orders_courier_id_fkey(id, name, last_name), customer:customers(id, zone), items:order_items(name, quantity, status, area)'
 const deliveryDTO = (o, rule) => ({
   id: o.id, number: o.number, siteId: o.site_id, status: o.status, customerName: o.customer_name, customerPhone: o.customer_phone, address: o.customer_address, note: o.note, customerId: o.customer?.id ?? null, zone: o.customer?.zone ?? null,
   payMethod: o.delivery_pay_method || null, cashWith: o.delivery_cash_with === null ? null : Number(o.delivery_cash_with),
@@ -42,6 +49,8 @@ const deliveryDTO = (o, rule) => ({
   total: Number(o.total), tip: Number(o.tip), deliveryFee: Number(o.delivery_fee || 0), share: rule.of(o.delivery_fee), paid: o.status === 'cobrado',
   courier: o.courier ? { id: o.courier.id, name: fullName(o.courier) } : null, deliveryStatus: o.delivery_status || 'por_despachar', deliveryStatusLabel: STATUS[o.delivery_status || 'por_despachar'],
   openedAt: o.opened_at, closedAt: o.closed_at, dispatchedAt: o.dispatched_at, arrivedAt: o.arrived_at,
+  // TD-015: efectivo que el domiciliario dice haber recibido (falta cobrarlo en caja mientras el pedido siga abierto).
+  cashPay: paysCash(o), cashReceivedAt: o.cash_received_at || null, cashReceivedAmount: num(o.cash_received_amount), cashReceivedFee: num(o.cash_received_fee),
   minutes: o.dispatched_at && o.arrived_at ? Math.max(0, Math.round((new Date(o.arrived_at) - new Date(o.dispatched_at)) / 60000)) : null,
   items: (o.items || []).filter((i) => i.status !== 'anulado').map((i) => ({ name: i.name, quantity: Number(i.quantity) })),
   // Por qué todavía no puede salir (sin productos o comandas sin entregar); null si ya puede.
@@ -90,7 +99,7 @@ router.get('/domicilios', auth(STAFF), guard(...SELLERS, 'domiciliario'), h(asyn
 
 // ---------------------------------------------------------------- Asignar y cambiar estado
 const loadDelivery = async (req, res) => {
-  const { data: o } = await supabase.from('orders').select('id, number, site_id, type, status, courier_id, delivery_status, dispatched_at, delivery_pay_method').eq('id', Number(req.params.id)).maybeSingle()
+  const { data: o } = await supabase.from('orders').select('id, number, site_id, type, status, total, delivery_fee, customer_name, customer_address, courier_id, delivery_status, dispatched_at, delivery_pay_method, cash_received_at').eq('id', Number(req.params.id)).maybeSingle()
   if (!o || o.type !== 'domicilio') { fail(res, 'Domicilio no encontrado', 404); return null }
   if (!sameSite(req, o.site_id)) { fail(res, 'El domicilio es de otra sucursal', 403); return null }
   if (o.status === 'anulado') { fail(res, 'El pedido está anulado', 409); return null }
@@ -155,10 +164,84 @@ router.post('/domicilios/:id/estado', auth(STAFF), guard(...SELLERS, 'domiciliar
   if (status === 'por_despachar') { patch.dispatched_at = null; patch.arrived_at = null }
   if (status === 'en_camino') { if (current === 'por_despachar') patch.dispatched_at = now; patch.arrived_at = null }
   if (status === 'entregado') patch.arrived_at = now
+  // Si deshace la entrega, también se borra el aviso de dinero recibido.
+  if (current === 'entregado' && o.cash_received_at) { patch.cash_received_at = null; patch.cash_received_amount = null; patch.cash_received_fee = null }
   const { error } = await supabase.from('orders').update(patch).eq('id', o.id)
   if (error) throw error
   await audit(req, 'domicilio_' + status, 'pedido', o.id, { number: o.number, from: current })
   res.send({ ok: true })
+}))
+
+// ---------------------------------------------------------------- Dinero recibido (TD-015)
+// El cliente le pagó en efectivo al domiciliario: él lo marca y al personal le sale un aviso con sonido
+// (y por Telegram, sección Domicilios) para cobrarlo en caja. Si iba en camino, queda entregado de una vez.
+router.post('/domicilios/:id/dinero-recibido', auth(STAFF), guard('domiciliario'), h(async (req, res) => {
+  const o = await loadDelivery(req, res)
+  if (!o) return
+  if (!isCourierUser(req.user) || o.courier_id !== req.user.id) return fail(res, 'Solo el domiciliario asignado puede avisar que recibió el dinero.', 403)
+  if (!paysCash(o)) return fail(res, `El ${o.number} no se paga en efectivo.`, 409)
+  if (o.status !== 'abierto') return fail(res, `El ${o.number} ya está cobrado en caja.`, 409)
+  if (o.cash_received_at) return fail(res, `Ya avisaste que recibiste el dinero del ${o.number}.`, 409)
+  const current = o.delivery_status || 'por_despachar'
+  if (current === 'por_despachar') return fail(res, `El ${o.number} todavía no ha salido. Primero marca "Salí con el pedido".`, 409)
+  if (current === 'en_camino' && o.dispatched_at && Date.now() - new Date(o.dispatched_at).getTime() < MIN_TRIP_MS) {
+    return fail(res, `El ${o.number} acaba de salir. Avisa cuando el cliente te pague.`, 409)
+  }
+  // El domiciliario registra el valor del domicilio y con cuánto pagó el cliente; al cobrar en caja se precargan.
+  const b = req.body || {}
+  const fee = b.deliveryFee === undefined || b.deliveryFee === null || b.deliveryFee === '' ? round(o.delivery_fee) : (isMoney(b.deliveryFee) ? money(b.deliveryFee) : NaN)
+  if (!(fee >= 0)) return fail(res, 'Escribe el valor del domicilio (0 si no se cobra).', 400)
+  const due = dueWith(o, fee)
+  const received = b.received === undefined || b.received === null || b.received === '' ? due : (isMoney(b.received) ? money(b.received) : NaN)
+  if (!(received >= 0)) return fail(res, 'Escribe cuánto dinero te dio el cliente.', 400)
+  if (received < due) return fail(res, `El cliente debe pagar ${due.toLocaleString('es-CO')}; te dio ${received.toLocaleString('es-CO')}.`, 400)
+  const change = received - due
+  const now = new Date().toISOString()
+  const patch = { cash_received_at: now, cash_received_amount: received, cash_received_fee: fee }
+  if (current === 'en_camino') { patch.delivery_status = 'entregado'; patch.arrived_at = now }
+  // Solo si sigue abierto y sin aviso: evita doble aviso con dos toques seguidos.
+  const { data: upd, error } = await supabase.from('orders').update(patch).eq('id', o.id).eq('status', 'abierto').is('cash_received_at', null).select('id')
+  if (error) throw error
+  if (!upd?.length) return fail(res, `El ${o.number} cambió mientras tanto. Actualiza la pantalla.`, 409)
+  if (current === 'en_camino') await audit(req, 'domicilio_entregado', 'pedido', o.id, { number: o.number, from: current })
+  await audit(req, 'domicilio_dinero_recibido', 'pedido', o.id, { number: o.number, fee, due, received, change })
+  notify('domicilios', async () => {
+    const { data: s } = await supabase.from('sites').select('name').eq('id', o.site_id).maybeSingle()
+    return cashReceivedMessage({ order: o, amount: due, fee, received, change, courier: req.user, site: s?.name, siteId: o.site_id })
+  })
+  res.send({ ok: true, delivered: current === 'en_camino', fee, due, received, change })
+}))
+
+router.post('/domicilios/:id/dinero-recibido/deshacer', auth(STAFF), guard('domiciliario'), h(async (req, res) => {
+  const o = await loadDelivery(req, res)
+  if (!o) return
+  if (!isCourierUser(req.user) || o.courier_id !== req.user.id) return fail(res, 'Solo el domiciliario asignado puede deshacerlo.', 403)
+  if (!o.cash_received_at) return fail(res, `No has avisado dinero recibido del ${o.number}.`, 409)
+  if (o.status !== 'abierto') return fail(res, `El ${o.number} ya se cobró en caja; no se puede deshacer.`, 409)
+  const { error } = await supabase.from('orders').update({ cash_received_at: null, cash_received_amount: null, cash_received_fee: null }).eq('id', o.id).eq('status', 'abierto')
+  if (error) throw error
+  await audit(req, 'domicilio_dinero_recibido_deshecho', 'pedido', o.id, { number: o.number })
+  res.send({ ok: true })
+}))
+
+// Valor del domicilio, lo que debe pagar el cliente, lo que dio y el cambio, según lo que registró el domiciliario.
+const cashFigures = (o) => {
+  const fee = o.cash_received_fee === null || o.cash_received_fee === undefined ? round(o.delivery_fee) : round(o.cash_received_fee)
+  const amount = dueWith(o, fee)
+  const received = o.cash_received_amount === null || o.cash_received_amount === undefined ? amount : round(o.cash_received_amount)
+  return { fee, amount, received, change: Math.max(0, received - amount) }
+}
+
+// Avisos para el personal (no domiciliarios): domicilios con dinero recibido que aún no se cobran en caja.
+router.get('/domicilios/avisos', auth(STAFF), guard(...SELLERS), h(async (req, res) => {
+  const site = await workSite(req, req.query.sede)
+  const { data, error } = await supabase.from('orders').select('id, number, total, delivery_fee, customer_name, customer_address, cash_received_at, cash_received_amount, cash_received_fee, courier:users!orders_courier_id_fkey(id, name, last_name)')
+    .eq('type', 'domicilio').eq('site_id', site).eq('status', 'abierto').not('cash_received_at', 'is', null).order('cash_received_at')
+  if (error) throw error
+  res.send((data || []).map((o) => ({
+    ...cashFigures(o), id: o.id, number: o.number, total: Number(o.total), customerName: o.customer_name, address: o.customer_address,
+    courier: o.courier ? { id: o.courier.id, name: fullName(o.courier) } : null, receivedAt: o.cash_received_at
+  })))
 }))
 
 // ---------------------------------------------------------------- Cuenta del domiciliario
@@ -330,3 +413,5 @@ module.exports = router
 module.exports.courierSettlement = courierSettlement
 
 module.exports.FLOW = FLOW
+module.exports.paysCash = paysCash
+module.exports.cashFigures = cashFigures

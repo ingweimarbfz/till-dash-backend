@@ -50,6 +50,7 @@ const orderDTO = (o) => ({
   discount: o.discount_type ? { id: o.discount_id, name: o.discount_name, type: o.discount_type, value: Number(o.discount_value), reason: o.discount_reason } : null,
   discountTotal: Number(o.discount_total), tip: Number(o.tip), deliveryFee: Number(o.delivery_fee || 0), total: Number(o.total), paid: Number(o.paid),
   courier: o.courier ? { id: o.courier.id, name: fullName(o.courier) } : null, deliveryStatus: o.delivery_status || null, deliveryPayMethod: o.delivery_pay_method || null, deliveryCashWith: o.delivery_cash_with === null || o.delivery_cash_with === undefined ? null : Number(o.delivery_cash_with), dispatchedAt: o.dispatched_at || null, arrivedAt: o.arrived_at || null,
+  cashReceivedAt: o.cash_received_at || null, cashReceivedAmount: o.cash_received_amount === null || o.cash_received_amount === undefined ? null : Number(o.cash_received_amount), cashReceivedFee: o.cash_received_fee === null || o.cash_received_fee === undefined ? null : Number(o.cash_received_fee),
   split: o.split || null, billRequestedAt: o.bill_requested_at, voidReason: o.void_reason, openedAt: o.opened_at, closedAt: o.closed_at,
   items: o.items ? o.items.sort((a, b) => a.id - b.id).map(itemDTO) : undefined,
   dispatchBlock: o.type === 'domicilio' && o.items && (o.delivery_status || 'por_despachar') === 'por_despachar' ? itemsBlock(o.number, o.items) : null

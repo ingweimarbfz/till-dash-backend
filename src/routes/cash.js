@@ -176,7 +176,7 @@ router.get('/caja/turnos/:id/personal', auth(STAFF), guard('cajero'), h(async (r
   const s = await loadSession(req.params.id)
   if (!s || !sameSite(req, s.site_id)) return fail(res, 'Turno no encontrado', 404)
   const [{ data: staff }, { data: orders }] = await Promise.all([
-    supabase.from('users').select('id, name, last_name, positions, site_id, hour_rate').eq('active', true).eq('pay_mode', 'turno').order('name').then((r) => (r.error ? { data: [] } : r)),
+    supabase.from('users').select('id, name, last_name, positions, site_id, hour_rate, overtime_rate').eq('active', true).eq('pay_mode', 'turno').order('name').then((r) => (r.error ? { data: [] } : r)),
     supabase.from('orders').select('waiter_id, courier_id, cashier_id').eq('session_id', s.id)
   ])
   const worked = new Set([s.opened_by])
@@ -185,7 +185,7 @@ router.get('/caja/turnos/:id/personal', auth(STAFF), guard('cajero'), h(async (r
   res.send({
     hours,
     employees: (staff || []).filter((u) => !u.site_id || u.site_id === s.site_id).map((u) => ({
-      id: u.id, name: fullName(u), positions: u.positions || [], hourRate: Number(u.hour_rate || 0), worked: worked.has(u.id)
+      id: u.id, name: fullName(u), positions: u.positions || [], hourRate: Number(u.hour_rate || 0), overtimeRate: Number(u.overtime_rate || 0), worked: worked.has(u.id)
     })).sort((a, b) => Number(b.worked) - Number(a.worked) || a.name.localeCompare(b.name))
   })
 }))
@@ -200,9 +200,10 @@ router.post('/caja/turnos/:id/cerrar', auth(STAFF), guard('cajero'), h(async (re
   if (b.nextFloat !== undefined && b.nextFloat !== '' && !isMoney(b.nextFloat)) return fail(res, 'La base para el próximo turno no es válida', 400)
   const couriers = (Array.isArray(b.couriers) ? b.couriers : []).filter((t) => Number(t?.amount) > 0)
   if (couriers.some((t) => !Number(t.userId) || !isMoney(t.amount))) return fail(res, 'Revisa los valores de los domiciliarios', 400)
-  // Turnos trabajados: horas × valor de la hora. payNow = false lo deja pendiente en Pagos al personal.
+  // Turnos trabajados: horas × valor de la hora + horas extra × valor de la hora extra, o un valor fijo (fixed).
+  // payNow = false lo deja pendiente en Pagos al personal.
   const staff = (Array.isArray(b.staff) ? b.staff : []).filter((t) => Number(t?.amount) > 0)
-  if (staff.some((t) => !Number(t.userId) || !isMoney(t.amount) || (t.hours !== undefined && t.hours !== '' && !(Number(t.hours) > 0 && Number(t.hours) <= 24)))) return fail(res, 'Revisa las horas y los valores de los turnos', 400)
+  if (staff.some((t) => !Number(t.userId) || !isMoney(t.amount) || (t.hours !== undefined && t.hours !== '' && t.hours !== null && !(Number(t.hours) > 0 && Number(t.hours) <= 24)) || (Number(t.extraHours) < 0 || Number(t.extraHours) > 24))) return fail(res, 'Revisa las horas y los valores de los turnos', 400)
   if (new Set(staff.map((t) => Number(t.userId))).size !== staff.length) return fail(res, 'Un empleado aparece dos veces en los turnos', 400)
   // Lo que el sistema calculó para cada domiciliario (su parte de los domicilios) queda guardado con el pago.
   // Sus propinas no van aquí (tips = 0): se le pagan en Caja → Propinas como al resto del personal.
@@ -218,7 +219,7 @@ router.post('/caja/turnos/:id/cerrar', auth(STAFF), guard('cajero'), h(async (re
     org_id: req.user.org_id, session_id: s.id, user_id: req.user.id, counted_cash: money(b.countedCash), next_float: money(b.nextFloat),
     tips: [], note: clean(b.note),
     couriers: couriers.map((t) => { const c = settle.rows.find((r) => r.userId === Number(t.userId)) || {}; return { user_id: Number(t.userId), amount: money(t.amount), deliveries: c.deliveries || 0, fees: c.fees || 0, share: c.share || 0, tips: 0, pay_now: t.payNow !== false } }),
-    staff: staff.map((t) => ({ user_id: Number(t.userId), hours: Number(t.hours) || null, rate: money(t.rate) || null, amount: money(t.amount), pay_now: t.payNow !== false }))
+    staff: staff.map((t) => ({ user_id: Number(t.userId), hours: Number(t.hours) || null, rate: t.fixed ? null : money(t.rate) || null, extra_hours: t.fixed ? null : Number(t.extraHours) || null, extra_rate: t.fixed || !Number(t.extraHours) ? null : money(t.extraRate) || null, fixed: Boolean(t.fixed), amount: money(t.amount), pay_now: t.payNow !== false }))
   } })
   if (error) return dbError(res, error)
   const after = await loadSession(s.id)

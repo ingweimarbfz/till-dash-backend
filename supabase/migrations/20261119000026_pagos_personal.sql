@@ -1,6 +1,7 @@
 -- TD-020 (2) · Pagos al personal: por turno o por nómina, configurado por empleado.
 -- · Cada empleado tiene su forma de pago (users.pay_mode):
---     'turno'   → se le paga cada turno trabajado: horas × valor de la hora (users.hour_rate).
+--     'turno'   → se le paga cada turno trabajado: horas × valor de la hora (users.hour_rate) más las horas
+--                 extra × valor de la hora extra (users.overtime_rate). En el cierre también se puede poner un valor fijo.
 --     'nomina'  → se le paga el salario (users.salary) al final de la quincena o del mes (users.pay_period).
 --     'ninguno' → no se le paga desde TillDash+ (dueños, socios…).
 -- · Al cerrar el turno se pregunta a cada domiciliario (su parte de los domicilios, sin propinas) y a
@@ -13,6 +14,7 @@ alter table public.users add column if not exists pay_mode text not null default
 alter table public.users drop constraint if exists users_pay_mode_chk;
 alter table public.users add constraint users_pay_mode_chk check (pay_mode in ('ninguno', 'turno', 'nomina'));
 alter table public.users add column if not exists hour_rate numeric(14, 2) not null default 0 check (hour_rate >= 0);
+alter table public.users add column if not exists overtime_rate numeric(14, 2) not null default 0 check (overtime_rate >= 0);
 alter table public.users add column if not exists salary numeric(14, 2) not null default 0 check (salary >= 0);
 alter table public.users add column if not exists pay_period text not null default 'mensual';
 alter table public.users drop constraint if exists users_pay_period_chk;
@@ -29,6 +31,9 @@ create table if not exists public.staff_earnings (
   session_id bigint references public.cash_sessions(id) on delete set null,   -- turno trabajado
   hours numeric(6, 2),
   rate numeric(14, 2),
+  extra_hours numeric(6, 2),                  -- horas extra del turno
+  extra_rate numeric(14, 2),                  -- valor de la hora extra
+  fixed boolean not null default false,       -- se pagó un valor fijo en vez de horas × valor de la hora
   deliveries int,
   period_from date,
   period_to date,
@@ -62,9 +67,22 @@ alter table public.vault_movements add constraint vault_movements_type_check che
   'deposito', 'retiro', 'cierre_caja', 'base_caja', 'consignacion', 'ajuste',
   'ingreso', 'gasto', 'traslado', 'retiro_socio', 'anulacion', 'pago_propina', 'pago_personal'));
 
+-- Detalle del turno para el gasto: " (8 h + 2 h extra)" o " (valor fijo, 8 h)".
+create or replace function public.shift_detail(t jsonb) returns text
+language sql immutable set search_path = '' as $$
+  select case
+    when coalesce((t->>'fixed')::boolean, false) then ' (valor fijo' || coalesce(', ' || trim_scale(nullif(t->>'hours', '')::numeric) || ' h', '') || ')'
+    when nullif(t->>'hours', '') is null then ''
+    else ' (' || trim_scale((t->>'hours')::numeric) || ' h' || coalesce(' + ' || trim_scale(nullif(nullif(t->>'extra_hours', ''), '0')::numeric) || ' h extra', '') || ')'
+  end
+$$;
+revoke execute on function public.shift_detail(jsonb) from public, anon, authenticated;
+grant execute on function public.shift_detail(jsonb) to service_role;
+
 -- Cierre de caja. Además de lo anterior:
 -- · couriers: [{user_id, amount, deliveries, fees, share, tips, pay_now}] → pay_now = false deja su parte pendiente.
--- · staff: [{user_id, hours, rate, amount, pay_now}] → turnos trabajados; pay_now = true se paga del efectivo.
+-- · staff: [{user_id, hours, rate, extra_hours, extra_rate, fixed, amount, pay_now}] → turnos trabajados (horas × valor
+--   más horas extra × valor extra, o un valor fijo); pay_now = true se paga del efectivo.
 create or replace function public.close_cash_session(p jsonb) returns jsonb
 language plpgsql set search_path = '' as $$
 declare v_org bigint := (p->>'org_id')::bigint; s record; v_exp numeric; v_cnt numeric := (p->>'counted_cash')::numeric;
@@ -120,15 +138,16 @@ begin
     if v_now then
       v_num := public.next_consecutive(v_org, 'gasto', 0, 'EG-');
       insert into public.expenses (org_id, site_id, number, category, description, amount, source, session_id, created_by)
-        values (v_org, s.site_id, v_num, 'nomina', left('Turno ' || s.number || ' · ' || v_name || coalesce(' (' || nullif(t->>'hours', '') || ' h)', ''), 200), v_amt, 'caja', s.id, v_user)
+        values (v_org, s.site_id, v_num, 'nomina', left('Turno ' || s.number || ' · ' || v_name || public.shift_detail(t), 200), v_amt, 'caja', s.id, v_user)
         returning id into v_exp_id;
       insert into public.cash_movements (org_id, session_id, type, method, amount, ref, note, user_id)
         values (v_org, s.id, 'pago_turno', 'efectivo', -v_amt, v_num, 'Turno para ' || v_name, v_user);
       v_staff := v_staff + v_amt;
     end if;
-    insert into public.staff_earnings (org_id, site_id, user_id, kind, session_id, hours, rate, amount, note, created_by,
+    insert into public.staff_earnings (org_id, site_id, user_id, kind, session_id, hours, rate, extra_hours, extra_rate, fixed, amount, note, created_by,
         status, paid_at, paid_by, paid_source, paid_method, paid_number, paid_session_id, expense_id)
-      values (v_org, s.site_id, v_emp.id, 'turno', s.id, nullif(t->>'hours', '')::numeric, nullif(t->>'rate', '')::numeric, v_amt, 'Turno ' || s.number, v_user,
+      values (v_org, s.site_id, v_emp.id, 'turno', s.id, nullif(t->>'hours', '')::numeric, nullif(t->>'rate', '')::numeric,
+        nullif(t->>'extra_hours', '')::numeric, nullif(t->>'extra_rate', '')::numeric, coalesce((t->>'fixed')::boolean, false), v_amt, 'Turno ' || s.number, v_user,
         case when v_now then 'pagado' else 'pendiente' end, case when v_now then now() end, case when v_now then v_user end,
         case when v_now then 'cierre' end, case when v_now then 'efectivo' end, v_num, case when v_now then s.id end, v_exp_id);
   end loop;
@@ -268,7 +287,7 @@ begin
       end if;
     else
       v_exp_id := public.finance_expense(jsonb_build_object('org_id', v_org, 'user_id', v_user, 'site_id', v_site, 'category', 'nomina',
-        'description', left(coalesce(e.note, 'Turno') || ' · ' || v_name || coalesce(' (' || trim_scale(e.hours) || ' h)', ''), 200), 'amount', e.amount,
+        'description', left(coalesce(e.note, 'Turno') || ' · ' || v_name || public.shift_detail(jsonb_build_object('hours', e.hours, 'extra_hours', e.extra_hours, 'fixed', e.fixed)), 200), 'amount', e.amount,
         'source', v_esrc, 'session_id', v_sid, 'invoice_ref', v_num));
     end if;
     update public.staff_earnings set status = 'pagado', paid_at = now(), paid_by = v_user, paid_source = v_src, paid_method = v_method,

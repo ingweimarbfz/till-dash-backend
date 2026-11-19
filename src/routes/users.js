@@ -50,16 +50,17 @@ const positionsFrom = (b, role, extra) => {
 
 // Forma de pago (TD-020): por turno (horas × valor de la hora), nómina (salario quincenal o mensual) o ninguna.
 const PAY_MODES = ['ninguno', 'turno', 'nomina']
-const PAY_COLUMNS = `${USER_COLUMNS}, pay_mode, hour_rate, salary, pay_period`
-const withPay = (u) => ({ ...toUserDTO(u), payMode: u.pay_mode || 'ninguno', hourRate: Number(u.hour_rate || 0), salary: Number(u.salary || 0), payPeriod: u.pay_period || 'mensual' })
+const PAY_COLUMNS = `${USER_COLUMNS}, pay_mode, hour_rate, overtime_rate, salary, pay_period`
+const withPay = (u) => ({ ...toUserDTO(u), payMode: u.pay_mode || 'ninguno', hourRate: Number(u.hour_rate || 0), overtimeRate: Number(u.overtime_rate || 0), salary: Number(u.salary || 0), payPeriod: u.pay_period || 'mensual' })
 const payFrom = (b) => {
   const mode = PAY_MODES.includes(b.payMode) ? b.payMode : 'ninguno'
   const hourRate = Math.round(Number(b.hourRate) || 0)
+  const overtimeRate = Math.round(Number(b.overtimeRate) || 0)
   const salary = Math.round(Number(b.salary) || 0)
-  if (hourRate < 0 || salary < 0) throw new HttpError('Los valores de pago no pueden ser negativos')
+  if (hourRate < 0 || overtimeRate < 0 || salary < 0) throw new HttpError('Los valores de pago no pueden ser negativos')
   if (mode === 'turno' && !hourRate) throw new HttpError('Escribe el valor de la hora para pagarle por turnos')
   if (mode === 'nomina' && !salary) throw new HttpError('Escribe el salario de la quincena o del mes')
-  return { pay_mode: mode, hour_rate: mode === 'turno' ? hourRate : 0, salary: mode === 'nomina' ? salary : 0, pay_period: b.payPeriod === 'quincenal' ? 'quincenal' : 'mensual' }
+  return { pay_mode: mode, hour_rate: mode === 'turno' ? hourRate : 0, overtime_rate: mode === 'turno' ? overtimeRate : 0, salary: mode === 'nomina' ? salary : 0, pay_period: b.payPeriod === 'quincenal' ? 'quincenal' : 'mensual' }
 }
 
 const dupMessage = (e) => (e?.code === '23505'

@@ -120,7 +120,7 @@ const cleanPayroll = (list) => {
 
 const earningDTO = (e) => ({
   id: e.id, userId: e.user_id, name: fullName(e.user), kind: e.kind, kindLabel: EARNING_KINDS[e.kind], session: e.session?.number ?? null,
-  hours: e.hours === null ? null : Number(e.hours), rate: e.rate === null ? null : Number(e.rate), deliveries: e.deliveries, periodFrom: e.period_from, periodTo: e.period_to,
+  hours: e.hours === null ? null : Number(e.hours), rate: e.rate === null ? null : Number(e.rate), extraHours: e.extra_hours === null || e.extra_hours === undefined ? null : Number(e.extra_hours), fixed: Boolean(e.fixed), deliveries: e.deliveries, periodFrom: e.period_from, periodTo: e.period_to,
   amount: Number(e.amount), note: e.note, status: e.status, createdAt: e.created_at,
   paidAt: e.paid_at, paidSource: e.paid_source, paidSourceLabel: e.paid_source ? TIP_SOURCES[e.paid_source] : null, paidMethod: e.paid_method, paidNumber: e.paid_number, paidBy: fullName(e.payer)
 })

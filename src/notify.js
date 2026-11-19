@@ -167,9 +167,10 @@ const callMessage = ({ table, kind, site, siteId, note, items }) => ({
 })
 
 // TD-015: el domiciliario recibió el efectivo del cliente; falta cobrarlo en caja.
-const cashReceivedMessage = ({ order, amount, courier, site, siteId }) => ({
+const cashReceivedMessage = ({ order, amount, fee, received, change, courier, site, siteId }) => ({
   siteId, path: `/pedidos/${order.id}`,
-  html: lines([`💵 <b>DINERO RECIBIDO · ${esc(order.number)}</b>`, SEP, `🛵 ${esc(fullName(courier))} recibió ${cop(amount)} en efectivo`,
+  html: lines([`💵 <b>DINERO RECIBIDO · ${esc(order.number)}</b>`, SEP, `🛵 ${esc(fullName(courier))} cobró ${cop(amount)} en efectivo`,
+    `🚚 Domicilio: ${Number(fee) > 0 ? cop(fee) : 'no se cobró'}`, `💰 El cliente dio ${cop(received)}${Number(change) > 0 ? ` · cambio ${cop(change)}` : ''}`,
     order.customer_name ? `👤 Cliente: ${esc(order.customer_name)}` : null, order.customer_address ? `🏠 ${esc(order.customer_address)}` : null,
     '🧾 Cóbralo en caja cuando entregue el dinero.', site ? `📍 ${esc(site)} · ${hour()}` : hour()])
 })

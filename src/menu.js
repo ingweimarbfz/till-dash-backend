@@ -8,6 +8,7 @@
 // =====================================================================
 const supabase = require('./db')
 const { bestFor, promoBrief, loadActive } = require('./promo')
+const { inSite, loadSitePrices, priceAt } = require('./catalog')
 
 const DEFAULT_PRESENTATION = { layout: 'lista', showPhotos: true, showDescriptions: true, soldOut: 'marcar' }
 
@@ -75,16 +76,21 @@ const buildMenu = async ({ siteId, menuId = null }) => {
   const menu = await pickMenu({ siteId, menuId, tz: s?.timezone })
   const { data: wh } = siteId ? await supabase.rpc('sale_warehouse', { p_site: siteId }) : { data: null }
   const [{ data: cats }, { data: prods }, { data: stock }, promos] = await Promise.all([
-    supabase.from('product_categories').select('id, name, emoji, color, description, sort_order').eq('active', true).eq('show_in_menu', true).order('sort_order').order('name'),
-    supabase.from('products').select('id, name, description, price, photo_url, category_id, track_stock, unit').eq('active', true).eq('show_in_menu', true).order('name'),
+    supabase.from('product_categories').select('id, name, emoji, color, description, sort_order, site_ids').eq('active', true).eq('show_in_menu', true).order('sort_order').order('name'),
+    supabase.from('products').select('id, name, description, price, photo_url, category_id, track_stock, unit, site_ids').eq('active', true).eq('show_in_menu', true).order('name'),
     wh ? supabase.from('warehouse_stock').select('product_id, stock').eq('warehouse_id', wh) : Promise.resolve({ data: [] }),
-    loadActive()
+    loadActive(siteId)
   ])
+  // TD-024: solo lo que se vende en la sucursal, con su precio.
+  const siteCats = (cats || []).filter((c) => inSite(c, siteId))
+  const catIds = new Set(siteCats.map((c) => c.id))
+  const prices = siteId ? await loadSitePrices() : new Map()
   const left = new Map((stock || []).map((x) => [x.product_id, Number(x.stock)]))
   const hidden = new Set((menu?.hidden_product_ids || []).map(Number))
   const p = { ...DEFAULT_PRESENTATION, ...(menu ? { layout: menu.layout, showPhotos: menu.show_photos, showDescriptions: menu.show_descriptions, soldOut: menu.sold_out } : {}) }
   const qr = qrOptionsOf(s)
-  let products = (prods || []).filter((x) => !hidden.has(x.id)).map((x) => {
+  let products = (prods || []).filter((x) => !hidden.has(x.id) && inSite(x, siteId) && catIds.has(x.category_id)).map((raw) => {
+    const x = { ...raw, price: priceAt(raw, siteId, prices) }
     const best = bestFor(promos, x)
     return {
       id: x.id, name: x.name, description: p.showDescriptions ? x.description : null, photoUrl: p.showPhotos ? x.photo_url : null, categoryId: x.category_id, unit: x.unit,
@@ -96,7 +102,7 @@ const buildMenu = async ({ siteId, menuId = null }) => {
   if (p.soldOut === 'ocultar') products = products.filter((x) => !x.soldOut)
   // Secciones: las elegidas en la carta y en su orden; si no eligió, todas las categorías de la carta.
   const chosen = (menu?.category_ids || []).map(Number)
-  const allCats = cats || []
+  const allCats = siteCats
   const ordered = chosen.length ? chosen.map((id) => allCats.find((c) => c.id === id)).filter(Boolean) : allCats
   const categories = ordered.filter((c) => products.some((x) => x.categoryId === c.id))
     .map((c) => ({ id: c.id, name: c.name, emoji: c.emoji, color: c.color, description: c.description }))

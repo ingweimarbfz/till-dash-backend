@@ -314,7 +314,7 @@ router.post('/carta/:token/pedido', h(async (req, res) => {
     if (mode === 'none') return fail(res, 'En este lugar los pedidos se hacen con el mesero. Toca "Llamar al mesero".', 403)
     if (!(await cashOpenAt(t.site_id))) return fail(res, 'Todavía no estamos recibiendo pedidos. Llama al mesero.', 409)
     const { buildItems } = require('./orders')
-    const built = await buildItems({ user: { id: null } }, items, { allowCourtesy: false })
+    const built = await buildItems({ user: { id: null } }, items, { allowCourtesy: false, siteId: t.site_id })
     if (built.error) return fail(res, built.error, 400)
     // Cada producto va directo o por confirmación según su categoría (con ambas formas de pedir activas).
     const { data: pc } = await supabase.from('products').select('id, category_id').in('id', items.map((i) => i.productId))

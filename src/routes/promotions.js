@@ -12,6 +12,7 @@ const { h, fail, clean } = require('../http')
 const { statusOf, hm } = require('../promo')
 const { auth, ADMIN, STAFF } = require('../auth')
 const { audit } = require('../audit')
+const { siteIdsOf, inSite, checkSites } = require('../catalog')
 
 const router = express.Router()
 const COLOR_RE = /^#[0-9A-Fa-f]{6}$/
@@ -20,11 +21,12 @@ const COLOR_RE = /^#[0-9A-Fa-f]{6}$/
 const DISCOUNT_ICONS = ['tag', 'star', 'heart', 'gift', 'handshake', 'cake', 'trophy', 'fire', 'percent', 'user', 'beer', 'party']
 const discountDTO = (d) => ({
   id: d.id, name: d.name, type: d.type, value: Number(d.value), icon: d.icon, color: d.color, description: d.description,
-  requiresReason: d.requires_reason, active: d.active
+  requiresReason: d.requires_reason, active: d.active, siteIds: (d.site_ids || []).map(Number)
 })
 const discountRow = (b) => ({
   name: clean(b.name), type: b.type, value: Number(b.value), icon: DISCOUNT_ICONS.includes(b.icon) ? b.icon : 'tag',
-  color: COLOR_RE.test(b.color || '') ? b.color : '#E4572E', description: clean(b.description), requires_reason: Boolean(b.requiresReason), active: b.active !== false
+  color: COLOR_RE.test(b.color || '') ? b.color : '#E4572E', description: clean(b.description), requires_reason: Boolean(b.requiresReason), active: b.active !== false,
+  ...(b.siteIds !== undefined ? { site_ids: siteIdsOf(b.siteIds) } : {})
 })
 const validateDiscount = (b) => {
   const errors = []
@@ -34,15 +36,18 @@ const validateDiscount = (b) => {
   if (b.type === 'porcentaje' && Number(b.value) > 100) errors.push('El porcentaje no puede superar 100')
   return errors
 }
+// ?venta=<sucursal>: solo los que aplican en esa sucursal (TD-024).
 router.get('/descuentos', auth(STAFF), h(async (req, res) => {
   let q = supabase.from('discounts').select('*').order('name')
   if (req.query.activos === '1') q = q.eq('active', true)
   const { data, error } = await q
   if (error) throw error
-  res.send(data.map(discountDTO))
+  const sale = Number(req.query.venta) || null
+  res.send(data.filter((d) => inSite(d, sale)).map(discountDTO))
 }))
 router.post('/descuentos', auth(ADMIN), h(async (req, res) => {
   const errors = validateDiscount(req.body || {})
+  const se = await checkSites(siteIdsOf(req.body?.siteIds)); if (se) errors.push(se)
   if (errors.length) return fail(res, errors.join('. '), 400)
   const { data, error } = await supabase.from('discounts').insert(discountRow(req.body)).select().single()
   if (error) return error.code === '23505' ? fail(res, 'Ya existe un descuento con ese nombre', 409) : fail(res, error)
@@ -51,6 +56,7 @@ router.post('/descuentos', auth(ADMIN), h(async (req, res) => {
 }))
 router.put('/descuentos/:id', auth(ADMIN), h(async (req, res) => {
   const errors = validateDiscount(req.body || {})
+  const se = await checkSites(siteIdsOf(req.body?.siteIds)); if (se) errors.push(se)
   if (errors.length) return fail(res, errors.join('. '), 400)
   const { data, error } = await supabase.from('discounts').update(discountRow(req.body)).eq('id', Number(req.params.id)).select().maybeSingle()
   if (error) return error.code === '23505' ? fail(res, 'Ya existe un descuento con ese nombre', 409) : fail(res, error)
@@ -69,7 +75,7 @@ const promotionDTO = (p, cats = [], prods = []) => {
     scope: p.scope, categoryIds: (p.category_ids || []).map(Number), productIds: (p.product_ids || []).map(Number),
     categories: (p.category_ids || []).map((id) => cats.find((c) => c.id === Number(id))?.name).filter(Boolean),
     products: (p.product_ids || []).map((id) => prods.find((x) => x.id === Number(id))?.name).filter(Boolean),
-    active: p.active, status, statusLabel: STATUS_LABEL[status], createdAt: p.created_at
+    active: p.active, status, statusLabel: STATUS_LABEL[status], createdAt: p.created_at, siteIds: (p.site_ids || []).map(Number)
   }
 }
 const ids = (v) => [...new Set((Array.isArray(v) ? v : []).map(Number).filter((x) => Number.isInteger(x) && x > 0))]
@@ -101,7 +107,8 @@ const promotionRow = (b) => ({
   starts_at: atBogota(b.startsAt), ends_at: atBogota(b.endsAt), time_from: clean(b.timeFrom), time_to: clean(b.timeTo),
   weekdays: ids(b.weekdays).filter((d) => d <= 7), scope: b.scope || 'todos',
   category_ids: b.scope === 'categorias' ? ids(b.categoryIds) : [], product_ids: b.scope === 'productos' ? ids(b.productIds) : [],
-  active: b.active !== false, updated_at: new Date().toISOString()
+  active: b.active !== false, updated_at: new Date().toISOString(),
+  ...(b.siteIds !== undefined ? { site_ids: siteIdsOf(b.siteIds) } : {})
 })
 const catalogs = async () => {
   const [{ data: cats }, { data: prods }] = await Promise.all([supabase.from('product_categories').select('id, name'), supabase.from('products').select('id, name')])
@@ -116,6 +123,7 @@ router.get('/promociones', auth(STAFF), h(async (req, res) => {
 router.post('/promociones', auth(ADMIN), h(async (req, res) => {
   const b = req.body || {}
   const errors = validatePromotion(b)
+  const se = await checkSites(siteIdsOf(b.siteIds)); if (se) errors.push(se)
   if (errors.length) return fail(res, errors.join('. '), 400)
   const { data, error } = await supabase.from('promotions').insert({ ...promotionRow(b), created_by: req.user.id }).select().single()
   if (error) throw error
@@ -125,6 +133,7 @@ router.post('/promociones', auth(ADMIN), h(async (req, res) => {
 router.put('/promociones/:id', auth(ADMIN), h(async (req, res) => {
   const b = req.body || {}
   const errors = validatePromotion(b)
+  const se = await checkSites(siteIdsOf(b.siteIds)); if (se) errors.push(se)
   if (errors.length) return fail(res, errors.join('. '), 400)
   const { data, error } = await supabase.from('promotions').update(promotionRow(b)).eq('id', Number(req.params.id)).select().maybeSingle()
   if (error) throw error

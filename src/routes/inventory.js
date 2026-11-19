@@ -19,6 +19,7 @@ const { isLow, checkLowStock, currentAlerts } = require('../stock')
 const { resolveSupplier } = require('../suppliers')
 const { parsePayment, checkPayment, settle } = require('../purchases')
 const lots = require('../lots')
+const { siteIdsOf, inSite, loadSitePrices, priceAt, availableAt, saveSitePrices, checkSites } = require('../catalog')
 const { todayBogota } = require('../http')
 
 const router = express.Router()
@@ -52,12 +53,14 @@ const loadPlace = async (id) => {
 // ---------------------------------------------------------------- Categorías
 const categoryDTO = (c) => ({
   id: c.id, name: c.name, description: c.description, emoji: c.emoji, color: c.color, area: c.area, areaLabel: AREAS[c.area],
-  sortOrder: c.sort_order, showInMenu: c.show_in_menu, active: c.active, products: c.products?.[0]?.count ?? undefined
+  sortOrder: c.sort_order, showInMenu: c.show_in_menu, active: c.active, products: c.products?.[0]?.count ?? undefined,
+  siteIds: (c.site_ids || []).map(Number)
 })
 const categoryRow = (b) => ({
   name: clean(b.name), description: clean(b.description), emoji: clean(b.emoji),
   color: COLOR_RE.test(b.color || '') ? b.color : '#E4572E', area: AREAS[b.area] ? b.area : 'cocina',
-  sort_order: Number.isInteger(Number(b.sortOrder)) ? Number(b.sortOrder) : 0, show_in_menu: b.showInMenu !== false, active: b.active !== false
+  sort_order: Number.isInteger(Number(b.sortOrder)) ? Number(b.sortOrder) : 0, show_in_menu: b.showInMenu !== false, active: b.active !== false,
+  ...(b.siteIds !== undefined ? { site_ids: siteIdsOf(b.siteIds) } : {})
 })
 const validateCategory = (b) => {
   const errors = []
@@ -66,16 +69,19 @@ const validateCategory = (b) => {
   return errors
 }
 
+// ?venta=<sucursal>: solo las categorías que se venden en esa sucursal (TD-024).
 router.get('/inventario/categorias', auth(STAFF), h(async (req, res) => {
   let q = supabase.from('product_categories').select('*, products(count)').order('sort_order').order('name')
   if (req.query.activas === '1') q = q.eq('active', true)
   const { data, error } = await q
   if (error) throw error
-  res.send(data.map(categoryDTO))
+  const sale = Number(req.query.venta) || null
+  res.send(data.filter((c) => inSite(c, sale)).map(categoryDTO))
 }))
 router.post('/inventario/categorias', auth(ADMIN), h(async (req, res) => {
   const b = req.body || {}
   const errors = validateCategory(b)
+  const se = await checkSites(siteIdsOf(b.siteIds)); if (se) errors.push(se)
   if (errors.length) return fail(res, errors.join('. '), 400)
   const { data, error } = await supabase.from('product_categories').insert(categoryRow(b)).select('*').single()
   if (error) return error.code === '23505' ? fail(res, 'Esa categoría ya existe', 409) : fail(res, error)
@@ -85,6 +91,7 @@ router.post('/inventario/categorias', auth(ADMIN), h(async (req, res) => {
 router.put('/inventario/categorias/:id', auth(ADMIN), h(async (req, res) => {
   const b = req.body || {}
   const errors = validateCategory(b)
+  const se = await checkSites(siteIdsOf(b.siteIds)); if (se) errors.push(se)
   if (errors.length) return fail(res, errors.join('. '), 400)
   const { data, error } = await supabase.from('product_categories').update(categoryRow(b)).eq('id', Number(req.params.id)).select('*').maybeSingle()
   if (error) return error.code === '23505' ? fail(res, 'Esa categoría ya existe', 409) : fail(res, error)
@@ -94,16 +101,20 @@ router.put('/inventario/categorias/:id', auth(ADMIN), h(async (req, res) => {
 }))
 
 // ---------------------------------------------------------------- Productos
-const PRODUCT_COLUMNS = 'id, sku, name, category_id, description, unit, cost, price, track_stock, stock, min_stock, photo_url, show_in_menu, courtesy_allowed, active, supplier_id, category:product_categories(id, name, emoji, color, area), supplier:suppliers(id, name)'
+const PRODUCT_COLUMNS = 'id, sku, name, category_id, description, unit, cost, price, track_stock, stock, min_stock, photo_url, show_in_menu, courtesy_allowed, active, supplier_id, site_ids, category:product_categories(id, name, emoji, color, area, site_ids), supplier:suppliers(id, name)'
 // promos: promociones activas; si alguna está vigente para el producto, se informa el precio con promoción.
-const productDTO = (p, promos = []) => {
-  const best = bestFor(promos, p)
+// TD-024: prices = precios por sucursal (loadSitePrices); con siteId, salePrice y la promoción son los de esa sucursal.
+const productDTO = (p, promos = [], { prices = new Map(), siteId = null } = {}) => {
+  const salePrice = priceAt(p, siteId, prices)
+  const best = bestFor(promos, { ...p, price: salePrice })
   return {
     id: p.id, sku: p.sku, name: p.name, categoryId: p.category_id, category: p.category?.name ?? null, categoryEmoji: p.category?.emoji ?? null,
     categoryColor: p.category?.color ?? null, area: p.category?.area ?? null, description: p.description, unit: p.unit, unitLabel: UNITS[p.unit],
     cost: Number(p.cost), price: Number(p.price), trackStock: p.track_stock, stock: Number(p.stock), minStock: Number(p.min_stock),
     lowStock: p.track_stock && isLow(p.stock, p.min_stock), photoUrl: p.photo_url, showInMenu: p.show_in_menu, courtesyAllowed: Boolean(p.courtesy_allowed), active: p.active, supplierId: p.supplier_id ?? null, supplier: p.supplier?.name ?? null,
-    promo: best ? promoBrief(best.promo, best.price, Number(p.price)) : null, finalPrice: best ? best.price : Number(p.price),
+    promo: best ? promoBrief(best.promo, best.price, salePrice) : null, finalPrice: best ? best.price : salePrice,
+    siteIds: (p.site_ids || []).map(Number), categorySiteIds: (p.category?.site_ids || []).map(Number),
+    sitePrices: prices.get(p.id) || [], salePrice, ...(siteId ? { availableHere: availableAt(p, siteId) } : {}),
     ...(p.gallery !== undefined ? { gallery: p.gallery || [] } : {})
   }
 }
@@ -128,29 +139,37 @@ const validateProduct = async (b) => {
     if (!Array.isArray(b.gallery) || b.gallery.length > 3) errors.push('Puedes agregar hasta 3 imágenes adicionales')
     else b.gallery.forEach((g, i) => { const ge = imageError(g, 600); if (ge) errors.push(`Imagen adicional ${i + 1}: ${ge}`) })
   }
+  const se = await checkSites(siteIdsOf(b.siteIds)); if (se) errors.push(se)
+  if (Array.isArray(b.sitePrices)) {
+    if (b.sitePrices.some((x) => x?.price !== '' && x?.price !== null && x?.price !== undefined && !(Number(x.price) >= 0))) errors.push('Uno de los precios por sucursal no es válido')
+    const pe = await checkSites(siteIdsOf(b.sitePrices.map((x) => x?.siteId))); if (pe) errors.push(pe)
+  }
   return errors
 }
 const productRow = (b) => ({
   sku: clean(b.sku), name: clean(b.name), category_id: num(b.categoryId), description: clean(b.description), unit: UNITS[b.unit] ? b.unit : 'und',
   cost: Number(b.cost) || 0, price: Number(b.price) || 0, track_stock: b.trackStock !== false, min_stock: qty(Number(b.minStock) || 0),
   photo_url: clean(b.photoUrl), show_in_menu: b.showInMenu !== false, ...(b.courtesyAllowed !== undefined ? { courtesy_allowed: b.courtesyAllowed === true } : {}), active: b.active !== false, supplier_id: num(b.supplierId) || null,
-  ...(Array.isArray(b.gallery) ? { gallery: b.gallery.filter(Boolean).slice(0, 3) } : {})
+  ...(Array.isArray(b.gallery) ? { gallery: b.gallery.filter(Boolean).slice(0, 3) } : {}),
+  ...(b.siteIds !== undefined ? { site_ids: siteIdsOf(b.siteIds) } : {})
 })
 
 // Con ?bodega= o ?sede=, stock es lo que hay en esas bodegas (y byWarehouse el detalle).
+// TD-024: ?venta=<sucursal> deja solo lo que se vende en ella, con su precio y sus promociones.
 router.get('/inventario/productos', auth(STAFF), h(async (req, res) => {
+  const sale = Number(req.query.venta) || null
   let q = supabase.from('products').select(PRODUCT_COLUMNS).order('name')
   if (req.query.activos === '1') q = q.eq('active', true)
   if (Number(req.query.categoria)) q = q.eq('category_id', Number(req.query.categoria))
   const whs = await warehouseFilter(req)
   let sq = supabase.from('warehouse_stock').select('product_id, warehouse_id, stock, warehouse:warehouses(name, is_main)').gt('stock', 0)
   if (whs) sq = sq.in('warehouse_id', whs.length ? whs : [0])
-  const [{ data, error }, { data: stock, error: e2 }, promos, near] = await Promise.all([q, sq, loadActive(), lots.nearestByProduct(whs)])
+  const [{ data, error }, { data: stock, error: e2 }, promos, near, prices] = await Promise.all([q, sq, loadActive(sale), lots.nearestByProduct(whs), loadSitePrices()])
   if (error) throw error
   if (e2) throw e2
-  let rows = data.map((p) => {
+  let rows = (sale ? data.filter((p) => availableAt(p, sale)) : data).map((p) => {
     const ls = stock.filter((s) => s.product_id === p.id)
-    const dto = productDTO(p, promos)
+    const dto = productDTO(p, promos, { prices, siteId: sale })
     // TD-016: el lote vigente que vence primero (dentro de la ventana de aviso) para recomendarlo al vender.
     dto.expiry = near.get(p.id) || null
     if (whs) { dto.stock = ls.reduce((a, s) => a + Number(s.stock), 0); dto.lowStock = p.track_stock && isLow(dto.stock, dto.minStock) }
@@ -172,7 +191,7 @@ router.get('/inventario/productos/:id', auth(STAFF), h(async (req, res) => {
       .eq('product_id', id).order('created_at', { ascending: false }).limit(15)
   ])
   if (!p) return fail(res, 'Producto no encontrado', 404)
-  const dto = productDTO(p, promos)
+  const dto = productDTO(p, promos, { prices: await loadSitePrices([id]) })
   dto.byWarehouse = (stock || []).map((s) => ({ warehouseId: s.warehouse_id, name: s.warehouse?.name, isMain: s.warehouse?.is_main, site: s.warehouse?.site?.name ?? null, stock: Number(s.stock), low: p.track_stock && isLow(s.stock, p.min_stock) }))
   dto.movements = (moves || []).map(moveDTO)
   // TD-016: lotes con fecha de vencimiento, del que vence primero al último.
@@ -211,6 +230,7 @@ router.post('/inventario/productos', auth(ADMIN), h(async (req, res) => {
   if (b.active !== false) await plan.checkLimit(req.user.org_id, 'products')
   const { data, error } = await supabase.from('products').insert(productRow(b)).select('id').single()
   if (error) return error.code === '23505' ? fail(res, 'Ya existe un producto con ese código (SKU)', 409) : fail(res, error)
+  await saveSitePrices(data.id, b.sitePrices)
   let paid = {}
   if (initial > 0) {
     const warehouseId = Number(b.warehouseId) || (await mainWarehouse()).id
@@ -225,7 +245,7 @@ router.post('/inventario/productos', auth(ADMIN), h(async (req, res) => {
   }
   await audit(req, 'crear', 'producto', data.id, { name: clean(b.name) })
   const { data: p } = await supabase.from('products').select(PRODUCT_COLUMNS).eq('id', data.id).single()
-  res.status(201).send({ ...productDTO(p, await loadActive()), purchase: initial > 0 ? { payment: pay.method, expense: paid.expense ?? null, payable: paid.payable ?? null, payError: paid.payError ?? null } : null })
+  res.status(201).send({ ...productDTO(p, await loadActive(), { prices: await loadSitePrices([data.id]) }), purchase: initial > 0 ? { payment: pay.method, expense: paid.expense ?? null, payable: paid.payable ?? null, payError: paid.payError ?? null } : null })
 }))
 
 router.put('/inventario/productos/:id', auth(ADMIN), h(async (req, res) => {
@@ -239,13 +259,14 @@ router.put('/inventario/productos/:id', auth(ADMIN), h(async (req, res) => {
   if (errors.length) return fail(res, errors.join('. '), 400)
   const { data, error } = await supabase.from('products').update({ ...productRow(b), ...(b.supplierId === undefined ? { supplier_id: cur.supplier_id } : {}) }).eq('id', id).select(PRODUCT_COLUMNS).maybeSingle()
   if (error) return error.code === '23505' ? fail(res, 'Ya existe un producto con ese código (SKU)', 409) : fail(res, error)
+  await saveSitePrices(id, b.sitePrices)
   // Si cambió el mínimo, se revisan sus bodegas: puede quedar bajo (o dejar de estarlo) sin moverse el stock.
   if (Number(cur.min_stock) !== Number(data.min_stock)) {
     const { data: ws } = await supabase.from('warehouse_stock').select('warehouse_id').eq('product_id', id)
     await checkLowStock((ws || []).map((w) => ({ warehouseId: w.warehouse_id, productId: id })))
   }
   await audit(req, 'editar', 'producto', id, { name: data.name, price: Number(data.price), active: data.active })
-  res.send(productDTO(data, await loadActive()))
+  res.send(productDTO(data, await loadActive(), { prices: await loadSitePrices([id]) }))
 }))
 
 // ---------------------------------------------------------------- Existencias por bodega

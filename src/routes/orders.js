@@ -12,6 +12,7 @@ const { h, fail, clean } = require('../http')
 const { auth, ADMIN, STAFF } = require('../auth')
 const { audit } = require('../audit')
 const { bestFor, loadActive } = require('../promo')
+const { loadSitePrices, priceAt, availableAt, inSite } = require('../catalog')
 const { checkLowStock } = require('../stock')
 const { notify, courtesyMessage, voidMessage } = require('../notify')
 const { cashOpenAt, NO_CASH, can, guard, workSite, sameSite, dbError, money, isMoney, PAY_METHODS, fullName, itemsBlock } = require('../ops')
@@ -108,28 +109,32 @@ router.get('/pedidos/:id', auth(STAFF), h(async (req, res) => {
 // Arma las filas con el precio vigente (promoción incluida) y el área de la categoría.
 // Cortesía al agregar (TD-013): { courtesy: true, courtesyReason } en productos marcados "se puede dar
 // como cortesía"; el cajero y el administrador pueden darla en cualquier producto. Desde el QR no aplica.
+// TD-024: con siteId, solo se venden los productos de esa sucursal, a su precio y con sus promociones.
 const COURTESY_DEFAULT = 'Cortesía de la casa'
-const buildItems = async (req, items, { allowCourtesy = true } = {}) => {
+const buildItems = async (req, items, { allowCourtesy = true, siteId = null } = {}) => {
   const list = (Array.isArray(items) ? items : []).filter((i) => Number(i.productId) && Number(i.quantity) > 0)
   if (!list.length) return { error: 'Agrega al menos un producto' }
   if (list.length > 60) return { error: 'Máximo 60 productos por envío' }
   const ids = [...new Set(list.map((i) => Number(i.productId)))]
   const [{ data: prods }, promos] = await Promise.all([
-    supabase.from('products').select('id, name, price, cost, category_id, active, track_stock, courtesy_allowed, category:product_categories(area)').in('id', ids),
-    loadActive()
+    supabase.from('products').select('id, name, price, cost, category_id, active, track_stock, courtesy_allowed, site_ids, category:product_categories(area, site_ids)').in('id', ids),
+    loadActive(siteId)
   ])
+  const prices = siteId ? await loadSitePrices(ids) : new Map()
   const byId = new Map((prods || []).map((p) => [p.id, p]))
   const rows = []
   for (const i of list) {
     const p = byId.get(Number(i.productId))
     if (!p || !p.active) return { error: 'Uno de los productos no existe o está inactivo' }
-    const best = bestFor(promos, p)
+    if (!availableAt(p, siteId)) return { error: `${p.name} no se vende en esta sucursal` }
+    const listPrice = priceAt(p, siteId, prices)
+    const best = bestFor(promos, { ...p, price: listPrice })
     const gift = Boolean(i.courtesy) && allowCourtesy
     if (gift && !p.courtesy_allowed && !can(req.user, 'cajero')) return { error: `${p.name} no está habilitado como cortesía. Pídele a la caja que la dé o actívalo en el producto.` }
     rows.push({
       ...(gift ? { courtesy: true, courtesy_reason: clean(i.courtesyReason)?.slice(0, 200) || COURTESY_DEFAULT, courtesy_by: req.user.id } : {}),
-      product_id: p.id, name: p.name, area: p.category?.area || 'ninguna', quantity: qty(i.quantity), list_price: Number(p.price),
-      unit_price: best ? best.price : Number(p.price), promotion_id: best?.promo.id ?? null, promotion_name: best?.promo.name ?? null,
+      product_id: p.id, name: p.name, area: p.category?.area || 'ninguna', quantity: qty(i.quantity), list_price: listPrice,
+      unit_price: best ? best.price : listPrice, promotion_id: best?.promo.id ?? null, promotion_name: best?.promo.name ?? null,
       note: clean(i.note)?.slice(0, 200) ?? null, user_id: req.user.id, status: p.category?.area && p.category.area !== 'ninguna' ? 'pendiente' : 'listo'
     })
   }
@@ -155,7 +160,7 @@ const courtesiesAdded = (req, order, rows) => {
 // Pedido de una mesa desde el QR: usa el pedido abierto de la mesa o abre uno, y le agrega los productos.
 // userId: el mesero que aceptó el pedido, o null si el cliente lo hizo directo (queda a nombre del mesero de la mesa).
 const addToTable = async ({ orgId, table, items, userId = null, note = null }) => {
-  const built = await buildItems({ user: { id: userId } }, items, { allowCourtesy: false })
+  const built = await buildItems({ user: { id: userId } }, items, { allowCourtesy: false, siteId: table.site_id })
   if (built.error) return { error: built.error }
   const find = async () => (await supabase.from('orders').select('id, number, site_id, waiter_id').eq('table_id', table.id).eq('status', 'abierto').maybeSingle()).data
   let o = await find()
@@ -214,7 +219,7 @@ router.post('/pedidos', auth(STAFF), guard(...SELLERS), h(async (req, res) => {
   }
   let built = null
   if (Array.isArray(b.items) && b.items.length) {
-    built = await buildItems(req, b.items)
+    built = await buildItems(req, b.items, { siteId: site })
     if (built.error) return fail(res, built.error, 400)
   }
   const waiterId = Number(b.waiterId) || req.user.id
@@ -244,7 +249,7 @@ router.post('/pedidos/:id/items', auth(STAFF), guard(...SELLERS), h(async (req, 
   const o = await orderFor(req, res)
   if (!o) return
   if (!(await cashOpenAt(o.site_id))) return fail(res, NO_CASH, 409)
-  const built = await buildItems(req, req.body?.items)
+  const built = await buildItems(req, req.body?.items, { siteId: o.site_id })
   if (built.error) return fail(res, built.error, 400)
   const r = await insertItems(req, o, built.rows)
   if (r.error) return dbError(res, r.error)
@@ -403,6 +408,7 @@ router.post('/pedidos/:id/cobrar', auth(STAFF), guard('cajero'), h(async (req, r
   if (Number(b.discountId)) {
     const { data: d } = await supabase.from('discounts').select('*').eq('id', Number(b.discountId)).maybeSingle()
     if (!d || !d.active) return fail(res, 'El descuento no existe o está inactivo', 400)
+    if (!inSite(d, o.site_id)) return fail(res, `El descuento "${d.name}" no aplica en esta sucursal`, 400)
     if (d.requires_reason && !clean(b.discountReason)) return fail(res, `Escribe el motivo del descuento "${d.name}"`, 400)
     discount = { id: d.id, name: d.name, type: d.type, value: Number(d.value), reason: clean(b.discountReason) }
   }

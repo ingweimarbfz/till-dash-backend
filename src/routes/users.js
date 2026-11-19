@@ -90,7 +90,7 @@ const activeOwners = async (excludeId) => {
 }
 
 router.get('/usuarios', auth(ADMIN), h(async (req, res) => {
-  let q = supabase.from('users').select(PAY_COLUMNS).order('name')
+  let q = supabase.from('users').select(PAY_COLUMNS).is('deleted_at', null).order('name')
   if (req.siteId) q = q.or(`site_id.eq.${req.siteId},role.in.(superadmin,admin)`)
   const { data, error } = await q
   if (error) throw error
@@ -132,6 +132,46 @@ router.post('/usuarios', auth(ADMIN), h(async (req, res) => {
   if (error) return dupMessage(error) ? fail(res, dupMessage(error), 409) : fail(res, error)
   await audit(req, 'crear', 'usuario', data.id, { role, extra, positions, username: data.username })
   res.status(201).send(withPay(data, canManagePay(req.user)))
+}))
+
+// ---------------------------------------------------------------- Eliminar (TD-029)
+// El super administrador no se elimina, ni uno mismo. Solo un super administrador elimina administradores.
+// Sin historial se borra de verdad. Con historial (pedidos, caja, pagos, bitácora…) se elimina en blando:
+// deleted_at, inactivo y con usuario e identificación liberados; los reportes siguen mostrando su nombre.
+const HISTORY = [
+  ['orders', 'waiter_id'], ['orders', 'opened_by'], ['orders', 'cashier_id'], ['orders', 'courier_id'], ['order_items', 'user_id'],
+  ['order_payments', 'user_id'], ['cash_sessions', 'opened_by'], ['cash_movements', 'user_id'], ['inventory_movements', 'user_id'],
+  ['tip_payouts', 'user_id'], ['courier_payouts', 'user_id'], ['courier_floats', 'user_id'], ['staff_earnings', 'user_id'],
+  ['expenses', 'created_by'], ['incidents', 'reported_by'], ['audit_log', 'user_id'], ['plan_requests', 'requested_by']
+]
+const hasHistory = async (id) => {
+  const counts = await Promise.all(HISTORY.map(([t, c]) => supabase.from(t).select(c, { count: 'exact', head: true }).eq(c, id).then((r) => r.count || 0, () => 0)))
+  return counts.some((n) => n > 0)
+}
+router.delete('/usuarios/:id', auth(ADMIN), h(async (req, res) => {
+  const id = Number(req.params.id)
+  if (id === req.user.id) return fail(res, 'No puedes eliminar tu propio usuario', 400)
+  const { data: u } = await supabase.from('users').select('id, role, name, last_name, username, identification, deleted_at').eq('id', id).maybeSingle()
+  if (!u || u.deleted_at) return fail(res, 'Usuario no encontrado', 404)
+  if (u.role === 'superadmin') return fail(res, 'El super administrador no se puede eliminar', 403)
+  if (u.role === 'admin' && req.user.role !== 'superadmin') return fail(res, 'Solo el super administrador puede eliminar administradores', 403)
+  const name = `${u.name} ${u.last_name || ''}`.trim()
+  if (!(await hasHistory(id))) {
+    const { error } = await supabase.from('users').delete().eq('id', id)
+    if (!error) {
+      await audit(req, 'eliminar', 'usuario', id, { name, username: u.username, mode: 'definitivo' })
+      return res.send({ ok: true, mode: 'definitivo' })
+    }
+    if (error.code !== '23503') throw error // con otra referencia: se elimina en blando
+  }
+  const tag = `eliminado-${id}`
+  const { error } = await supabase.from('users').update({
+    deleted_at: new Date().toISOString(), active: false, can_manage_pay: false,
+    username: `${u.username}.${tag}`.slice(0, 80), identification: `${u.identification}-${tag}`.slice(0, 40)
+  }).eq('id', id)
+  if (error) throw error
+  await audit(req, 'eliminar', 'usuario', id, { name, username: u.username, mode: 'historial' })
+  res.send({ ok: true, mode: 'historial' })
 }))
 
 router.put('/usuarios/:id', auth(ADMIN), h(async (req, res) => {

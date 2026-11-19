@@ -56,7 +56,7 @@ router.get('/buscar', auth(STAFF), h(async (req, res) => {
   }
   if (admin) {
     jobs.push(supabase.from('users').select('id, name, last_name, username, identification, role')
-      .or(`name.ilike.%${q}%,last_name.ilike.%${q}%,username.ilike.%${q}%,identification.ilike.%${q}%`).limit(6)
+      .or(`name.ilike.%${q}%,last_name.ilike.%${q}%,username.ilike.%${q}%,identification.ilike.%${q}%`).is('deleted_at', null).limit(6)
       .then(({ data }) => (data || []).forEach((u) => groups.usuarios.push({ id: u.id, title: `${u.name} ${u.last_name || ''}`.trim(), subtitle: `@${u.username} · ${u.identification}`, to: `/usuarios?id=${u.id}` }))))
     jobs.push(supabase.from('sites').select('id, name, city').or(`name.ilike.%${q}%,city.ilike.%${q}%`).limit(4)
       .then(({ data }) => (data || []).forEach((s) => groups.sucursales.push({ id: s.id, title: s.name, subtitle: s.city || 'Sucursal', to: '/sucursales' }))))

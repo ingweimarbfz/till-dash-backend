@@ -18,6 +18,8 @@ const { notify, movementMessage, transferMessage } = require('../notify')
 const { isLow, checkLowStock, currentAlerts } = require('../stock')
 const { resolveSupplier } = require('../suppliers')
 const { parsePayment, checkPayment, settle } = require('../purchases')
+const lots = require('../lots')
+const { todayBogota } = require('../http')
 
 const router = express.Router()
 
@@ -143,12 +145,14 @@ router.get('/inventario/productos', auth(STAFF), h(async (req, res) => {
   const whs = await warehouseFilter(req)
   let sq = supabase.from('warehouse_stock').select('product_id, warehouse_id, stock, warehouse:warehouses(name, is_main)').gt('stock', 0)
   if (whs) sq = sq.in('warehouse_id', whs.length ? whs : [0])
-  const [{ data, error }, { data: stock, error: e2 }, promos] = await Promise.all([q, sq, loadActive()])
+  const [{ data, error }, { data: stock, error: e2 }, promos, near] = await Promise.all([q, sq, loadActive(), lots.nearestByProduct(whs)])
   if (error) throw error
   if (e2) throw e2
   let rows = data.map((p) => {
     const ls = stock.filter((s) => s.product_id === p.id)
     const dto = productDTO(p, promos)
+    // TD-016: el lote vigente que vence primero (dentro de la ventana de aviso) para recomendarlo al vender.
+    dto.expiry = near.get(p.id) || null
     if (whs) { dto.stock = ls.reduce((a, s) => a + Number(s.stock), 0); dto.lowStock = p.track_stock && isLow(dto.stock, dto.minStock) }
     dto.byWarehouse = ls.map((s) => ({ warehouseId: s.warehouse_id, name: s.warehouse?.name, isMain: s.warehouse?.is_main, stock: Number(s.stock) }))
     return dto
@@ -171,6 +175,11 @@ router.get('/inventario/productos/:id', auth(STAFF), h(async (req, res) => {
   const dto = productDTO(p, promos)
   dto.byWarehouse = (stock || []).map((s) => ({ warehouseId: s.warehouse_id, name: s.warehouse?.name, isMain: s.warehouse?.is_main, site: s.warehouse?.site?.name ?? null, stock: Number(s.stock), low: p.track_stock && isLow(s.stock, p.min_stock) }))
   dto.movements = (moves || []).map(moveDTO)
+  // TD-016: lotes con fecha de vencimiento, del que vence primero al último.
+  const today = todayBogota()
+  const win = await lots.alertWindow()
+  dto.lots = await lots.loadLots({ productId: id }).then((ls) => lots.markFirst(ls, today).map(({ l, first }) => lots.lotDTO(l, today, win, first))).catch(() => [])
+  dto.expiryWindowDays = win
   dto.upcoming = promos.filter((x) => x.id !== dto.promo?.id && covers(x, p) && ['programada', 'fuera_de_horario'].includes(statusOf(x)))
     .map((x) => ({ ...promoBrief(x, priceWith(x, Number(p.price)), Number(p.price)), status: statusOf(x), startsAt: x.starts_at, timeFrom: hm(x.time_from), weekdays: x.weekdays }))
   res.send(dto)
@@ -182,6 +191,10 @@ router.post('/inventario/productos', auth(ADMIN), h(async (req, res) => {
   const initial = qty(Number(b.initialStock) || 0)
   if (!(initial >= 0)) errors.push('Stock inicial inválido')
   if (b.trackStock === false && initial > 0) errors.push('Un producto sin inventario no lleva stock inicial')
+  const expiresOn = clean(b.expiresOn)
+  if (expiresOn && !lots.isDate(expiresOn)) errors.push('Fecha de vencimiento inválida')
+  else if (expiresOn && expiresOn < todayBogota()) errors.push('La fecha de vencimiento ya pasó')
+  if (expiresOn && !(initial > 0)) errors.push('La fecha de vencimiento va con el stock inicial')
   if (errors.length) return fail(res, errors.join('. '), 400)
   // TD-011: el stock inicial también dice de dónde se pagó (o si es inventario que ya estaba).
   let pay = null; let check = null; let sup = { id: null, name: null }
@@ -202,7 +215,7 @@ router.post('/inventario/productos', auth(ADMIN), h(async (req, res) => {
   if (initial > 0) {
     const warehouseId = Number(b.warehouseId) || (await mainWarehouse()).id
     const { data: ref } = await supabase.rpc('next_consecutive', { p_org: currentOrg(), p_kind: 'entrada', p_site: 0, p_prefix: 'EN-' })
-    const { error: e2 } = await supabase.from('inventory_movements').insert({ warehouse_id: warehouseId, product_id: data.id, type: 'entrada', quantity: initial, unit_cost: Number(b.cost) || 0, ref, note: pay.method === 'inicial' ? 'Stock inicial (inventario existente)' : 'Stock inicial', user_id: req.user.id, supplier_id: sup.id })
+    const { error: e2 } = await supabase.from('inventory_movements').insert({ warehouse_id: warehouseId, product_id: data.id, type: 'entrada', quantity: initial, unit_cost: Number(b.cost) || 0, ref, note: pay.method === 'inicial' ? 'Stock inicial (inventario existente)' : 'Stock inicial', user_id: req.user.id, supplier_id: sup.id, ...(expiresOn ? { expires_on: expiresOn } : {}) })
     if (e2) return p0001(res, e2)
     await checkLowStock([{ warehouseId, productId: data.id }])
     paid = await settle({ pay, check, total, ref, items: [{ name: clean(b.name) }], supplier: sup, invoice: null, userId: req.user.id })
@@ -289,13 +302,13 @@ const moveDTO = (m) => ({
   id: m.id, type: m.type, typeLabel: MOVE_LABELS[m.type], quantity: Number(m.quantity), stockAfter: m.stock_after === null ? null : Number(m.stock_after),
   unitCost: m.unit_cost === null || m.unit_cost === undefined ? null : Number(m.unit_cost), note: m.note, ref: m.ref, createdAt: m.created_at,
   warehouse: m.warehouse ? { id: m.warehouse.id, name: m.warehouse.name } : null,
-  supplierId: m.supplier_id ?? null, supplier: m.supplier?.name ?? null, invoiceRef: m.invoice_ref ?? null,
+  supplierId: m.supplier_id ?? null, supplier: m.supplier?.name ?? null, invoiceRef: m.invoice_ref ?? null, expiresOn: m.expires_on ?? null,
   product: m.product || null, user: m.user ? `${m.user.name} ${m.user.last_name || ''}`.trim() : null
 })
 
 router.get('/inventario/movimientos', auth(STAFF), h(async (req, res) => {
   let q = supabase.from('inventory_movements')
-    .select('id, type, quantity, stock_after, unit_cost, note, ref, invoice_ref, supplier_id, created_at, warehouse_id, supplier:suppliers(name), warehouse:warehouses(id, name), product:products(id, name, sku, unit), user:users(name, last_name)')
+    .select('id, type, quantity, stock_after, unit_cost, note, ref, invoice_ref, supplier_id, expires_on, created_at, warehouse_id, supplier:suppliers(name), warehouse:warehouses(id, name), product:products(id, name, sku, unit), user:users(name, last_name)')
     .order('created_at', { ascending: false }).order('id', { ascending: false }).limit(Math.min(Number(req.query.limit) || 200, 500))
   if (Number(req.query.producto)) q = q.eq('product_id', Number(req.query.producto))
   if (req.query.tipo && MOVE_LABELS[req.query.tipo]) q = q.eq('type', req.query.tipo)
@@ -313,14 +326,23 @@ router.post('/inventario/movimientos', auth(ADMIN), h(async (req, res) => {
   const b = req.body || {}
   if (!MOVE_PREFIX[b.type]) return fail(res, 'Tipo de movimiento inválido', 400)
   const raw = Array.isArray(b.items) ? b.items : [{ productId: b.productId, quantity: b.quantity, unitCost: b.unitCost }]
-  const items = raw.map((i) => ({ productId: Number(i.productId), quantity: isQty(i.quantity) ? qty(i.quantity) : NaN, unitCost: i.unitCost === '' || i.unitCost === undefined || i.unitCost === null ? null : Number(i.unitCost) }))
-    .filter((i) => i.productId)
+  const items = raw.map((i) => ({
+    productId: Number(i.productId), quantity: isQty(i.quantity) ? qty(i.quantity) : NaN, unitCost: i.unitCost === '' || i.unitCost === undefined || i.unitCost === null ? null : Number(i.unitCost),
+    // TD-016: fecha de vencimiento opcional de lo que entra; lote puntual del que sale una baja o un ajuste.
+    expiresOn: clean(i.expiresOn) || null, lotId: Number(i.lotId) || null
+  })).filter((i) => i.productId)
   if (!items.length) return fail(res, 'Agrega al menos un producto', 400)
   if (new Set(items.map((i) => i.productId)).size !== items.length) return fail(res, 'Hay productos repetidos', 400)
   if (items.some((i) => !Number.isFinite(i.quantity) || i.quantity === 0)) return fail(res, 'Cada cantidad debe ser un número distinto de cero', 400)
   if (b.type !== 'ajuste' && items.some((i) => i.quantity < 0)) return fail(res, 'Las cantidades deben ser positivas', 400)
   if (items.some((i) => i.unitCost !== null && !(i.unitCost >= 0))) return fail(res, 'Costo unitario inválido', 400)
   if ((b.type === 'ajuste' || b.type === 'baja') && !clean(b.note)) return fail(res, 'Escribe el motivo del ajuste o la baja', 400)
+  for (const i of items) {
+    if (i.expiresOn && (b.type === 'baja' || i.quantity < 0)) i.expiresOn = null
+    if (i.expiresOn && !lots.isDate(i.expiresOn)) return fail(res, 'Hay una fecha de vencimiento inválida', 400)
+    if (i.expiresOn && b.type === 'entrada' && i.expiresOn < todayBogota()) return fail(res, 'Hay una fecha de vencimiento que ya pasó: revísala o registra la mercancía como baja', 400)
+    if (i.lotId && (b.type === 'entrada' || i.quantity > 0)) i.lotId = null
+  }
   const warehouseId = Number(b.warehouseId) || (await mainWarehouse()).id
   const wh = await loadPlace(warehouseId)
   if (!wh || !wh.active) return fail(res, 'Selecciona una bodega activa', 400)
@@ -350,7 +372,8 @@ router.post('/inventario/movimientos', auth(ADMIN), h(async (req, res) => {
   // Un solo insert: si un producto no alcanza, no se registra ninguno.
   const { error } = await supabase.from('inventory_movements').insert(items.map((i) => ({
     warehouse_id: warehouseId, product_id: i.productId, type: b.type, quantity: b.type === 'baja' ? -i.quantity : i.quantity,
-    unit_cost: b.type === 'entrada' ? i.unitCost : null, ref, note, user_id: req.user.id, supplier_id: sup.id, invoice_ref: invoice
+    unit_cost: b.type === 'entrada' ? i.unitCost : null, ref, note, user_id: req.user.id, supplier_id: sup.id, invoice_ref: invoice,
+    ...(i.expiresOn ? { expires_on: i.expiresOn } : {}), ...(i.lotId ? { lot_id: i.lotId } : {})
   })))
   if (error) return p0001(res, error)
   const signed = items.map((i) => ({ ...i, quantity: b.type === 'baja' ? -i.quantity : i.quantity }))
@@ -404,6 +427,51 @@ router.get('/inventario/traslados', auth(STAFF), h(async (req, res) => {
   let rows = [...map.values()]
   if (whs) rows = rows.filter((t) => whs.includes(t.from?.id) || whs.includes(t.to?.id))
   res.send(rows.slice(0, 100))
+}))
+
+// ---------------------------------------------------------------- Vencimientos (TD-016)
+// Tablero de próximos a vencer: vencidos, urgentes (3 días o menos) y dentro de la ventana de aviso,
+// con la recomendación de qué hacer con cada lote. ?dias= cambia la ventana (por defecto, la de Configuración).
+router.get('/inventario/vencimientos', auth(STAFF), h(async (req, res) => {
+  const whs = await warehouseFilter(req)
+  const days = Math.min(Math.max(Number(req.query.dias) || 0, 0), 365) || null
+  res.send(await lots.expiryBoard({ warehouseIds: whs, days }))
+}))
+
+// Lotes con existencias de un producto (o de las bodegas elegidas), del que vence primero al último.
+router.get('/inventario/lotes', auth(STAFF), h(async (req, res) => {
+  const productId = Number(req.query.producto) || null
+  const whs = await warehouseFilter(req)
+  const today = todayBogota()
+  const win = await lots.alertWindow()
+  const ls = await lots.loadLots({ warehouseIds: whs, productId })
+  res.send(lots.markFirst(ls, today).map(({ l, first }) => lots.lotDTO(l, today, win, first)))
+}))
+
+// Corregir la fecha de un lote (se escribió mal al recibir). Si ya hay un lote con esa fecha en la bodega, se unen.
+router.patch('/inventario/lotes/:id', auth(ADMIN), h(async (req, res) => {
+  const id = Number(req.params.id)
+  const expiresOn = clean(req.body?.expiresOn)
+  if (!lots.isDate(expiresOn)) return fail(res, 'Fecha de vencimiento inválida', 400)
+  const { data: lot } = await supabase.from('stock_lots').select('id, warehouse_id, product_id, expires_on, quantity, received, product:products(name)').eq('id', id).maybeSingle()
+  if (!lot) return fail(res, 'Lote no encontrado', 404)
+  if (lot.expires_on === expiresOn) return res.send({ id, expiresOn, merged: false })
+  const { data: twin } = await supabase.from('stock_lots').select('id, quantity, received').eq('warehouse_id', lot.warehouse_id).eq('product_id', lot.product_id).eq('expires_on', expiresOn).maybeSingle()
+  let target = id
+  if (twin) {
+    const { error } = await supabase.from('stock_lots').update({ quantity: Number(twin.quantity) + Number(lot.quantity), received: Number(twin.received) + Number(lot.received), updated_at: new Date().toISOString() }).eq('id', twin.id)
+    if (error) throw error
+    await supabase.from('stock_lot_moves').update({ lot_id: twin.id }).eq('lot_id', id)
+    await supabase.from('inventory_movements').update({ lot_id: twin.id }).eq('lot_id', id)
+    const { error: e2 } = await supabase.from('stock_lots').delete().eq('id', id)
+    if (e2) throw e2
+    target = twin.id
+  } else {
+    const { error } = await supabase.from('stock_lots').update({ expires_on: expiresOn, updated_at: new Date().toISOString() }).eq('id', id)
+    if (error) throw error
+  }
+  await audit(req, 'editar', 'lote', target, { product: lot.product?.name, from: lot.expires_on, to: expiresOn, merged: Boolean(twin) })
+  res.send({ id: target, expiresOn, merged: Boolean(twin) })
 }))
 
 // ---------------------------------------------------------------- Resumen y alertas

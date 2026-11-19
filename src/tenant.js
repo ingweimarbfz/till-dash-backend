@@ -25,7 +25,9 @@ const TENANT_TABLES = new Set([
   // TD-010: clientes (distribuidoras)
   'customers',
   // TD-011: cuentas por pagar a proveedores
-  'supplier_payables'
+  'supplier_payables',
+  // TD-016: lotes con fecha de vencimiento
+  'stock_lots', 'stock_lot_moves'
 ])
 
 const withOrg = (rows, org) => (Array.isArray(rows) ? rows.map((r) => ({ ...r, org_id: org })) : { ...rows, org_id: org })

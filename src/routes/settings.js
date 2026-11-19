@@ -46,6 +46,8 @@ const toDTO = (s, o) => ({
   courierShareMode: s?.courier_share_mode || 'todo',
   deliveryTransferTiming: s?.delivery_transfer_timing || 'antes',
   courierSharePercent: Number(s?.courier_share_percent ?? 100),
+  expiryAlertDays: Number(s?.expiry_alert_days ?? 15),
+  blockExpiredSales: s?.block_expired_sales ?? true,
   nit: o?.nit || null,
   phone: o?.phone || null,
   email: o?.email || null,
@@ -86,6 +88,7 @@ router.put('/configuracion', auth(ADMIN), h(async (req, res) => {
   if (!Number.isFinite(tip) || tip < 0 || tip > 100) errors.push('La propina debe estar entre 0 % y 100 %')
   if (b.cashExpenseLimit !== undefined && b.cashExpenseLimit !== '' && !(Number(b.cashExpenseLimit) >= 0)) errors.push('El tope de gastos de caja no es válido')
   if (b.cashReopenHours !== undefined && b.cashReopenHours !== '' && !(Number(b.cashReopenHours) >= 0 && Number(b.cashReopenHours) <= 72)) errors.push('Las horas para reabrir un turno deben estar entre 0 y 72')
+  if (b.expiryAlertDays !== undefined && b.expiryAlertDays !== '' && !(Number.isInteger(Number(b.expiryAlertDays)) && Number(b.expiryAlertDays) >= 1 && Number(b.expiryAlertDays) <= 365)) errors.push('Los días de aviso de vencimiento deben estar entre 1 y 365')
   if (b.qrOrdering !== undefined && !['llamar', 'confirmar', 'directo'].includes(b.qrOrdering)) errors.push('Opción de pedidos por QR no válida')
   if (errors.length) return fail(res, errors.join('. '), 400)
 
@@ -103,6 +106,8 @@ router.put('/configuracion', auth(ADMIN), h(async (req, res) => {
     ...(b.deliveryTransferTiming === 'antes' || b.deliveryTransferTiming === 'al_entregar' ? { delivery_transfer_timing: b.deliveryTransferTiming } : {}),
     ...(b.courierShareMode === 'todo' || b.courierShareMode === 'porcentaje' ? { courier_share_mode: b.courierShareMode } : {}),
     ...(b.courierSharePercent !== undefined && b.courierSharePercent !== '' && Number(b.courierSharePercent) >= 0 && Number(b.courierSharePercent) <= 100 ? { courier_share_percent: Number(b.courierSharePercent) } : {}),
+    ...(b.expiryAlertDays !== undefined && b.expiryAlertDays !== '' ? { expiry_alert_days: Number(b.expiryAlertDays) } : {}),
+    ...(typeof b.blockExpiredSales === 'boolean' ? { block_expired_sales: b.blockExpiredSales } : {}),
     ...(b.deliveryFeeDefault !== undefined && b.deliveryFeeDefault !== '' && Number(b.deliveryFeeDefault) >= 0 ? { delivery_fee_default: Math.round(Number(b.deliveryFeeDefault)) } : {})
   }).eq('org_id', currentOrg())
   if (error) throw error

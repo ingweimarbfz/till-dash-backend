@@ -9,6 +9,7 @@ const { h, todayBogota } = require('../http')
 const { auth } = require('../auth')
 const { dayStart } = require('./logbook')
 const { currentAlerts } = require('../stock')
+const { expiryBoard } = require('../lots')
 const { tableStats } = require('./reports')
 
 const plan = require('../plan')
@@ -184,6 +185,8 @@ router.get('/dashboard', auth(), h(async (req, res) => {
       safe(site(supabase.from('cash_requests').select('id, number, amount, reason, created_at, session:cash_sessions(number, register:cash_registers(name))').eq('status', 'pendiente').order('created_at')), []),
       count('incidents', (q) => site(q.eq('status', 'abierto')))
     ])
+    // TD-016: lotes vencidos y por vencer (si la migración aún no corre, queda en null).
+    const expiry = await expiryBoard({ warehouseIds: whs }).catch(() => null)
     const funds = (vaults.data || []).filter((v) => !req.siteId || v.site_id === req.siteId || v.site_id === null)
     return res.send({
       money: {
@@ -209,6 +212,7 @@ router.get('/dashboard', auth(), h(async (req, res) => {
       calls: (calls.data || []).map((c) => ({ id: c.id, kind: c.kind, table: c.table?.name, createdAt: c.created_at })),
       sessions: (sessions.data || []).map((x) => ({ id: x.id, number: x.number, register: x.register?.name, site: x.site?.name, openingAmount: Number(x.opening_amount), openedAt: x.opened_at, minutes: minutesSince(x.opened_at) })),
       alerts: alerts.slice(0, 8),
+      expiry: expiry ? { windowDays: expiry.windowDays, summary: expiry.summary, rows: expiry.rows.slice(0, 8) } : null,
       recent: (recent.data || []).map((a) => ({ id: a.id, action: a.action, entity: a.entity, createdAt: a.created_at, user: a.user ? `${a.user.name} ${a.user.last_name || ''}`.trim() : null }))
     })
   }

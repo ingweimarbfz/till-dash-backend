@@ -32,3 +32,13 @@ test('opciones del QR propias de la sucursal (TD-025)', () => {
   assert.equal(orderMode(o), 'directo')
   assert.equal(orderMode(ownQrOf({ callWaiter: false })), 'none')
 })
+
+// TD-034: domiciliarios que sirven a todas las sedes.
+test('sharedCourier: solo domiciliario en la sede principal o sin sucursal', () => {
+  const { sharedCourier } = require('../src/routes/deliveries')
+  assert.equal(sharedCourier({ positions: ['domiciliario'], site_id: 1 }, 1), true)
+  assert.equal(sharedCourier({ positions: ['domiciliario'], site_id: null }, 1), true)
+  assert.equal(sharedCourier({ positions: ['domiciliario'], site_id: 2 }, 1), false)
+  assert.equal(sharedCourier({ positions: ['domiciliario', 'mesero'], site_id: 1 }, 1), false)
+  assert.equal(sharedCourier({ positions: ['mesero'], site_id: 1 }, 1), false)
+})

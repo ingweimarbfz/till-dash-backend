@@ -75,10 +75,25 @@ const totals = (list) => {
 }
 // TD-022: si es externo, si trabaja con base propia y su vehículo.
 const courierRow = (u) => ({ id: u.id, name: fullName(u), phone: u.phone || null, external: Boolean(u.courier_external), ownFloat: u.courier_float === 'propia', vehicle: vehicleLabel(u) })
-const couriersOf = async (siteId) => {
-  const { data } = await supabase.from('users').select(`id, name, last_name, site_id, phone, ${COURIER_COLUMNS}`).eq('active', true).eq('role', 'empleado').contains('positions', ['domiciliario']).order('name')
-  return (data || []).filter((u) => !siteId || !u.site_id || u.site_id === siteId).map(courierRow)
+// TD-034: el domiciliario que solo es domiciliario y está en la sede principal (o sin sucursal) sirve a todas
+// las sedes: aparece para asignar en cualquiera y ve sus domicilios de todas.
+let mainSite = { id: null, at: 0 }
+const mainSiteId = async () => {
+  if (Date.now() - mainSite.at < 60e3) return mainSite.id
+  const { data } = await supabase.from('sites').select('id').eq('is_main', true).maybeSingle()
+  mainSite = { id: data?.id ?? null, at: Date.now() }
+  return mainSite.id
 }
+const sharedCourier = (u, mainId) => (u.positions || []).length === 1 && u.positions[0] === 'domiciliario' && (!u.site_id || Number(u.site_id) === Number(mainId))
+const couriersOf = async (siteId) => {
+  const [{ data }, mainId] = await Promise.all([
+    supabase.from('users').select(`id, name, last_name, site_id, phone, positions, ${COURIER_COLUMNS}`).eq('active', true).eq('role', 'empleado').contains('positions', ['domiciliario']).order('name'),
+    mainSiteId()
+  ])
+  return (data || []).filter((u) => !siteId || !u.site_id || u.site_id === siteId || sharedCourier(u, mainId)).map(courierRow)
+}
+// El domiciliario que entra a la app y sirve a todas las sedes ve lo suyo de todas.
+const allSitesCourier = async (user) => onlyCourier(user) && sharedCourier(user, await mainSiteId())
 
 // ---------------------------------------------------------------- Lista del día
 router.get('/domicilios', auth(STAFF), guard(...SELLERS, 'domiciliario'), h(async (req, res) => {
@@ -87,7 +102,8 @@ router.get('/domicilios', auth(STAFF), guard(...SELLERS, 'domiciliario'), h(asyn
   const site = await workSite(req, req.query.sede)
   const mine = onlyCourier(req.user)
   const courierId = mine ? req.user.id : Number(req.query.domiciliario) || null
-  let q = supabase.from('orders').select(COLUMNS).eq('type', 'domicilio').eq('site_id', site).neq('status', 'anulado')
+  let q = supabase.from('orders').select(COLUMNS).eq('type', 'domicilio').neq('status', 'anulado')
+  if (!(await allSitesCourier(req.user))) q = q.eq('site_id', site)
   // Hoy: los abiertos (aunque vengan de ayer) y los del día. Otro día: los que se abrieron ese día.
   q = today ? q.or(`status.eq.abierto,opened_at.gte.${dayStart(day)}`) : q.gte('opened_at', dayStart(day)).lt('opened_at', nextDay(day))
   if (courierId) q = q.eq('courier_id', courierId)
@@ -109,7 +125,7 @@ router.get('/domicilios', auth(STAFF), guard(...SELLERS, 'domiciliario'), h(asyn
 const loadDelivery = async (req, res) => {
   const { data: o } = await supabase.from('orders').select('id, number, site_id, type, status, total, delivery_fee, customer_name, customer_address, courier_id, delivery_status, dispatched_at, delivery_pay_method, cash_received_at').eq('id', Number(req.params.id)).maybeSingle()
   if (!o || o.type !== 'domicilio') { fail(res, 'Domicilio no encontrado', 404); return null }
-  if (!sameSite(req, o.site_id)) { fail(res, 'El domicilio es de otra sucursal', 403); return null }
+  if (!sameSite(req, o.site_id) && !(o.courier_id && o.courier_id === req.user.id)) { fail(res, 'El domicilio es de otra sucursal', 403); return null }
   if (o.status === 'anulado') { fail(res, 'El pedido está anulado', 409); return null }
   return o
 }
@@ -322,7 +338,7 @@ router.get('/domicilios/cuenta', auth(STAFF), guard(...SELLERS, 'domiciliario'),
       .eq('type', 'domicilio').eq('courier_id', courierId).neq('status', 'anulado').gte('opened_at', dayStart(from)).lt('opened_at', nextDay(to)).order('opened_at'),
     supabase.from('courier_payouts').select('id, amount, deliveries, fees, share, tips, created_at, session:cash_sessions(number, register:cash_registers(name))')
       .eq('user_id', courierId).gte('created_at', dayStart(from)).lt('created_at', nextDay(to)).order('created_at', { ascending: false }),
-    supabase.from('users').select('id, name, last_name, site_id, courier_pay').eq('id', courierId).maybeSingle(),
+    supabase.from('users').select('id, name, last_name, site_id, positions, courier_pay').eq('id', courierId).maybeSingle(),
     shareRule(),
     // Sus propinas se le pagan en Caja → Propinas (TD-020), no en el cierre.
     supabase.from('tip_payouts').select('amount').eq('user_id', courierId).gte('created_at', dayStart(from)).lt('created_at', nextDay(to)).then((r) => (r.error ? { data: [] } : r)),
@@ -330,7 +346,7 @@ router.get('/domicilios/cuenta', auth(STAFF), guard(...SELLERS, 'domiciliario'),
     supabase.from('staff_earnings').select('amount, status, paid_at').eq('user_id', courierId).eq('kind', 'domicilios').then((r) => (r.error ? { data: [] } : r))
   ])
   if (error) throw error
-  if (!u || (!mine && !sameSite(req, u.site_id) && u.site_id)) return fail(res, 'Domiciliario no encontrado', 404)
+  if (!u || (!mine && !sameSite(req, u.site_id) && u.site_id && !sharedCourier(u, await mainSiteId()))) return fail(res, 'Domiciliario no encontrado', 404)
   const day = (d) => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Bogota' }).format(new Date(d))
   const days = {}
   let pending = 0
@@ -409,8 +425,9 @@ const loadFloat = async (req, res) => {
 router.get('/domicilios/bases', auth(STAFF), guard(...SELLERS, 'domiciliario'), h(async (req, res) => {
   const mine = onlyCourier(req.user)
   const site = await workSite(req, req.query.sede)
-  let q = supabase.from('courier_floats').select(FLOAT_COLUMNS).eq('site_id', site).or(`status.eq.abierta,settled_at.gte.${dayStart(todayBogota())}`).order('created_at', { ascending: false })
+  let q = supabase.from('courier_floats').select(FLOAT_COLUMNS).or(`status.eq.abierta,settled_at.gte.${dayStart(todayBogota())}`).order('created_at', { ascending: false })
   if (mine) q = q.eq('user_id', req.user.id)
+  if (!mine || !(await allSitesCourier(req.user))) q = q.eq('site_id', site)
   const { data, error } = await q
   if (error) throw error
   const rows = await Promise.all((data || []).map(async (f) => {
@@ -482,6 +499,7 @@ router.get('/caja/turnos/:id/domiciliarios', auth(STAFF), guard('cajero'), h(asy
 }))
 
 module.exports = router
+module.exports.sharedCourier = sharedCourier
 module.exports.courierSettlement = courierSettlement
 module.exports.quickCourierErrors = quickCourierErrors
 
